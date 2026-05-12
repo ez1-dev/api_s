@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pyodbc
+python-jose[cryptography]
+pydantic
+python-dotenv
+httpx
+google-generativeai

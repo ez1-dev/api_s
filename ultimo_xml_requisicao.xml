@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ser="http://services.senior.com.br">
+  <soapenv:Body>
+    <ser:requisicaoAgrupadaComposta>
+      <user>sapiens</user>
+      <password>0n%lV'g0F94</password>
+      <encryption>0</encryption>
+      <parameters>
+        <dadosGerais>
+          <codEmp>1</codEmp>
+          <codFil>1</codFil>
+          <identificadorExterno>260411202108</identificadorExterno>
+          <tipoProcessamento>1</tipoProcessamento>
+          <tipoOperacao>R</tipoOperacao>
+          <usuGer>123</usuGer>
+          <usuSol>123</usuSol>
+          <usuEme>123</usuEme>
+          
+            <itens>
+              <codPro>CHA022</codPro>
+              <codDer>MPM</codDer>
+              <codDep></codDep>
+              <qtdEme>100.00000</qtdEme>
+              <preEme>0.0000000000</preEme>
+              <codTns></codTns>
+              <datEme>11/04/2026</datEme>
+              <ccuRes></ccuRes>
+              <obsEme></obsEme>
+              <codPri>1</codPri>
+              
+              
+              
+              
+              
+            </itens>
+        
+        </dadosGerais>
+        <identificadorSistema>APIREQ</identificadorSistema>
+      </parameters>
+    </ser:requisicaoAgrupadaComposta>
+  </soapenv:Body>
+</soapenv:Envelope>
