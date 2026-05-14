@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  api_auditoria:
+    build: .
+    container_name: api_auditoria
+    restart: unless-stopped
+    ports:
+      - "8055:8055"
+    env_file:
+      - gemini_api_key.env
+    command: python3 api_auditoria_fiscal.py
+    volumes:
+      - .:/app
+
+  api_sapiens:
+    build: .
+    container_name: api_sapiens
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    env_file:
+      - gemini_api_key2.env
+    command: python3 api_sapiens_control_center.py
+    volumes:
+      - .:/app
