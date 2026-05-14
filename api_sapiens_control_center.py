@@ -1113,6 +1113,10 @@ async def startup_event():
     criar_tabelas_log_bkp_sgu()
     criar_tabela_log_auditoria_revenda()
     criar_tabela_tipo_movimento_nf()
+    criar_tabelas_senior_regras()
+    _migrar_usu_senior_regra()
+    criar_tabela_senior_regra_fonte()
+    criar_tabelas_aud_snap_ident_regra()
 
 # =========================================
 # LOGIN
@@ -3224,6 +3228,8 @@ def consultar_notas_recebimento(
             'PRODUTO' AS tipo_item,
             CAST(I.SeqIpc AS INT) AS sequencia_item,
             COALESCE(I.CodPro, '') AS codigo_item,
+            COALESCE(I.CplIpc, '') AS descricao_lancamento,
+            COALESCE(P.DesPro, '') AS descricao_cadastro_produto_servico,
             COALESCE(P.DesPro, I.CplIpc, '') AS descricao_item,
             COALESCE(I.CodDer, '') AS derivacao,
             COALESCE(I.UniMed, P.UniMed, '') AS unidade_medida,
@@ -3304,6 +3310,8 @@ def consultar_notas_recebimento(
             'SERVIÇO' AS tipo_item,
             CAST(SI.SeqIsc AS INT) AS sequencia_item,
             COALESCE(SI.CodSer, '') AS codigo_item,
+            COALESCE(SI.CplIsc, '') AS descricao_lancamento,
+            COALESCE(S.DesSer, '') AS descricao_cadastro_produto_servico,
             COALESCE(S.DesSer, SI.CplIsc, '') AS descricao_item,
             '' AS derivacao,
             COALESCE(SI.UniMed, S.UniMed, '') AS unidade_medida,
@@ -7264,6 +7272,8 @@ def _excel_label(coluna: str) -> str:
         'fantasia_fornecedor': 'Fantasia Fornecedor',
         'codigo_item': 'Código Item',
         'descricao_item': 'Descrição Item',
+        'descricao_lancamento': 'Descrição Lançamento',
+        'descricao_cadastro_produto_servico': 'Descrição Cadastro Produto/Serviço',
         'codigo_familia': 'Código Família',
         'origem_material': 'Origem Material',
         'transacao': 'Transação',
@@ -26121,6 +26131,3474 @@ def bi_validar_notas_recebimento(
             "BI usa valor_recebido_liquido (ETL aplica sinal de movimento)."
         ),
     }
+
+
+# ============================================================
+# GESTÃO DE REGRAS SENIOR (LSP)
+# Cadastro + versionamento + validação de riscos + exportação TXT
+# + consulta vínculo F098REG. NÃO publica automaticamente no ERP —
+# compilação oficial continua pelo Editor de Regras Senior.
+# ============================================================
+
+ADMINS_SENIOR_REGRAS = {"ADMIN", "RENATO"}
+
+SENIOR_REGRA_STATUS = [
+    "RASCUNHO",
+    "EM_REVISAO",
+    "APROVADA",
+    "EXPORTADA",
+    "COMPILADA_HOMOLOGACAO",
+    "TESTADA_HOMOLOGACAO",
+    "APROVADA_PRODUCAO",
+    "PUBLICADA_PRODUCAO",
+    "ATIVA",
+    "INATIVA",
+]
+
+# Transições permitidas no workflow. Voltar para o status anterior é
+# permitido (rejeição/correção); pular etapas, não.
+SENIOR_REGRA_TRANSICOES: dict = {
+    "RASCUNHO":               {"EM_REVISAO", "RASCUNHO"},
+    "EM_REVISAO":             {"APROVADA", "RASCUNHO"},
+    "APROVADA":               {"EXPORTADA", "EM_REVISAO"},
+    "EXPORTADA":              {"COMPILADA_HOMOLOGACAO", "APROVADA"},
+    "COMPILADA_HOMOLOGACAO":  {"TESTADA_HOMOLOGACAO", "EXPORTADA"},
+    "TESTADA_HOMOLOGACAO":    {"APROVADA_PRODUCAO", "COMPILADA_HOMOLOGACAO"},
+    "APROVADA_PRODUCAO":      {"PUBLICADA_PRODUCAO", "TESTADA_HOMOLOGACAO"},
+    "PUBLICADA_PRODUCAO":     {"ATIVA", "APROVADA_PRODUCAO"},
+    "ATIVA":                  {"INATIVA"},
+    "INATIVA":                {"ATIVA"},
+}
+
+SENIOR_REGRA_AMBIENTES = {"HOMOLOGACAO", "PRODUCAO"}
+
+
+def criar_tabela_senior_regra_fonte():
+    """Cria USU_SENIOR_REGRA_FONTE — guarda o fonte LSP importado de
+    regras que vivem só no ERP (E098REG). Diferente de USU_SENIOR_REGRA,
+    que é o cadastro do portal com workflow/versão, este aqui é um
+    cache simples para a tela 'Ver código LSP' de regras E098REG."""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            IF OBJECT_ID('dbo.USU_SENIOR_REGRA_FONTE', 'U') IS NULL
+            BEGIN
+                CREATE TABLE dbo.USU_SENIOR_REGRA_FONTE (
+                    ID_FONTE       INT IDENTITY(1,1) PRIMARY KEY,
+                    CODEMP         INT           NULL,
+                    CODREG_ERP     INT           NOT NULL,
+                    MODSIS         VARCHAR(10)   NULL,
+                    IDEREG         VARCHAR(40)   NULL,
+                    CODTNS         VARCHAR(20)   NULL,
+                    NOME_REGRA     VARCHAR(200)  NULL,
+                    DESCRICAO      VARCHAR(1000) NULL,
+                    FONTE_LSP      NVARCHAR(MAX) NOT NULL,
+                    HASH_FONTE     VARCHAR(64)   NULL,
+                    ORIGEM_FONTE   VARCHAR(30)   NOT NULL DEFAULT 'IMPORTADO',
+                    TICKET         VARCHAR(100)  NULL,
+                    MOTIVO         VARCHAR(500)  NULL,
+                    USUARIO_IMPORT VARCHAR(100)  NULL,
+                    DATA_IMPORT    DATETIME      NOT NULL DEFAULT GETDATE(),
+                    USUARIO_ALT    VARCHAR(100)  NULL,
+                    DATA_ALT       DATETIME      NULL
+                );
+                CREATE INDEX IX_USU_SENIOR_REGRA_FONTE_CODREG
+                    ON dbo.USU_SENIOR_REGRA_FONTE (CODREG_ERP, MODSIS, IDEREG, CODTNS, DATA_IMPORT DESC);
+                CREATE INDEX IX_USU_SENIOR_REGRA_FONTE_IDENT
+                    ON dbo.USU_SENIOR_REGRA_FONTE (MODSIS, IDEREG, CODTNS);
+            END;
+        """)
+        # Migrações idempotentes para tabelas pré-existentes
+        cursor.execute("""
+            IF OBJECT_ID('dbo.USU_SENIOR_REGRA_FONTE', 'U') IS NOT NULL
+            BEGIN
+                IF COL_LENGTH('dbo.USU_SENIOR_REGRA_FONTE', 'CODEMP') IS NULL
+                    ALTER TABLE dbo.USU_SENIOR_REGRA_FONTE ADD CODEMP INT NULL;
+                IF COL_LENGTH('dbo.USU_SENIOR_REGRA_FONTE', 'DESCRICAO') IS NULL
+                    ALTER TABLE dbo.USU_SENIOR_REGRA_FONTE ADD DESCRICAO VARCHAR(1000) NULL;
+                IF COL_LENGTH('dbo.USU_SENIOR_REGRA_FONTE', 'TICKET') IS NULL
+                    ALTER TABLE dbo.USU_SENIOR_REGRA_FONTE ADD TICKET VARCHAR(100) NULL;
+            END;
+        """)
+        conn.commit()
+        conn.close()
+        print("[OK] Tabela USU_SENIOR_REGRA_FONTE verificada/criada/migrada")
+    except Exception as e:
+        print(f"[!] Erro ao criar USU_SENIOR_REGRA_FONTE: {e}")
+
+
+def _migrar_usu_senior_regra():
+    """ALTER TABLE idempotentes para alinhar USU_SENIOR_REGRA ao schema
+    completo do módulo (IDEREG/CODTNS/TICKET/MOTIVO). Sem essas colunas
+    o /api/senior/regras unificado com E098REG não funciona."""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            IF OBJECT_ID('dbo.USU_SENIOR_REGRA', 'U') IS NOT NULL
+            BEGIN
+                IF COL_LENGTH('dbo.USU_SENIOR_REGRA', 'IDEREG') IS NULL
+                    ALTER TABLE dbo.USU_SENIOR_REGRA ADD IDEREG VARCHAR(40) NULL;
+                IF COL_LENGTH('dbo.USU_SENIOR_REGRA', 'CODTNS') IS NULL
+                    ALTER TABLE dbo.USU_SENIOR_REGRA ADD CODTNS VARCHAR(20) NULL;
+                IF COL_LENGTH('dbo.USU_SENIOR_REGRA', 'TICKET') IS NULL
+                    ALTER TABLE dbo.USU_SENIOR_REGRA ADD TICKET VARCHAR(100) NULL;
+                IF COL_LENGTH('dbo.USU_SENIOR_REGRA', 'MOTIVO') IS NULL
+                    ALTER TABLE dbo.USU_SENIOR_REGRA ADD MOTIVO VARCHAR(500) NULL;
+            END;
+        """)
+        # Backfill: copia IDENTIFICADOR → IDEREG nos registros antigos onde
+        # IDEREG ainda está null mas IDENTIFICADOR existe
+        cursor.execute("""
+            IF OBJECT_ID('dbo.USU_SENIOR_REGRA', 'U') IS NOT NULL
+             AND COL_LENGTH('dbo.USU_SENIOR_REGRA', 'IDENTIFICADOR') IS NOT NULL
+             AND COL_LENGTH('dbo.USU_SENIOR_REGRA', 'IDEREG') IS NOT NULL
+            BEGIN
+                UPDATE dbo.USU_SENIOR_REGRA
+                   SET IDEREG = IDENTIFICADOR
+                 WHERE IDEREG IS NULL AND IDENTIFICADOR IS NOT NULL;
+            END;
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[!] Erro ao migrar USU_SENIOR_REGRA: {e}")
+
+
+def criar_tabelas_senior_regras():
+    """Cria as 3 tabelas do módulo Gestão de Regras Senior se não
+    existirem. Idempotente."""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            IF OBJECT_ID('dbo.USU_SENIOR_REGRA', 'U') IS NULL
+            BEGIN
+                CREATE TABLE dbo.USU_SENIOR_REGRA (
+                    ID_REGRA         INT IDENTITY(1,1) PRIMARY KEY,
+                    CODREG_ERP       INT           NULL,
+                    NOME_REGRA       VARCHAR(120)  NOT NULL,
+                    IDENTIFICADOR    VARCHAR(40)   NULL,
+                    MODSIS           VARCHAR(10)   NULL,
+                    CODEMP           INT           NULL,
+                    DESCRICAO        VARCHAR(500)  NULL,
+                    FONTE_LSP        NVARCHAR(MAX) NOT NULL,
+                    HASH_FONTE       VARCHAR(64)   NULL,
+                    STATUS_REGRA     VARCHAR(30)   NOT NULL DEFAULT 'RASCUNHO',
+                    AMBIENTE         VARCHAR(20)   NOT NULL DEFAULT 'HOMOLOGACAO',
+                    USUARIO_CRIACAO  VARCHAR(100)  NULL,
+                    DATA_CRIACAO     DATETIME      NOT NULL DEFAULT GETDATE(),
+                    USUARIO_ALT      VARCHAR(100)  NULL,
+                    DATA_ALT         DATETIME      NULL
+                );
+                CREATE INDEX IX_USU_SENIOR_REGRA_IDENT
+                    ON dbo.USU_SENIOR_REGRA (IDENTIFICADOR);
+                CREATE INDEX IX_USU_SENIOR_REGRA_STATUS
+                    ON dbo.USU_SENIOR_REGRA (STATUS_REGRA, AMBIENTE);
+                CREATE INDEX IX_USU_SENIOR_REGRA_CODREG
+                    ON dbo.USU_SENIOR_REGRA (CODREG_ERP);
+            END;
+
+            IF OBJECT_ID('dbo.USU_SENIOR_REGRA_VERSAO', 'U') IS NULL
+            BEGIN
+                CREATE TABLE dbo.USU_SENIOR_REGRA_VERSAO (
+                    ID_VERSAO     INT IDENTITY(1,1) PRIMARY KEY,
+                    ID_REGRA      INT           NOT NULL,
+                    NUM_VERSAO    INT           NOT NULL,
+                    FONTE_LSP     NVARCHAR(MAX) NOT NULL,
+                    HASH_FONTE    VARCHAR(64)   NULL,
+                    MOTIVO        VARCHAR(500)  NOT NULL,
+                    TICKET        VARCHAR(100)  NULL,
+                    USUARIO       VARCHAR(100)  NOT NULL,
+                    DATA_HORA     DATETIME      NOT NULL DEFAULT GETDATE(),
+                    CONSTRAINT FK_USU_SENIOR_REGRA_VERSAO
+                        FOREIGN KEY (ID_REGRA)
+                        REFERENCES dbo.USU_SENIOR_REGRA(ID_REGRA)
+                );
+                CREATE INDEX IX_USU_SENIOR_REGRA_VERSAO_REGRA
+                    ON dbo.USU_SENIOR_REGRA_VERSAO (ID_REGRA, NUM_VERSAO);
+            END;
+
+            IF OBJECT_ID('dbo.USU_SENIOR_REGRA_IMPLANTACAO', 'U') IS NULL
+            BEGIN
+                CREATE TABLE dbo.USU_SENIOR_REGRA_IMPLANTACAO (
+                    ID_IMPLANTACAO     INT IDENTITY(1,1) PRIMARY KEY,
+                    ID_REGRA           INT          NOT NULL,
+                    CODREG_ERP         INT          NULL,
+                    CODEMP             INT          NULL,
+                    MODSIS             VARCHAR(10)  NULL,
+                    IDEREG             VARCHAR(40)  NULL,
+                    CODTNS             VARCHAR(20)  NULL,
+                    AMBIENTE           VARCHAR(20)  NOT NULL,
+                    STATUS_IMPLANTACAO VARCHAR(30)  NOT NULL,
+                    RESPONSAVEL        VARCHAR(100) NULL,
+                    DATA_HORA          DATETIME     NOT NULL DEFAULT GETDATE(),
+                    OBSERVACAO         VARCHAR(1000) NULL,
+                    CONSTRAINT FK_USU_SENIOR_REGRA_IMPLANTACAO
+                        FOREIGN KEY (ID_REGRA)
+                        REFERENCES dbo.USU_SENIOR_REGRA(ID_REGRA)
+                );
+                CREATE INDEX IX_USU_SENIOR_REGRA_IMPL_REGRA
+                    ON dbo.USU_SENIOR_REGRA_IMPLANTACAO (ID_REGRA, DATA_HORA);
+            END;
+        """)
+        conn.commit()
+        conn.close()
+        print("[OK] Tabelas de Gestão de Regras Senior verificadas/criadas")
+    except Exception as e:
+        print(f"[!] Erro ao criar tabelas de Gestão de Regras Senior: {e}")
+
+
+# Schemas ------------------------------------------------------
+
+class SeniorRegraCriarPayload(BaseModel):
+    nome_regra: str
+    fonte_lsp: str
+    motivo: str
+    # Aliases aceitos: identificador (legado) e idereg (spec novo)
+    identificador: Optional[str] = None
+    idereg: Optional[str] = None
+    modsis: Optional[str] = None
+    codemp: Optional[int] = None
+    codtns: Optional[str] = None
+    descricao: Optional[str] = None
+    codreg_erp: Optional[int] = None
+    ambiente: Optional[str] = "HOMOLOGACAO"
+    ticket: Optional[str] = None
+
+
+class SeniorRegraAtualizarPayload(BaseModel):
+    fonte_lsp: str
+    motivo: str
+    nome_regra: Optional[str] = None
+    identificador: Optional[str] = None
+    modsis: Optional[str] = None
+    codemp: Optional[int] = None
+    descricao: Optional[str] = None
+    codreg_erp: Optional[int] = None
+    ticket: Optional[str] = None
+
+
+class SeniorRegraTransicionarPayload(BaseModel):
+    novo_status: str
+    motivo: str
+    observacao: Optional[str] = None
+
+
+class SeniorRegraImplantacaoPayload(BaseModel):
+    codreg_erp: Optional[int] = None
+    codemp: Optional[int] = None
+    modsis: Optional[str] = None
+    idereg: Optional[str] = None
+    codtns: Optional[str] = None
+    ambiente: str = "HOMOLOGACAO"
+    status_implantacao: str
+    observacao: Optional[str] = None
+
+
+# Helpers ------------------------------------------------------
+
+def _hash_fonte_lsp(fonte: str) -> str:
+    return _hashlib.sha256((fonte or "").encode("utf-8")).hexdigest()
+
+
+def _admin_regras(usuario_api: str):
+    if usuario_api not in ADMINS_SENIOR_REGRAS:
+        raise HTTPException(
+            status_code=403,
+            detail="Usuário sem permissão para administrar regras Senior.",
+        )
+
+
+def _validar_transicao_regra(status_atual: str, novo_status: str):
+    if novo_status not in SENIOR_REGRA_STATUS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Status inválido. Use um de: {', '.join(SENIOR_REGRA_STATUS)}",
+        )
+    permitidos = SENIOR_REGRA_TRANSICOES.get(status_atual, set())
+    if novo_status not in permitidos:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Transição inválida: {status_atual} → {novo_status}. "
+                f"De {status_atual} só é permitido ir para: "
+                f"{', '.join(sorted(permitidos)) or '(nenhum)'}"
+            ),
+        )
+
+
+def _validar_riscos_lsp(fonte: str) -> dict:
+    """Heurísticas estáticas no fonte LSP para detectar pontos de
+    atenção antes de levar a regra ao Editor de Regras. Sempre retorna
+    `ok=True/False` + lista detalhada de issues."""
+    src = fonte or ""
+    src_upper = src.upper()
+    issues: list = []
+
+    # 1) Cabeçalho com identificador
+    if "IDENTIFICADOR" not in src_upper:
+        issues.append({
+            "nivel": "WARNING",
+            "categoria": "CABECALHO",
+            "mensagem": "Fonte não menciona 'Identificador' no cabeçalho.",
+        })
+
+    # 2) UPDATE/DELETE sem WHERE (regex tolerante a quebras de linha)
+    for cmd in ("UPDATE", "DELETE"):
+        # Regex: COMANDO ... ; sem WHERE no meio
+        # Detecta blocos delimitados por ; — comum em LSP/SQL
+        pattern = rf"\b{cmd}\b[\s\S]+?;"
+        for m in re.finditer(pattern, src_upper):
+            bloco = m.group(0)
+            if " WHERE " not in bloco:
+                issues.append({
+                    "nivel": "ERROR",
+                    "categoria": "SQL_PERIGOSO",
+                    "mensagem": f"Comando {cmd} sem WHERE detectado.",
+                    "trecho": bloco[:200],
+                })
+                break  # 1 por tipo de comando é suficiente
+
+    # 3) DROP/TRUNCATE/ALTER em tabelas
+    for cmd in ("DROP TABLE", "TRUNCATE TABLE", "ALTER TABLE"):
+        if cmd in src_upper:
+            issues.append({
+                "nivel": "ERROR",
+                "categoria": "SQL_PERIGOSO",
+                "mensagem": f"Comando '{cmd}' detectado. Não usar em regra Senior.",
+            })
+
+    # 4) Uso de GeraLog (warning — pode causar rollback dependendo do ponto)
+    if re.search(r"\bGeraLog\b", src):
+        issues.append({
+            "nivel": "WARNING",
+            "categoria": "ROLLBACK",
+            "mensagem": (
+                "Uso de GeraLog. Em pontos transacionais isso pode "
+                "provocar rollback da operação do ERP."
+            ),
+        })
+
+    # 5) Manipulação de tabelas nativas (E* / R*) — exige aprovação
+    nativas_pattern = re.compile(
+        r"\b(UPDATE|DELETE|INSERT\s+INTO)\b\s+(E\d{3}\w+|R\d{3}\w+)",
+        re.IGNORECASE,
+    )
+    matches_nativas = nativas_pattern.findall(src)
+    if matches_nativas:
+        tabelas = sorted({m[1].upper() for m in matches_nativas})
+        issues.append({
+            "nivel": "WARNING",
+            "categoria": "TABELA_NATIVA",
+            "mensagem": "Modificação em tabela nativa do ERP detectada.",
+            "tabelas": tabelas,
+        })
+
+    # 6) USU_* tabelas (custom) — informativo
+    usu_pattern = re.compile(r"\bUSU_[A-Z0-9_]+\b", re.IGNORECASE)
+    tabelas_usu = sorted({m.upper() for m in usu_pattern.findall(src)})
+    if tabelas_usu:
+        issues.append({
+            "nivel": "INFO",
+            "categoria": "TABELA_USUARIO",
+            "mensagem": f"Tabelas USU_* referenciadas: {len(tabelas_usu)}.",
+            "tabelas": tabelas_usu[:50],
+        })
+
+    # 7) ExecSQL / ExecSQLEx — informativo
+    if re.search(r"\bExecSQL(Ex)?\b", src):
+        issues.append({
+            "nivel": "INFO",
+            "categoria": "SQL_DINAMICO",
+            "mensagem": "Uso de ExecSQL/ExecSQLEx — confirme parametrização.",
+        })
+
+    # 8) Tem motivo/ticket comentado
+    tem_ticket_comentado = bool(re.search(r"Ticket\s*:|TICKET-", src, re.IGNORECASE))
+    if not tem_ticket_comentado:
+        issues.append({
+            "nivel": "WARNING",
+            "categoria": "RASTREABILIDADE",
+            "mensagem": "Não foi detectado ticket/motivo no cabeçalho do fonte.",
+        })
+
+    erros = [i for i in issues if i["nivel"] == "ERROR"]
+    warnings = [i for i in issues if i["nivel"] == "WARNING"]
+
+    return {
+        "ok": len(erros) == 0,
+        "total_issues": len(issues),
+        "erros": len(erros),
+        "warnings": len(warnings),
+        "issues": issues,
+        "hash_fonte": _hash_fonte_lsp(src),
+    }
+
+
+def _registrar_versao_regra(cursor, id_regra: int, fonte: str, motivo: str,
+                             ticket: Optional[str], usuario: str):
+    cursor.execute("""
+        SELECT COALESCE(MAX(NUM_VERSAO), 0) FROM dbo.USU_SENIOR_REGRA_VERSAO
+        WHERE ID_REGRA = ?
+    """, [id_regra])
+    proxima = int((cursor.fetchone() or [0])[0]) + 1
+    cursor.execute("""
+        INSERT INTO dbo.USU_SENIOR_REGRA_VERSAO
+            (ID_REGRA, NUM_VERSAO, FONTE_LSP, HASH_FONTE, MOTIVO, TICKET, USUARIO)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, [
+        id_regra, proxima, fonte, _hash_fonte_lsp(fonte),
+        motivo[:500], (ticket or "")[:100] or None, usuario[:100],
+    ])
+    return proxima
+
+
+def _row_regra_to_dict(cursor, row) -> dict:
+    cols = [c[0].lower() for c in cursor.description]
+    item: dict = {}
+    for i, col in enumerate(cols):
+        v = row[i]
+        if isinstance(v, str):
+            v = v.strip()
+        item[col] = v
+    return item
+
+
+# Endpoints ----------------------------------------------------
+
+@app.post("/api/senior/regras")
+def criar_regra_senior(
+    body: SeniorRegraCriarPayload,
+    usuario=Depends(validar_token),
+):
+    usuario_api = str(usuario or "").upper().strip()
+    _admin_regras(usuario_api)
+
+    nome = (body.nome_regra or "").strip()
+    fonte = body.fonte_lsp or ""
+    motivo = (body.motivo or "").strip()
+    if not nome or not fonte or not motivo:
+        raise HTTPException(
+            status_code=422,
+            detail="nome_regra, fonte_lsp e motivo são obrigatórios.",
+        )
+    ambiente = (body.ambiente or "HOMOLOGACAO").upper().strip()
+    if ambiente not in SENIOR_REGRA_AMBIENTES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Ambiente inválido. Use um de: {', '.join(SENIOR_REGRA_AMBIENTES)}",
+        )
+
+    # Consolida aliases: idereg (preferido) > identificador (legado)
+    ident_eff = ((body.idereg or body.identificador or "") or "").strip()
+    codtns_eff = (body.codtns or "").strip()
+    ticket_eff = (body.ticket or "").strip()
+
+    h = _hash_fonte_lsp(fonte)
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        # Grava IDENTIFICADOR e IDEREG juntos (compat com schema legado +
+        # spec novo). CODTNS, TICKET, MOTIVO usam colunas adicionadas
+        # via migração idempotente — funciona em qualquer schema.
+        cursor.execute("""
+            INSERT INTO dbo.USU_SENIOR_REGRA
+                (CODREG_ERP, NOME_REGRA, IDENTIFICADOR, IDEREG,
+                 MODSIS, CODEMP, CODTNS, DESCRICAO,
+                 FONTE_LSP, HASH_FONTE, STATUS_REGRA, AMBIENTE,
+                 TICKET, MOTIVO,
+                 USUARIO_CRIACAO, USUARIO_ALT, DATA_ALT)
+            OUTPUT INSERTED.ID_REGRA
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RASCUNHO', ?, ?, ?, ?, ?, GETDATE())
+        """, [
+            body.codreg_erp, nome[:120],
+            ident_eff[:40] or None,
+            ident_eff[:40] or None,
+            (body.modsis or "")[:10] or None,
+            body.codemp,
+            codtns_eff[:20] or None,
+            (body.descricao or "")[:500] or None,
+            fonte, h, ambiente,
+            ticket_eff[:100] or None,
+            motivo[:500],
+            usuario_api, usuario_api,
+        ])
+        id_regra = int(cursor.fetchone()[0])
+        num_versao = _registrar_versao_regra(
+            cursor, id_regra, fonte, motivo, ticket_eff, usuario_api,
+        )
+        conn.commit()
+        return {
+            "mensagem": "Regra criada como RASCUNHO.",
+            "id_regra": id_regra,
+            "status": "RASCUNHO",
+            "num_versao": num_versao,
+            "hash_fonte": h,
+        }
+    except HTTPException:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Erro ao criar regra: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/senior/regras")
+def listar_regras_senior(
+    # Aceita ambas convenções: spec novo (texto/status_regra/idereg) +
+    # original (filtro/status/identificador). Combina via fallback.
+    texto: Optional[str] = None,
+    status_regra: Optional[str] = None,
+    idereg: Optional[str] = None,
+    filtro: Optional[str] = None,
+    status: Optional[str] = None,
+    ambiente: Optional[str] = None,
+    identificador: Optional[str] = None,
+    incluir_e098reg: bool = True,
+    pagina: int = 1,
+    tamanho_pagina: int = 100,
+    usuario=Depends(validar_token),
+):
+    """Lista regras unificadas:
+       - PORTAL: dbo.USU_SENIOR_REGRA (criadas via /api/senior/regras POST)
+       - E098REG: identificadores do ERP com CODREG > 0
+                  (modo `incluir_e098reg=true`, default)
+
+    Frontend recebe linhas das duas origens com coluna `ORIGEM` indicando
+    qual. Quando USU_SENIOR_REGRA está vazia, ainda assim aparecem as
+    regras do ERP — destrava a tela sem precisar cadastrar nada antes."""
+    pagina = max(1, int(pagina or 1))
+    tamanho_pagina = max(1, min(int(tamanho_pagina or 100), 500))
+    offset = (pagina - 1) * tamanho_pagina
+
+    # Consolida aliases dos query params (texto preferido sobre filtro, etc)
+    texto_eff = (texto or filtro or "").strip() or None
+    status_eff = (status_regra or status or "").strip().upper() or None
+    idereg_eff = (idereg or identificador or "").strip().upper() or None
+    ambiente_eff = (ambiente or "").strip().upper() or None
+
+    # WHERE do branch PORTAL
+    where_portal = ["1=1"]
+    params_portal: list = []
+    if texto_eff:
+        where_portal.append(
+            "(NOME_REGRA LIKE ? OR DESCRICAO LIKE ? OR FONTE_LSP LIKE ?"
+            " OR CAST(CODREG_ERP AS VARCHAR(20)) LIKE ?)"
+        )
+        like = f"%{texto_eff}%"
+        params_portal.extend([like, like, like, like])
+    if status_eff:
+        where_portal.append("STATUS_REGRA = ?")
+        params_portal.append(status_eff)
+    if idereg_eff:
+        where_portal.append(
+            "(COALESCE(IDEREG, IDENTIFICADOR, '') LIKE ?)"
+        )
+        params_portal.append(f"%{idereg_eff}%")
+    if ambiente_eff:
+        where_portal.append("AMBIENTE = ?")
+        params_portal.append(ambiente_eff)
+    sql_where_portal = " AND ".join(where_portal)
+
+    # WHERE do branch E098REG — só ativos vinculados a CODREG > 0
+    incluir_erp = bool(incluir_e098reg)
+    where_erp = ["ISNULL(R.CODREG, 0) > 0"]
+    params_erp: list = []
+    if status_eff and status_eff not in (
+        "ATIVA", "INATIVA", "TESTE_X", "OUTRA"
+    ):
+        # Status que só existe no PORTAL — não traz ERP nessa combinação
+        incluir_erp = False
+    if texto_eff:
+        where_erp.append("(R.IDEREG LIKE ? OR R.DESREG LIKE ? OR R.OBSREG LIKE ?)")
+        like = f"%{texto_eff}%"
+        params_erp.extend([like, like, like])
+    if idereg_eff:
+        where_erp.append("R.IDEREG LIKE ?")
+        params_erp.append(f"%{idereg_eff}%")
+    sql_where_erp = " AND ".join(where_erp)
+
+    # Detecta se IDEREG existe (a migração ainda pode não ter rodado em
+    # ambientes muito antigos). Se não existir, usa IDENTIFICADOR.
+    coluna_idereg = "COALESCE(IDEREG, IDENTIFICADOR, '')"
+
+    sql_portal = f"""
+        SELECT
+            ID_REGRA,
+            CODEMP,
+            CODREG_ERP,
+            NOME_REGRA,
+            MODSIS,
+            {coluna_idereg} AS IDEREG,
+            CODTNS,
+            DESCRICAO,
+            HASH_FONTE,
+            STATUS_REGRA,
+            AMBIENTE,
+            TICKET,
+            MOTIVO,
+            USUARIO_CRIACAO,
+            CONVERT(VARCHAR(19), DATA_CRIACAO, 120) AS DATA_CRIACAO,
+            USUARIO_ALT,
+            CONVERT(VARCHAR(19), DATA_ALT, 120) AS DATA_ALT,
+            CAST('PORTAL' AS VARCHAR(20)) AS ORIGEM
+        FROM dbo.USU_SENIOR_REGRA
+        WHERE {sql_where_portal}
+    """
+
+    sql_erp = f"""
+        SELECT
+            CAST(NULL AS INT) AS ID_REGRA,
+            R.CODEMP AS CODEMP,
+            R.CODREG AS CODREG_ERP,
+            CONCAT(
+                'Regra ERP ', R.CODREG, ' - ',
+                LTRIM(RTRIM(ISNULL(R.MODSIS, ''))), '-',
+                LTRIM(RTRIM(ISNULL(R.IDEREG, '')))
+            ) AS NOME_REGRA,
+            LTRIM(RTRIM(ISNULL(R.MODSIS, ''))) AS MODSIS,
+            LTRIM(RTRIM(ISNULL(R.IDEREG, ''))) AS IDEREG,
+            LTRIM(RTRIM(ISNULL(R.CODTNS, ''))) AS CODTNS,
+            LTRIM(RTRIM(ISNULL(R.DESREG, ''))) AS DESCRICAO,
+            CAST(NULL AS VARCHAR(64)) AS HASH_FONTE,
+            CASE
+                WHEN LTRIM(RTRIM(ISNULL(R.SITREG, ''))) = 'A' THEN 'ATIVA'
+                WHEN LTRIM(RTRIM(ISNULL(R.SITREG, ''))) = 'I' THEN 'INATIVA'
+                WHEN LTRIM(RTRIM(ISNULL(R.SITREG, ''))) = 'X' THEN 'TESTE_X'
+                ELSE 'OUTRA'
+            END AS STATUS_REGRA,
+            CAST('ERP' AS VARCHAR(20)) AS AMBIENTE,
+            CAST(NULL AS VARCHAR(100)) AS TICKET,
+            LTRIM(RTRIM(ISNULL(R.OBSREG, ''))) AS MOTIVO,
+            CONVERT(VARCHAR(100), R.USUGER) AS USUARIO_CRIACAO,
+            CONVERT(VARCHAR(19), R.DATGER, 120) AS DATA_CRIACAO,
+            CAST(NULL AS VARCHAR(100)) AS USUARIO_ALT,
+            CAST(NULL AS VARCHAR(19)) AS DATA_ALT,
+            CAST('E098REG' AS VARCHAR(20)) AS ORIGEM
+        FROM E098REG R
+        WHERE {sql_where_erp}
+    """
+
+    if incluir_erp:
+        sql_unificada = f"""
+            WITH REGRAS_UNIFICADAS AS (
+                {sql_portal}
+                UNION ALL
+                {sql_erp}
+            )
+        """
+        params_unificada = params_portal + params_erp
+    else:
+        sql_unificada = f"""
+            WITH REGRAS_UNIFICADAS AS (
+                {sql_portal}
+            )
+        """
+        params_unificada = params_portal
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        # Total
+        cursor.execute(
+            sql_unificada + " SELECT COUNT(1) FROM REGRAS_UNIFICADAS",
+            params_unificada,
+        )
+        total = int(cursor.fetchone()[0] or 0)
+
+        # Página
+        sql_pagina = sql_unificada + """
+            SELECT *
+            FROM REGRAS_UNIFICADAS
+            ORDER BY
+                CASE WHEN ORIGEM = 'PORTAL' THEN 0 ELSE 1 END,
+                COALESCE(DATA_ALT, DATA_CRIACAO) DESC,
+                IDEREG,
+                CODREG_ERP
+            OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+        """
+        cursor.execute(sql_pagina, params_unificada + [offset, tamanho_pagina])
+        cols = [c[0] for c in cursor.description]
+        dados = []
+        for row in cursor.fetchall():
+            item = {}
+            for i, col in enumerate(cols):
+                v = row[i]
+                if isinstance(v, str):
+                    v = v.strip()
+                item[col] = v
+            dados.append(item)
+        return {
+            "pagina": pagina,
+            "tamanho_pagina": tamanho_pagina,
+            "total": total,
+            "total_paginas": (total + tamanho_pagina - 1) // tamanho_pagina if total else 0,
+            "dados": dados,
+            "items": dados,  # alias compat frontend
+            "incluir_e098reg": incluir_erp,
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _carregar_regra(cursor, id_regra: int) -> dict:
+    cursor.execute("""
+        SELECT
+            ID_REGRA, CODREG_ERP, NOME_REGRA, IDENTIFICADOR, MODSIS, CODEMP,
+            DESCRICAO, FONTE_LSP, HASH_FONTE, STATUS_REGRA, AMBIENTE,
+            USUARIO_CRIACAO,
+            CONVERT(VARCHAR(19), DATA_CRIACAO, 120) AS DATA_CRIACAO,
+            USUARIO_ALT,
+            CONVERT(VARCHAR(19), DATA_ALT, 120) AS DATA_ALT
+        FROM dbo.USU_SENIOR_REGRA
+        WHERE ID_REGRA = ?
+    """, [id_regra])
+    row = cursor.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Regra não encontrada.")
+    return _row_regra_to_dict(cursor, row)
+
+
+# ============================================================
+# ATENÇÃO ROTEAMENTO: as 3 rotas fixas abaixo (/codigo, /importar-fonte,
+# /fontes) PRECISAM estar declaradas ANTES de /{id_regra} — senão o
+# FastAPI tenta converter "codigo"/"importar-fonte"/"fontes" para int e
+# devolve 422 ao cliente.
+# ============================================================
+
+
+class SeniorRegraImportarFontePayload(BaseModel):
+    codreg_erp: int
+    fonte_lsp: str
+    motivo: str
+    codemp: Optional[int] = None
+    modsis: Optional[str] = None
+    idereg: Optional[str] = None
+    codtns: Optional[str] = ""
+    nome_regra: Optional[str] = None
+    descricao: Optional[str] = None
+    ticket: Optional[str] = None
+    origem_fonte: Optional[str] = "IMPORTADO"
+    importar_para_portal: bool = True
+
+
+@app.get("/api/senior/regras/codigo")
+def senior_regras_codigo(
+    codreg: Optional[int] = None,
+    codreg_erp: Optional[int] = None,
+    codemp: Optional[int] = None,
+    modsis: Optional[str] = None,
+    idereg: Optional[str] = None,
+    codtns: str = "",
+    usuario=Depends(validar_token),
+):
+    """Busca o fonte LSP da regra. Ordem de busca:
+       1. USU_SENIOR_REGRA_FONTE (cache de imports manuais)
+       2. USU_SENIOR_REGRA (regra clonada/criada no portal)
+       3. Resumo da E098REG quando não houver fonte"""
+    codigo = codreg_erp or codreg
+    if not codigo:
+        raise HTTPException(status_code=400, detail="Informe codreg ou codreg_erp.")
+
+    modsis_n = (modsis or "").strip().upper()
+    idereg_n = (idereg or "").strip().upper()
+    codtns_n = (codtns or "").strip().upper()
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+
+        # 1) Cache de fontes importadas
+        where_f = ["CODREG_ERP = ?"]
+        params_f: list = [int(codigo)]
+        if codemp is not None:
+            where_f.append("(CODEMP = ? OR CODEMP IS NULL)")
+            params_f.append(int(codemp))
+        if modsis_n:
+            where_f.append("LTRIM(RTRIM(ISNULL(MODSIS, ''))) = ?")
+            params_f.append(modsis_n)
+        if idereg_n:
+            where_f.append("LTRIM(RTRIM(ISNULL(IDEREG, ''))) = ?")
+            params_f.append(idereg_n)
+        if codtns_n:
+            where_f.append("LTRIM(RTRIM(ISNULL(CODTNS, ''))) = ?")
+            params_f.append(codtns_n)
+
+        cursor.execute(f"""
+            SELECT TOP 1
+                ID_FONTE, CODEMP, CODREG_ERP, MODSIS, IDEREG, CODTNS,
+                NOME_REGRA, DESCRICAO, FONTE_LSP, HASH_FONTE,
+                ORIGEM_FONTE, TICKET, MOTIVO, USUARIO_IMPORT,
+                CONVERT(VARCHAR(19), DATA_IMPORT, 120) AS DATA_IMPORT,
+                USUARIO_ALT,
+                CONVERT(VARCHAR(19), DATA_ALT, 120) AS DATA_ALT
+            FROM dbo.USU_SENIOR_REGRA_FONTE
+            WHERE {' AND '.join(where_f)}
+            ORDER BY DATA_IMPORT DESC
+        """, params_f)
+        row = cursor.fetchone()
+        if row:
+            cols = [c[0] for c in cursor.description]
+            item: dict = {}
+            for i, c in enumerate(cols):
+                v = row[i]
+                if isinstance(v, str):
+                    v = v.strip()
+                item[c.lower()] = v
+            fonte = item.get("fonte_lsp") or ""
+            item["fonte_disponivel"] = True
+            item["origem"] = "USU_SENIOR_REGRA_FONTE"
+            item["alertas"] = [
+                i.get("mensagem") for i in
+                _validar_riscos_lsp(fonte).get("issues", [])
+            ]
+            return item
+
+        # 2) Tenta USU_SENIOR_REGRA (regra criada/clonada no portal)
+        cursor.execute("""
+            SELECT TOP 1
+                ID_REGRA, CODREG_ERP, NOME_REGRA, MODSIS,
+                COALESCE(IDEREG, IDENTIFICADOR, '') AS IDEREG,
+                CODTNS, DESCRICAO, FONTE_LSP, HASH_FONTE,
+                STATUS_REGRA, AMBIENTE, TICKET, MOTIVO
+            FROM dbo.USU_SENIOR_REGRA
+            WHERE CODREG_ERP = ?
+              AND ISNULL(FONTE_LSP, '') <> ''
+            ORDER BY ID_REGRA DESC
+        """, [int(codigo)])
+        row = cursor.fetchone()
+        if row:
+            cols = [c[0] for c in cursor.description]
+            item = {}
+            for i, c in enumerate(cols):
+                v = row[i]
+                if isinstance(v, str):
+                    v = v.strip()
+                item[c.lower()] = v
+            fonte = item.get("fonte_lsp") or ""
+            item["fonte_disponivel"] = bool(fonte.strip())
+            item["origem"] = "USU_SENIOR_REGRA"
+            item["alertas"] = [
+                i.get("mensagem") for i in
+                _validar_riscos_lsp(fonte).get("issues", [])
+            ]
+            return item
+
+        # 3) Resumo E098REG se nada encontrado
+        where_e = ["R.CODREG = ?"]
+        params_e: list = [int(codigo)]
+        if codemp is not None:
+            where_e.append("R.CODEMP = ?")
+            params_e.append(int(codemp))
+        if modsis_n:
+            where_e.append("LTRIM(RTRIM(ISNULL(R.MODSIS, ''))) = ?")
+            params_e.append(modsis_n)
+        if idereg_n:
+            where_e.append("LTRIM(RTRIM(ISNULL(R.IDEREG, ''))) = ?")
+            params_e.append(idereg_n)
+        if codtns_n:
+            where_e.append("LTRIM(RTRIM(ISNULL(R.CODTNS, ''))) = ?")
+            params_e.append(codtns_n)
+        cursor.execute(f"""
+            SELECT TOP 1
+                R.CODEMP,
+                LTRIM(RTRIM(ISNULL(R.MODSIS, ''))) AS MODSIS,
+                LTRIM(RTRIM(ISNULL(R.IDEREG, ''))) AS IDEREG,
+                LTRIM(RTRIM(ISNULL(R.CODTNS, ''))) AS CODTNS,
+                LTRIM(RTRIM(ISNULL(R.DESREG, ''))) AS DESREG,
+                R.CODREG, R.REGGUP,
+                LTRIM(RTRIM(ISNULL(R.OBSREG, ''))) AS OBSREG,
+                LTRIM(RTRIM(ISNULL(R.SITREG, ''))) AS SITREG
+            FROM E098REG R
+            WHERE {' AND '.join(where_e)}
+        """, params_e)
+        row = cursor.fetchone()
+        resumo_erp = None
+        if row:
+            cols = [c[0] for c in cursor.description]
+            resumo_erp = {}
+            for i, c in enumerate(cols):
+                v = row[i]
+                if isinstance(v, str):
+                    v = v.strip()
+                resumo_erp[c] = v
+
+        return {
+            "fonte_disponivel": False,
+            "origem": "E098REG",
+            "codreg_erp": int(codigo),
+            "codemp": codemp,
+            "modsis": modsis_n or None,
+            "idereg": idereg_n or None,
+            "codtns": codtns_n or None,
+            "resumo_erp": resumo_erp,
+            "mensagem": (
+                "Fonte LSP ainda não importado para o portal. Use o botão "
+                "'Importar fonte LSP' para colar o código exportado do "
+                "Editor de Regras Senior."
+            ),
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/api/senior/regras/importar-fonte")
+def senior_regras_importar_fonte(
+    body: SeniorRegraImportarFontePayload,
+    usuario=Depends(validar_token),
+):
+    """Importa fonte LSP. Sempre grava em USU_SENIOR_REGRA_FONTE
+    (histórico). Quando `importar_para_portal=true` (default), também
+    cria/atualiza a regra correspondente em USU_SENIOR_REGRA + versão."""
+    usuario_api = str(usuario or "").upper().strip()
+    _admin_regras(usuario_api)
+
+    fonte = body.fonte_lsp or ""
+    motivo = (body.motivo or "").strip()
+    if not fonte.strip():
+        raise HTTPException(status_code=422, detail="fonte_lsp é obrigatório.")
+    if not motivo:
+        raise HTTPException(status_code=422, detail="motivo é obrigatório.")
+    if not body.codreg_erp or body.codreg_erp <= 0:
+        raise HTTPException(status_code=422, detail="codreg_erp deve ser > 0.")
+
+    h = _hash_fonte_lsp(fonte)
+    modsis = (body.modsis or "").strip().upper() or None
+    idereg = (body.idereg or "").strip().upper() or None
+    codtns = (body.codtns or "").strip().upper() or None
+    nome = body.nome_regra or f"Regra ERP {body.codreg_erp} - {modsis or ''}-{idereg or ''}"
+    nome = nome.strip()
+    origem_fonte = (body.origem_fonte or "IMPORTADO").upper().strip()[:30]
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        # 1) Sempre INSERT em USU_SENIOR_REGRA_FONTE (histórico imutável)
+        cursor.execute("""
+            INSERT INTO dbo.USU_SENIOR_REGRA_FONTE
+                (CODEMP, CODREG_ERP, MODSIS, IDEREG, CODTNS,
+                 NOME_REGRA, DESCRICAO, FONTE_LSP, HASH_FONTE,
+                 ORIGEM_FONTE, TICKET, MOTIVO, USUARIO_IMPORT)
+            OUTPUT INSERTED.ID_FONTE
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            body.codemp,
+            int(body.codreg_erp), modsis, idereg, codtns,
+            nome[:200] or None,
+            (body.descricao or "")[:1000] or None,
+            fonte, h, origem_fonte,
+            (body.ticket or "")[:100] or None,
+            motivo[:500], usuario_api,
+        ])
+        id_fonte = int(cursor.fetchone()[0])
+
+        id_regra_portal = None
+        num_versao = None
+
+        # 2) Se solicitado, cria/atualiza regra no portal + versão
+        if body.importar_para_portal:
+            cursor.execute("""
+                SELECT TOP 1 ID_REGRA
+                FROM dbo.USU_SENIOR_REGRA
+                WHERE CODREG_ERP = ?
+                  AND COALESCE(MODSIS, '') = ?
+                  AND COALESCE(IDEREG, IDENTIFICADOR, '') = ?
+                  AND COALESCE(CODTNS, '') = ?
+                ORDER BY ID_REGRA DESC
+            """, [
+                int(body.codreg_erp),
+                modsis or "", idereg or "", codtns or "",
+            ])
+            row = cursor.fetchone()
+            if row:
+                id_regra_portal = int(row[0])
+                cursor.execute("""
+                    SELECT ISNULL(MAX(NUM_VERSAO), 0) + 1
+                    FROM dbo.USU_SENIOR_REGRA_VERSAO
+                    WHERE ID_REGRA = ?
+                """, [id_regra_portal])
+                num_versao = int(cursor.fetchone()[0] or 1)
+                cursor.execute("""
+                    UPDATE dbo.USU_SENIOR_REGRA
+                       SET NOME_REGRA = ?, DESCRICAO = ?,
+                           FONTE_LSP = ?, HASH_FONTE = ?,
+                           TICKET = ?, MOTIVO = ?,
+                           USUARIO_ALT = ?, DATA_ALT = GETDATE()
+                     WHERE ID_REGRA = ?
+                """, [
+                    nome[:120], (body.descricao or "")[:500] or None,
+                    fonte, h,
+                    (body.ticket or "")[:100] or None,
+                    motivo[:500],
+                    usuario_api, id_regra_portal,
+                ])
+            else:
+                cursor.execute("""
+                    INSERT INTO dbo.USU_SENIOR_REGRA
+                        (CODEMP, CODREG_ERP, NOME_REGRA,
+                         IDENTIFICADOR, IDEREG, MODSIS, CODTNS, DESCRICAO,
+                         FONTE_LSP, HASH_FONTE,
+                         STATUS_REGRA, AMBIENTE,
+                         TICKET, MOTIVO,
+                         USUARIO_CRIACAO, USUARIO_ALT, DATA_ALT)
+                    OUTPUT INSERTED.ID_REGRA
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            'IMPORTADA', 'HOMOLOGACAO',
+                            ?, ?, ?, ?, GETDATE())
+                """, [
+                    body.codemp,
+                    int(body.codreg_erp), nome[:120],
+                    (idereg or "")[:40] or None,
+                    (idereg or "")[:40] or None,
+                    modsis, codtns,
+                    (body.descricao or "")[:500] or None,
+                    fonte, h,
+                    (body.ticket or "")[:100] or None,
+                    motivo[:500],
+                    usuario_api, usuario_api,
+                ])
+                id_regra_portal = int(cursor.fetchone()[0])
+                num_versao = 1
+
+            cursor.execute("""
+                INSERT INTO dbo.USU_SENIOR_REGRA_VERSAO
+                    (ID_REGRA, NUM_VERSAO, FONTE_LSP, HASH_FONTE,
+                     MOTIVO, TICKET, USUARIO)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, [
+                id_regra_portal, num_versao, fonte, h,
+                motivo[:500],
+                (body.ticket or "")[:100] or None,
+                usuario_api,
+            ])
+
+        conn.commit()
+        return {
+            "status": "OK",
+            "mensagem": "Fonte LSP importado com sucesso.",
+            "id_fonte": id_fonte,
+            "id_regra_portal": id_regra_portal,
+            "num_versao": num_versao,
+            "codreg_erp": int(body.codreg_erp),
+            "modsis": modsis,
+            "idereg": idereg,
+            "codtns": codtns,
+            "hash_fonte": h,
+            "alertas": [
+                i.get("mensagem") for i in
+                _validar_riscos_lsp(fonte).get("issues", [])
+            ],
+        }
+    except HTTPException:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Erro ao importar fonte LSP: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/senior/regras/fontes")
+def senior_regras_listar_fontes(
+    texto: Optional[str] = None,
+    modsis: Optional[str] = None,
+    pagina: int = 1,
+    tamanho_pagina: int = 100,
+    usuario=Depends(validar_token),
+):
+    """Lista fontes LSP importados (biblioteca de regras ERP com código
+    disponível para visualizar)."""
+    pagina = max(1, int(pagina or 1))
+    tamanho_pagina = max(1, min(int(tamanho_pagina or 100), 500))
+    offset = (pagina - 1) * tamanho_pagina
+
+    where = ["1=1"]
+    params: list = []
+    if texto:
+        where.append("(CAST(CODREG_ERP AS VARCHAR(20)) LIKE ? OR NOME_REGRA LIKE ? OR IDEREG LIKE ?)")
+        like = f"%{texto}%"
+        params.extend([like, like, like])
+    if modsis:
+        where.append("MODSIS = ?")
+        params.append(modsis.strip().upper())
+    where_sql = " AND ".join(where)
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT COUNT(1) FROM dbo.USU_SENIOR_REGRA_FONTE WHERE {where_sql}",
+            params,
+        )
+        total = int(cursor.fetchone()[0] or 0)
+        cursor.execute(f"""
+            SELECT
+                ID_FONTE, CODEMP, CODREG_ERP, MODSIS, IDEREG, CODTNS,
+                NOME_REGRA, DESCRICAO, HASH_FONTE, ORIGEM_FONTE,
+                TICKET, MOTIVO,
+                USUARIO_IMPORT,
+                CONVERT(VARCHAR(19), DATA_IMPORT, 120) AS DATA_IMPORT,
+                USUARIO_ALT,
+                CONVERT(VARCHAR(19), DATA_ALT, 120) AS DATA_ALT,
+                DATALENGTH(FONTE_LSP) AS TAMANHO_FONTE_BYTES
+            FROM dbo.USU_SENIOR_REGRA_FONTE
+            WHERE {where_sql}
+            ORDER BY ID_FONTE DESC
+            OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+        """, params + [offset, tamanho_pagina])
+        cols = [c[0] for c in cursor.description]
+        dados = []
+        for row in cursor.fetchall():
+            item = {}
+            for i, c in enumerate(cols):
+                v = row[i]
+                if isinstance(v, str):
+                    v = v.strip()
+                item[c] = v
+            dados.append(item)
+        return {
+            "pagina": pagina, "tamanho_pagina": tamanho_pagina,
+            "total": total, "dados": dados, "items": dados,
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+class SeniorImportarLoteItem(BaseModel):
+    codreg_erp: int
+    fonte_lsp: str
+    codemp: Optional[int] = None
+    modsis: Optional[str] = None
+    idereg: Optional[str] = None
+    codtns: Optional[str] = ""
+    nome_regra: Optional[str] = None
+    descricao: Optional[str] = None
+    ticket: Optional[str] = None
+
+
+class SeniorImportarLoteFontePayload(BaseModel):
+    """Body do bulk import. Cada item segue o mesmo schema do
+    /importar-fonte. Motivo é compartilhado para o lote inteiro;
+    `parar_no_primeiro_erro` controla se aborta no primeiro erro ou
+    tenta importar tudo coletando falhas."""
+    itens: list
+    motivo: str
+    importar_para_portal: bool = True
+    origem_fonte: Optional[str] = "IMPORTADO_LOTE"
+    parar_no_primeiro_erro: bool = False
+
+
+@app.post("/api/senior/regras/importar-lote")
+def senior_regras_importar_lote(
+    body: SeniorImportarLoteFontePayload,
+    usuario=Depends(validar_token),
+):
+    """Importa N regras de uma vez. Cada item vira:
+       - 1 INSERT em USU_SENIOR_REGRA_FONTE (sempre)
+       - 1 UPSERT em USU_SENIOR_REGRA + versão (se importar_para_portal=true)
+
+    Cada item é processado em sua própria transação curta para que
+    1 erro não corrompa o resto do lote. Retorna resumo com sucessos,
+    falhas e detalhes individuais."""
+    usuario_api = str(usuario or "").upper().strip()
+    _admin_regras(usuario_api)
+
+    motivo = (body.motivo or "").strip()
+    if not motivo:
+        raise HTTPException(status_code=422, detail="motivo é obrigatório para o lote.")
+    if not body.itens or not isinstance(body.itens, list):
+        raise HTTPException(status_code=422, detail="itens deve ser uma lista não vazia.")
+    if len(body.itens) > 500:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Máximo 500 itens por lote — recebido {len(body.itens)}.",
+        )
+
+    origem_fonte = (body.origem_fonte or "IMPORTADO_LOTE").upper().strip()[:30]
+    resultados: list = []
+    sucessos = 0
+    falhas = 0
+    falhas_detalhe: list = []
+
+    for idx, raw in enumerate(body.itens, start=1):
+        # Cada item vira um payload tipado individualmente
+        try:
+            if isinstance(raw, dict):
+                item = SeniorImportarLoteItem(**raw)
+            else:
+                item = raw
+        except Exception as exc:
+            falhas += 1
+            err = {
+                "indice": idx,
+                "status": "ERRO_VALIDACAO",
+                "erro": str(exc)[:300],
+                "codreg_erp": (raw.get("codreg_erp") if isinstance(raw, dict) else None),
+            }
+            resultados.append(err)
+            falhas_detalhe.append(err)
+            if body.parar_no_primeiro_erro:
+                break
+            continue
+
+        # Reusa toda a lógica do /importar-fonte chamando o handler
+        # diretamente — preserva validações e workflow de versão.
+        payload_unitario = SeniorRegraImportarFontePayload(
+            codreg_erp=item.codreg_erp,
+            fonte_lsp=item.fonte_lsp,
+            motivo=motivo,
+            codemp=item.codemp,
+            modsis=item.modsis,
+            idereg=item.idereg,
+            codtns=item.codtns,
+            nome_regra=item.nome_regra,
+            descricao=item.descricao,
+            ticket=item.ticket,
+            origem_fonte=origem_fonte,
+            importar_para_portal=body.importar_para_portal,
+        )
+        try:
+            resp = senior_regras_importar_fonte(payload_unitario, usuario)
+            sucessos += 1
+            resultados.append({
+                "indice": idx,
+                "status": "OK",
+                "codreg_erp": item.codreg_erp,
+                "id_fonte": resp.get("id_fonte"),
+                "id_regra_portal": resp.get("id_regra_portal"),
+                "num_versao": resp.get("num_versao"),
+                "alertas": resp.get("alertas") or [],
+            })
+        except HTTPException as exc:
+            falhas += 1
+            err = {
+                "indice": idx,
+                "status": "ERRO",
+                "codreg_erp": item.codreg_erp,
+                "http_status": exc.status_code,
+                "erro": str(exc.detail)[:300],
+            }
+            resultados.append(err)
+            falhas_detalhe.append(err)
+            if body.parar_no_primeiro_erro:
+                break
+        except Exception as exc:
+            falhas += 1
+            err = {
+                "indice": idx,
+                "status": "ERRO_INESPERADO",
+                "codreg_erp": item.codreg_erp,
+                "erro": str(exc)[:300],
+            }
+            resultados.append(err)
+            falhas_detalhe.append(err)
+            if body.parar_no_primeiro_erro:
+                break
+
+    return {
+        "status": "OK" if falhas == 0 else ("PARCIAL" if sucessos > 0 else "ERRO"),
+        "total": len(body.itens),
+        "processados": len(resultados),
+        "sucessos": sucessos,
+        "falhas": falhas,
+        "parar_no_primeiro_erro": body.parar_no_primeiro_erro,
+        "resultados": resultados,
+        "falhas_detalhe": falhas_detalhe[:50],   # truncar pra não inflar resposta
+    }
+
+
+@app.get("/api/senior/regras/{id_regra:int}")
+def detalhar_regra_senior(id_regra: int, usuario=Depends(validar_token)):
+    """Detalhe completo de uma regra do portal — inclui FONTE_LSP,
+    ALERTAS (validação heurística) e metadados. Frontend usa este
+    endpoint quando o usuário abre o Editor de Regras."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT
+                ID_REGRA,
+                CODREG_ERP,
+                NOME_REGRA,
+                MODSIS,
+                COALESCE(IDEREG, IDENTIFICADOR, '')  AS IDEREG,
+                IDENTIFICADOR,
+                CODEMP,
+                CODTNS,
+                DESCRICAO,
+                FONTE_LSP,
+                HASH_FONTE,
+                STATUS_REGRA,
+                AMBIENTE,
+                TICKET,
+                MOTIVO,
+                USUARIO_CRIACAO,
+                CONVERT(VARCHAR(19), DATA_CRIACAO, 120) AS DATA_CRIACAO,
+                USUARIO_ALT,
+                CONVERT(VARCHAR(19), DATA_ALT, 120)     AS DATA_ALT
+            FROM dbo.USU_SENIOR_REGRA
+            WHERE ID_REGRA = ?
+        """, [id_regra])
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Regra não encontrada no portal.")
+
+        cols = [c[0] for c in cursor.description]
+        dados: dict = {}
+        for i, col in enumerate(cols):
+            v = row[i]
+            if isinstance(v, str):
+                v = v.strip()
+            dados[col] = v
+
+        fonte = dados.get("FONTE_LSP") or ""
+        validacao = _validar_riscos_lsp(fonte)
+        # Lista de mensagens curtas (compat com clientes que esperam strings)
+        dados["ALERTAS"] = [i.get("mensagem") for i in validacao.get("issues", [])]
+        dados["VALIDACAO"] = validacao
+        dados["FONTE_DISPONIVEL"] = bool(fonte.strip())
+        dados["ORIGEM"] = "PORTAL"
+
+        # Última versão
+        cursor.execute("""
+            SELECT TOP 1 NUM_VERSAO, MOTIVO, TICKET, USUARIO,
+                CONVERT(VARCHAR(19), DATA_HORA, 120) AS DATA_HORA
+            FROM dbo.USU_SENIOR_REGRA_VERSAO
+            WHERE ID_REGRA = ?
+            ORDER BY NUM_VERSAO DESC
+        """, [id_regra])
+        row_v = cursor.fetchone()
+        ultima_versao = None
+        if row_v:
+            ultima_versao = {
+                "num_versao": int(row_v[0]),
+                "motivo": (row_v[1] or "").strip(),
+                "ticket": (row_v[2] or "").strip() or None,
+                "usuario": (row_v[3] or "").strip(),
+                "data_hora": row_v[4],
+            }
+        dados["ULTIMA_VERSAO"] = ultima_versao
+
+        # Compat com cliente legado que esperava {regra, ultima_versao}
+        dados["regra"] = {k.lower(): v for k, v in dados.items() if k not in ("regra",)}
+        dados["ultima_versao"] = ultima_versao
+        return dados
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/senior/regras/{id_regra:int}/negocio")
+def senior_regra_negocio(id_regra: int, usuario=Depends(validar_token)):
+    """Análise automática do fonte LSP — extrai tabelas referenciadas,
+    mensagens de GeraLog/Mensagem, e flags técnicos (usa_execsql,
+    usa_cursor, usa_geralog). Útil para o frontend mostrar 'regra de
+    negócio resumida' sem o usuário precisar ler todo o fonte."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT
+                ID_REGRA, CODREG_ERP, NOME_REGRA, MODSIS,
+                COALESCE(IDEREG, IDENTIFICADOR, '') AS IDEREG,
+                CODTNS, DESCRICAO, FONTE_LSP,
+                STATUS_REGRA, AMBIENTE, TICKET
+            FROM dbo.USU_SENIOR_REGRA
+            WHERE ID_REGRA = ?
+        """, [id_regra])
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Regra não encontrada.")
+
+        cols = [c[0] for c in cursor.description]
+        regra: dict = {}
+        for i, col in enumerate(cols):
+            v = row[i]
+            if isinstance(v, str):
+                v = v.strip()
+            regra[col] = v
+
+        fonte = regra.get("FONTE_LSP") or ""
+        upper = fonte.upper()
+
+        # Extração heurística
+        tabelas = sorted(set(re.findall(
+            r"\b(E\d{3}[A-Z0-9_]+|R\d{3}[A-Z0-9_]+|USU_[A-Z0-9_]+)\b",
+            upper,
+        )))
+        mensagens_geralog = re.findall(
+            r'GERALOG\s*\(\s*"([^"]+)"', fonte, flags=re.IGNORECASE,
+        )
+        mensagens_msg = re.findall(
+            r'MENSAGEM\s*\([^,]+,\s*"([^"]+)"', fonte, flags=re.IGNORECASE,
+        )
+        mensagens = list(dict.fromkeys(mensagens_geralog + mensagens_msg))[:50]
+
+        # Variáveis declaradas (Definir Alfa/Numero/Cursor)
+        variaveis = sorted(set(re.findall(
+            r"\bDefinir\s+(Alfa|Numero|Cursor|Data|Memo|Logico)\s+(\w+)",
+            fonte,
+            flags=re.IGNORECASE,
+        )))
+        variaveis_fmt = [{"tipo": t, "nome": n} for t, n in variaveis][:50]
+
+        usa_execsql = "EXECSQL" in upper or "EXECSQLEX" in upper
+        usa_cursor = "DEFINIR CURSOR" in upper or "SQL_CRIAR" in upper or ".SQL" in upper
+        usa_geralog = "GERALOG" in upper
+        usa_atualizar = bool(re.search(r"\b(UPDATE|INSERT|DELETE|ATUALIZARTABELA)\b", upper))
+
+        validacao = _validar_riscos_lsp(fonte)
+
+        return {
+            "id_regra": regra.get("ID_REGRA"),
+            "nome_regra": regra.get("NOME_REGRA"),
+            "codreg_erp": regra.get("CODREG_ERP"),
+            "modsis": regra.get("MODSIS"),
+            "idereg": regra.get("IDEREG"),
+            "codtns": regra.get("CODTNS"),
+            "descricao": regra.get("DESCRICAO"),
+            "status_regra": regra.get("STATUS_REGRA"),
+            "ambiente": regra.get("AMBIENTE"),
+            "ticket": regra.get("TICKET"),
+            "fonte_disponivel": bool(fonte.strip()),
+            "resumo_tecnico": {
+                "usa_execsql": usa_execsql,
+                "usa_cursor": usa_cursor,
+                "usa_geralog": usa_geralog,
+                "usa_atualizacao": usa_atualizar,
+                "tabelas_encontradas": tabelas,
+                "qtd_tabelas": len(tabelas),
+                "mensagens_encontradas": mensagens,
+                "qtd_mensagens": len(mensagens),
+                "variaveis_declaradas": variaveis_fmt,
+                "qtd_variaveis": len(variaveis_fmt),
+                "tamanho_fonte_bytes": len(fonte.encode("utf-8")),
+                "alertas": [i.get("mensagem") for i in validacao.get("issues", [])],
+                "validacao": validacao,
+            },
+            "observacao": (
+                "Análise automática heurística do fonte LSP. A interpretação "
+                "final de negócio deve ser validada por consultor/desenvolvedor "
+                "Senior. Para a regra rodar no ERP, ela precisa ser compilada "
+                "no Editor de Regras Senior."
+            ),
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/senior/regras-erp/detalhe")
+def senior_regra_erp_detalhe(
+    codemp: int,
+    modsis: str,
+    idereg: str,
+    codtns: str = "",
+    codreg: Optional[int] = None,
+    usuario=Depends(validar_token),
+):
+    """Detalhe de uma regra que existe apenas em E098REG (ainda não foi
+    clonada para o portal). Mostra todos os campos do identificador +
+    resumo de negócio textual. NÃO retorna fonte_lsp — ele não existe
+    nesse banco."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+
+        where = ["R.CODEMP = ?",
+                 "LTRIM(RTRIM(ISNULL(R.MODSIS, ''))) = ?",
+                 "LTRIM(RTRIM(ISNULL(R.IDEREG, ''))) = ?",
+                 "LTRIM(RTRIM(ISNULL(R.CODTNS, ''))) = ?"]
+        params = [
+            int(codemp),
+            (modsis or "").strip().upper(),
+            (idereg or "").strip().upper(),
+            (codtns or "").strip().upper(),
+        ]
+        if codreg is not None:
+            where.append("R.CODREG = ?")
+            params.append(int(codreg))
+
+        cursor.execute(f"""
+            SELECT TOP 1
+                R.CODEMP,
+                LTRIM(RTRIM(ISNULL(R.MODSIS, ''))) AS MODSIS,
+                LTRIM(RTRIM(ISNULL(R.IDEREG, ''))) AS IDEREG,
+                LTRIM(RTRIM(ISNULL(R.CODTNS, ''))) AS CODTNS,
+                LTRIM(RTRIM(ISNULL(R.DESREG, ''))) AS DESREG,
+                R.CODREG,
+                R.REGGUP,
+                LTRIM(RTRIM(ISNULL(R.OBSREG, ''))) AS OBSREG,
+                LTRIM(RTRIM(ISNULL(R.SITREG, ''))) AS SITREG,
+                R.USUGER,
+                CONVERT(VARCHAR(19), R.DATGER, 120) AS DATGER,
+                R.HORGER
+            FROM E098REG R
+            WHERE {' AND '.join(where)}
+        """, params)
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail="Identificador/regra não encontrado na E098REG.",
+            )
+        cols = [c[0] for c in cursor.description]
+        dados: dict = {}
+        for i, col in enumerate(cols):
+            v = row[i]
+            if isinstance(v, str):
+                v = v.strip()
+            dados[col] = v
+
+        # Verifica se já foi clonada para o portal
+        cursor.execute("""
+            SELECT TOP 1
+                ID_REGRA, NOME_REGRA, STATUS_REGRA,
+                CONVERT(VARCHAR(19), DATA_CRIACAO, 120) AS DATA_CRIACAO
+            FROM dbo.USU_SENIOR_REGRA
+            WHERE (CODREG_ERP = ? AND ? > 0)
+               OR (
+                    COALESCE(MODSIS, '') = ?
+                AND COALESCE(IDEREG, IDENTIFICADOR, '') = ?
+                AND COALESCE(CODTNS, '') = ?
+               )
+            ORDER BY ID_REGRA DESC
+        """, [
+            int(dados.get("CODREG") or 0),
+            int(dados.get("CODREG") or 0),
+            dados.get("MODSIS") or "",
+            dados.get("IDEREG") or "",
+            dados.get("CODTNS") or "",
+        ])
+        ex = cursor.fetchone()
+        regra_portal = None
+        if ex:
+            regra_portal = {
+                "id_regra": int(ex[0]),
+                "nome_regra": (ex[1] or "").strip(),
+                "status_regra": (ex[2] or "").strip(),
+                "data_criacao": ex[3],
+            }
+
+        sitreg = dados.get("SITREG") or ""
+        sitreg_label = {
+            "A": "Ativo",
+            "I": "Inativo",
+            "X": "Teste",
+        }.get(sitreg, sitreg or "Não informado")
+
+        dados["ORIGEM"] = "E098REG"
+        dados["FONTE_DISPONIVEL"] = False
+        dados["FONTE_LSP"] = None
+        dados["JA_CLONADA_NO_PORTAL"] = regra_portal is not None
+        dados["REGRA_NO_PORTAL"] = regra_portal
+        dados["REGRA_NEGOCIO_RESUMIDA"] = {
+            "identificador": dados.get("IDEREG"),
+            "codigo_regra": dados.get("CODREG"),
+            "modulo": dados.get("MODSIS"),
+            "codtns": dados.get("CODTNS"),
+            "descricao": dados.get("DESREG"),
+            "observacao": dados.get("OBSREG"),
+            "situacao": sitreg,
+            "situacao_label": sitreg_label,
+            "criado_por": dados.get("USUGER"),
+            "criado_em": dados.get("DATGER"),
+        }
+        dados["AVISO"] = (
+            "Este registro vem da E098REG e representa apenas o VÍNCULO "
+            "do identificador com o código da regra. O fonte LSP completo "
+            "está somente no Editor de Regras Senior. Para editar pelo "
+            "portal, use 'Clonar para portal' e cole o fonte LSP copiado "
+            "do Editor de Regras."
+        )
+
+        return dados
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+
+
+
+@app.get("/api/senior/regras/{id_regra:int}/codigo")
+def senior_regra_portal_codigo(id_regra: int, usuario=Depends(validar_token)):
+    """Versão simplificada do detalhe focada no Editor de Código LSP do
+    portal. Retorna `fonte_disponivel`, `fonte_lsp` e metadados mínimos
+    para abrir o editor."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT
+                ID_REGRA, CODEMP, CODREG_ERP, NOME_REGRA, MODSIS,
+                COALESCE(IDEREG, IDENTIFICADOR, '') AS IDEREG,
+                CODTNS, DESCRICAO, FONTE_LSP, HASH_FONTE,
+                STATUS_REGRA, AMBIENTE, TICKET, MOTIVO,
+                USUARIO_CRIACAO,
+                CONVERT(VARCHAR(19), DATA_CRIACAO, 120) AS DATA_CRIACAO,
+                USUARIO_ALT,
+                CONVERT(VARCHAR(19), DATA_ALT, 120) AS DATA_ALT
+            FROM dbo.USU_SENIOR_REGRA
+            WHERE ID_REGRA = ?
+        """, [id_regra])
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Regra não encontrada no portal.")
+        cols = [c[0] for c in cursor.description]
+        dados: dict = {}
+        for i, c in enumerate(cols):
+            v = row[i]
+            if isinstance(v, str):
+                v = v.strip()
+            dados[c.lower()] = v
+        fonte = dados.get("fonte_lsp") or ""
+        return {
+            "fonte_disponivel": bool(fonte.strip()),
+            "origem": "USU_SENIOR_REGRA",
+            **dados,
+            "alertas": [
+                i.get("mensagem") for i in
+                _validar_riscos_lsp(fonte).get("issues", [])
+            ],
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.put("/api/senior/regras/{id_regra:int}")
+def atualizar_regra_senior(
+    id_regra: int,
+    body: SeniorRegraAtualizarPayload,
+    usuario=Depends(validar_token),
+):
+    usuario_api = str(usuario or "").upper().strip()
+    _admin_regras(usuario_api)
+
+    fonte = body.fonte_lsp or ""
+    motivo = (body.motivo or "").strip()
+    if not fonte or not motivo:
+        raise HTTPException(
+            status_code=422, detail="fonte_lsp e motivo são obrigatórios.",
+        )
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        regra = _carregar_regra(cursor, id_regra)
+        # Bloqueia edição de regra ATIVA — exige mover para INATIVA primeiro
+        if regra["status_regra"] in ("ATIVA", "PUBLICADA_PRODUCAO"):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Regra está em status {regra['status_regra']}. "
+                    "Edite criando nova versão via transição (ATIVA→INATIVA → "
+                    "abrir nova regra) ou volte para RASCUNHO."
+                ),
+            )
+
+        h = _hash_fonte_lsp(fonte)
+        novo_hash_igual = h == (regra.get("hash_fonte") or "")
+        if novo_hash_igual and not any([
+            body.nome_regra, body.identificador, body.modsis, body.codemp,
+            body.descricao, body.codreg_erp, body.ticket,
+        ]):
+            raise HTTPException(
+                status_code=409,
+                detail="Nenhuma alteração detectada (fonte e metadados idênticos).",
+            )
+
+        sets = ["FONTE_LSP = ?", "HASH_FONTE = ?",
+                "USUARIO_ALT = ?", "DATA_ALT = GETDATE()"]
+        params: list = [fonte, h, usuario_api]
+        if body.nome_regra:
+            sets.append("NOME_REGRA = ?")
+            params.append(body.nome_regra[:120])
+        if body.identificador is not None:
+            sets.append("IDENTIFICADOR = ?")
+            params.append((body.identificador or "")[:40] or None)
+        if body.modsis is not None:
+            sets.append("MODSIS = ?")
+            params.append((body.modsis or "")[:10] or None)
+        if body.codemp is not None:
+            sets.append("CODEMP = ?")
+            params.append(body.codemp)
+        if body.descricao is not None:
+            sets.append("DESCRICAO = ?")
+            params.append((body.descricao or "")[:500] or None)
+        if body.codreg_erp is not None:
+            sets.append("CODREG_ERP = ?")
+            params.append(body.codreg_erp)
+
+        cursor.execute(
+            f"UPDATE dbo.USU_SENIOR_REGRA SET {', '.join(sets)} WHERE ID_REGRA = ?",
+            params + [id_regra],
+        )
+        num_versao = _registrar_versao_regra(
+            cursor, id_regra, fonte, motivo, body.ticket, usuario_api,
+        )
+        conn.commit()
+        return {
+            "mensagem": "Regra atualizada e nova versão registrada.",
+            "id_regra": id_regra,
+            "num_versao": num_versao,
+            "hash_fonte": h,
+        }
+    except HTTPException:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Erro ao atualizar regra: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/senior/regras/{id_regra:int}/versoes")
+def listar_versoes_regra(id_regra: int, usuario=Depends(validar_token)):
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        _carregar_regra(cursor, id_regra)  # valida existência
+        cursor.execute("""
+            SELECT
+                ID_VERSAO AS id_versao, NUM_VERSAO AS num_versao,
+                HASH_FONTE AS hash_fonte, MOTIVO AS motivo,
+                TICKET AS ticket, USUARIO AS usuario,
+                CONVERT(VARCHAR(19), DATA_HORA, 120) AS data_hora,
+                DATALENGTH(FONTE_LSP) AS tamanho_fonte_bytes
+            FROM dbo.USU_SENIOR_REGRA_VERSAO
+            WHERE ID_REGRA = ?
+            ORDER BY NUM_VERSAO DESC
+        """, [id_regra])
+        cols = [c[0] for c in cursor.description]
+        dados = []
+        for row in cursor.fetchall():
+            item = {}
+            for i, c in enumerate(cols):
+                v = row[i]
+                if isinstance(v, str):
+                    v = v.strip()
+                item[c] = v
+            dados.append(item)
+        return {"total": len(dados), "dados": dados}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/senior/regras/{id_regra:int}/versoes/{num_versao}")
+def detalhar_versao_regra(id_regra: int, num_versao: int,
+                          usuario=Depends(validar_token)):
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT
+                ID_VERSAO, NUM_VERSAO, FONTE_LSP, HASH_FONTE,
+                MOTIVO, TICKET, USUARIO,
+                CONVERT(VARCHAR(19), DATA_HORA, 120) AS DATA_HORA
+            FROM dbo.USU_SENIOR_REGRA_VERSAO
+            WHERE ID_REGRA = ? AND NUM_VERSAO = ?
+        """, [id_regra, num_versao])
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Versão não encontrada.")
+        return {
+            "id_versao": int(row[0]),
+            "num_versao": int(row[1]),
+            "fonte_lsp": row[2] or "",
+            "hash_fonte": (row[3] or "").strip() if isinstance(row[3], str) else row[3],
+            "motivo": (row[4] or "").strip(),
+            "ticket": (row[5] or "").strip() or None,
+            "usuario": (row[6] or "").strip(),
+            "data_hora": row[7],
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/api/senior/regras/{id_regra:int}/transicionar")
+def transicionar_regra_senior(
+    id_regra: int,
+    body: SeniorRegraTransicionarPayload,
+    usuario=Depends(validar_token),
+):
+    usuario_api = str(usuario or "").upper().strip()
+    _admin_regras(usuario_api)
+
+    novo_status = (body.novo_status or "").upper().strip()
+    motivo = (body.motivo or "").strip()
+    if not motivo:
+        raise HTTPException(status_code=422, detail="motivo é obrigatório.")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        regra = _carregar_regra(cursor, id_regra)
+        _validar_transicao_regra(regra["status_regra"], novo_status)
+
+        cursor.execute("""
+            UPDATE dbo.USU_SENIOR_REGRA
+               SET STATUS_REGRA = ?, USUARIO_ALT = ?, DATA_ALT = GETDATE()
+             WHERE ID_REGRA = ?
+        """, [novo_status, usuario_api, id_regra])
+
+        # Loga a transição como uma "implantação" leve para preservar histórico
+        cursor.execute("""
+            INSERT INTO dbo.USU_SENIOR_REGRA_IMPLANTACAO
+                (ID_REGRA, CODREG_ERP, CODEMP, MODSIS, IDEREG,
+                 AMBIENTE, STATUS_IMPLANTACAO, RESPONSAVEL, OBSERVACAO)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            id_regra, regra.get("codreg_erp"), regra.get("codemp"),
+            regra.get("modsis"), regra.get("identificador"),
+            regra.get("ambiente"), f"TRANSICAO:{regra['status_regra']}→{novo_status}",
+            usuario_api,
+            (f"{motivo}{' | ' + body.observacao if body.observacao else ''}")[:1000],
+        ])
+        conn.commit()
+        return {
+            "mensagem": "Status atualizado.",
+            "id_regra": id_regra,
+            "status_anterior": regra["status_regra"],
+            "status_novo": novo_status,
+        }
+    except HTTPException:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Erro na transição: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/api/senior/regras/{id_regra:int}/validar-riscos")
+def validar_riscos_regra_senior(id_regra: int, usuario=Depends(validar_token)):
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT FONTE_LSP FROM dbo.USU_SENIOR_REGRA WHERE ID_REGRA = ?",
+            [id_regra],
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Regra não encontrada.")
+        return _validar_riscos_lsp(row[0] or "")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/senior/regras/{id_regra:int}/exportar")
+def exportar_regra_senior_txt(id_regra: int, usuario=Depends(validar_token)):
+    """Devolve o fonte LSP como texto puro para download / colar no
+    Editor de Regras Senior."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT NOME_REGRA, IDENTIFICADOR, CODREG_ERP, FONTE_LSP, HASH_FONTE
+            FROM dbo.USU_SENIOR_REGRA
+            WHERE ID_REGRA = ?
+        """, [id_regra])
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Regra não encontrada.")
+        nome = (row[0] or "regra").strip()
+        identif = (row[1] or "").strip()
+        codreg = row[2]
+        fonte = row[3] or ""
+        h = (row[4] or "").strip() if isinstance(row[4], str) else (row[4] or "")
+
+        cabecalho = (
+            f"/* Exportado de USU_SENIOR_REGRA\n"
+            f" * id_regra:      {id_regra}\n"
+            f" * nome:          {nome}\n"
+            f" * identificador: {identif}\n"
+            f" * codreg_erp:    {codreg}\n"
+            f" * hash_fonte:    {h}\n"
+            f" * exportado_por: {str(usuario or '').upper().strip()}\n"
+            f" * exportado_em:  {datetime.now().isoformat(timespec='seconds')}\n"
+            f" */\n\n"
+        )
+
+        # Nome de arquivo seguro
+        nome_arquivo = re.sub(r"[^A-Za-z0-9._-]+", "_", nome)[:80] or "regra"
+        nome_arquivo = f"{nome_arquivo}.lsp.txt"
+
+        return Response(
+            content=(cabecalho + fonte).encode("utf-8"),
+            media_type="text/plain; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{nome_arquivo}"',
+            },
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/api/senior/regras/{id_regra:int}/marcar-implantada")
+def marcar_implantacao_regra_senior(
+    id_regra: int,
+    body: SeniorRegraImplantacaoPayload,
+    usuario=Depends(validar_token),
+):
+    """Registra um evento de implantação manual (compilação no Editor de
+    Regras, vínculo, ativação, rollback, etc). Não altera o status da
+    regra — para isso usar /transicionar."""
+    usuario_api = str(usuario or "").upper().strip()
+    _admin_regras(usuario_api)
+
+    ambiente = (body.ambiente or "").upper().strip()
+    if ambiente not in SENIOR_REGRA_AMBIENTES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Ambiente inválido. Use: {', '.join(SENIOR_REGRA_AMBIENTES)}",
+        )
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        _carregar_regra(cursor, id_regra)  # valida existência
+        cursor.execute("""
+            INSERT INTO dbo.USU_SENIOR_REGRA_IMPLANTACAO
+                (ID_REGRA, CODREG_ERP, CODEMP, MODSIS, IDEREG, CODTNS,
+                 AMBIENTE, STATUS_IMPLANTACAO, RESPONSAVEL, OBSERVACAO)
+            OUTPUT INSERTED.ID_IMPLANTACAO
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            id_regra, body.codreg_erp, body.codemp,
+            (body.modsis or "")[:10] or None,
+            (body.idereg or "")[:40] or None,
+            (body.codtns or "")[:20] or None,
+            ambiente, body.status_implantacao[:30],
+            usuario_api,
+            (body.observacao or "")[:1000] or None,
+        ])
+        id_implantacao = int(cursor.fetchone()[0])
+        conn.commit()
+        return {
+            "mensagem": "Implantação registrada.",
+            "id_implantacao": id_implantacao,
+            "id_regra": id_regra,
+        }
+    except HTTPException:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Erro: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/senior/regras/{id_regra:int}/implantacoes")
+def listar_implantacoes_regra(id_regra: int, usuario=Depends(validar_token)):
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        _carregar_regra(cursor, id_regra)
+        cursor.execute("""
+            SELECT
+                ID_IMPLANTACAO AS id_implantacao,
+                CODREG_ERP AS codreg_erp, CODEMP AS codemp,
+                MODSIS AS modsis, IDEREG AS idereg, CODTNS AS codtns,
+                AMBIENTE AS ambiente,
+                STATUS_IMPLANTACAO AS status_implantacao,
+                RESPONSAVEL AS responsavel,
+                CONVERT(VARCHAR(19), DATA_HORA, 120) AS data_hora,
+                OBSERVACAO AS observacao
+            FROM dbo.USU_SENIOR_REGRA_IMPLANTACAO
+            WHERE ID_REGRA = ?
+            ORDER BY DATA_HORA DESC
+        """, [id_regra])
+        cols = [c[0] for c in cursor.description]
+        dados = []
+        for row in cursor.fetchall():
+            item = {}
+            for i, c in enumerate(cols):
+                v = row[i]
+                if isinstance(v, str):
+                    v = v.strip()
+                item[c] = v
+            dados.append(item)
+        return {"total": len(dados), "dados": dados}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/senior/regras/{id_regra:int}/vinculo-e098reg")
+def consultar_vinculo_e098reg(id_regra: int, usuario=Depends(validar_token)):
+    """Consulta E098REG (cadastro de identificadores de regra do Senior)
+    para conferir se o IDENTIFICADOR da regra está cadastrado no ERP e
+    qual a situação (A=Ativo). Não altera nada — só leitura."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        regra = _carregar_regra(cursor, id_regra)
+        idereg = (regra.get("identificador") or "").strip()
+        codemp = regra.get("codemp") or EMPRESA_PADRAO
+        if not idereg:
+            return {
+                "encontrado": False,
+                "regra": regra,
+                "observacao": "Regra sem IDENTIFICADOR informado.",
+            }
+
+        # Tenta E098REG primeiro; se a tabela não existir, fallback para
+        # F098REG (varia por instalação Senior).
+        for tabela in ("E098REG", "F098REG"):
+            try:
+                cursor.execute(f"""
+                    SELECT TOP 1
+                        CODEMP, IDEREG, MODSIS, SITREG,
+                        LTRIM(RTRIM(COALESCE(DESREG, ''))) AS DESREG
+                    FROM dbo.{tabela}
+                    WHERE CODEMP = ? AND IDEREG = ?
+                """, [codemp, idereg])
+                row = cursor.fetchone()
+                if row:
+                    return {
+                        "encontrado": True,
+                        "tabela": tabela,
+                        "codemp": int(row[0]),
+                        "idereg": (row[1] or "").strip(),
+                        "modsis": (row[2] or "").strip(),
+                        "sitreg": (row[3] or "").strip(),
+                        "ativo": (row[3] or "").strip().upper() == "A",
+                        "descricao_erp": row[4],
+                        "regra_local": regra,
+                    }
+            except Exception:
+                continue
+
+        return {
+            "encontrado": False,
+            "regra": regra,
+            "observacao": (
+                "Identificador não encontrado em E098REG/F098REG. "
+                "Cadastre o identificador no Senior antes de publicar a regra."
+            ),
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ============================================================
+# GESTÃO DE IDENTIFICADORES SENIOR (E098REG / E098LOG)
+# Complementa o módulo de Regras: leitura, alteração controlada com
+# auditoria, snapshot. Compilação continua no Editor de Regras Senior.
+# ============================================================
+
+# Flag de segurança — em produção mantenha False até validar fluxo.
+PERMITE_ALTERAR_E098REG = True
+
+
+def criar_tabelas_aud_snap_ident_regra():
+    """Cria USU_AUD_IDENT_REGRA (auditoria) e USU_SNAP_IDENT_REGRA
+    (snapshot) se não existirem. Idempotente."""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            IF OBJECT_ID('dbo.USU_AUD_IDENT_REGRA', 'U') IS NULL
+            BEGIN
+                CREATE TABLE dbo.USU_AUD_IDENT_REGRA (
+                    ID_LOG       INT IDENTITY(1,1) PRIMARY KEY,
+                    DATA_HORA    DATETIME      NOT NULL DEFAULT GETDATE(),
+                    USUARIO_API  VARCHAR(100)  NULL,
+                    IP           VARCHAR(60)   NULL,
+                    ACAO         VARCHAR(40)   NOT NULL,
+                    MOTIVO       VARCHAR(500)  NOT NULL,
+
+                    CODEMP       SMALLINT      NOT NULL,
+                    MODSIS       VARCHAR(3)    NOT NULL,
+                    IDEREG       VARCHAR(40)   NOT NULL,
+                    CODTNS       VARCHAR(20)   NULL,
+
+                    DESREG_ANT   VARCHAR(250)  NULL,
+                    DESREG_NOV   VARCHAR(250)  NULL,
+                    CODREG_ANT   INT           NULL,
+                    CODREG_NOV   INT           NULL,
+                    OBSREG_ANT   VARCHAR(1000) NULL,
+                    OBSREG_NOV   VARCHAR(1000) NULL,
+                    SITREG_ANT   VARCHAR(1)    NULL,
+                    SITREG_NOV   VARCHAR(1)    NULL,
+
+                    DADOS_ANTES  NVARCHAR(MAX) NULL,
+                    DADOS_DEPOIS NVARCHAR(MAX) NULL,
+                    RESULTADO    VARCHAR(500)  NULL
+                );
+                CREATE INDEX IX_USU_AUD_IDENT_REGRA_CHAVE
+                    ON dbo.USU_AUD_IDENT_REGRA (CODEMP, MODSIS, IDEREG, CODTNS, DATA_HORA DESC);
+                CREATE INDEX IX_USU_AUD_IDENT_REGRA_DATA
+                    ON dbo.USU_AUD_IDENT_REGRA (DATA_HORA DESC);
+            END;
+
+            IF OBJECT_ID('dbo.USU_SNAP_IDENT_REGRA_LOTE', 'U') IS NULL
+            BEGIN
+                CREATE TABLE dbo.USU_SNAP_IDENT_REGRA_LOTE (
+                    ID_LOTE         INT IDENTITY(1,1) PRIMARY KEY,
+                    DATA_SNAPSHOT   DATETIME     NOT NULL DEFAULT GETDATE(),
+                    USUARIO_API     VARCHAR(100) NULL,
+                    TOTAL_REGISTROS INT          NULL
+                );
+                CREATE INDEX IX_USU_SNAP_LOTE_DATA
+                    ON dbo.USU_SNAP_IDENT_REGRA_LOTE (DATA_SNAPSHOT DESC);
+            END;
+
+            IF OBJECT_ID('dbo.USU_SNAP_IDENT_REGRA', 'U') IS NULL
+            BEGIN
+                CREATE TABLE dbo.USU_SNAP_IDENT_REGRA (
+                    ID_SNAPSHOT   INT IDENTITY(1,1) PRIMARY KEY,
+                    ID_LOTE       INT          NULL,
+                    DATA_SNAPSHOT DATETIME     NOT NULL DEFAULT GETDATE(),
+                    CODEMP        SMALLINT     NOT NULL,
+                    MODSIS        VARCHAR(3)   NOT NULL,
+                    IDEREG        VARCHAR(40)  NOT NULL,
+                    CODTNS        VARCHAR(20)  NULL,
+                    DESREG        VARCHAR(250) NULL,
+                    CODREG        INT          NULL,
+                    REGGUP        INT          NULL,
+                    OBSREG        VARCHAR(1000) NULL,
+                    SITREG        VARCHAR(1)   NULL,
+                    USUGER        BIGINT       NULL,
+                    DATGER        DATETIME     NULL,
+                    HORGER        INT          NULL,
+                    HASH_REGISTRO VARCHAR(64)  NULL
+                );
+                CREATE INDEX IX_USU_SNAP_IDENT_REGRA_DATA
+                    ON dbo.USU_SNAP_IDENT_REGRA (DATA_SNAPSHOT DESC);
+                CREATE INDEX IX_USU_SNAP_IDENT_REGRA_CHAVE
+                    ON dbo.USU_SNAP_IDENT_REGRA (CODEMP, MODSIS, IDEREG, CODTNS);
+                CREATE INDEX IX_USU_SNAP_IDENT_REGRA_LOTE
+                    ON dbo.USU_SNAP_IDENT_REGRA (ID_LOTE);
+            END;
+
+            -- Migração idempotente para tabelas pré-existentes
+            IF COL_LENGTH('dbo.USU_SNAP_IDENT_REGRA', 'ID_LOTE') IS NULL
+            BEGIN
+                ALTER TABLE dbo.USU_SNAP_IDENT_REGRA ADD ID_LOTE INT NULL;
+            END;
+        """)
+        conn.commit()
+        conn.close()
+        print("[OK] Tabelas USU_AUD_IDENT_REGRA / USU_SNAP_IDENT_REGRA verificadas/criadas")
+    except Exception as e:
+        print(f"[!] Erro ao criar tabelas de auditoria/snapshot de identificadores: {e}")
+
+
+# Schemas ------------------------------------------------------
+
+class SeniorIdentAlterarSituacaoPayload(BaseModel):
+    codemp: int
+    modsis: str
+    idereg: str
+    codtns: Optional[str] = ""
+    nova_situacao: str       # A | I | X
+    motivo: str
+    confirmar: bool = False
+
+
+class SeniorIdentAlterarRegraPayload(BaseModel):
+    codemp: int
+    modsis: str
+    idereg: str
+    codtns: Optional[str] = ""
+    novo_codreg: int
+    motivo: str
+    confirmar: bool = False
+
+
+# Helpers ------------------------------------------------------
+
+def _row_to_dict_e098(cursor, row) -> dict:
+    cols = [c[0] for c in cursor.description]
+    out: dict = {}
+    for i, col in enumerate(cols):
+        v = row[i]
+        if isinstance(v, str):
+            v = v.strip()
+        out[col] = v
+    return out
+
+
+def _ip_request(request: Request) -> str:
+    try:
+        return request.client.host if request and request.client else ""
+    except Exception:
+        return ""
+
+
+def _buscar_identificador_e098(cursor, codemp, modsis, idereg, codtns="") -> Optional[dict]:
+    """SELECT TOP 1 em E098REG normalizando trims. Retorna dict ou None."""
+    cursor.execute("""
+        SELECT TOP 1
+            CODEMP,
+            LTRIM(RTRIM(ISNULL(MODSIS, ''))) AS MODSIS,
+            LTRIM(RTRIM(ISNULL(IDEREG, ''))) AS IDEREG,
+            LTRIM(RTRIM(ISNULL(CODTNS, ''))) AS CODTNS,
+            LTRIM(RTRIM(ISNULL(DESREG, ''))) AS DESREG,
+            CODREG,
+            REGGUP,
+            LTRIM(RTRIM(ISNULL(OBSREG, ''))) AS OBSREG,
+            LTRIM(RTRIM(ISNULL(SITREG, ''))) AS SITREG,
+            USUGER,
+            DATGER,
+            HORGER
+        FROM E098REG
+        WHERE CODEMP = ?
+          AND LTRIM(RTRIM(ISNULL(MODSIS, ''))) = ?
+          AND LTRIM(RTRIM(ISNULL(IDEREG, ''))) = ?
+          AND LTRIM(RTRIM(ISNULL(CODTNS, ''))) = ?
+    """, [
+        int(codemp),
+        str(modsis or "").strip(),
+        str(idereg or "").strip(),
+        str(codtns or "").strip(),
+    ])
+    row = cursor.fetchone()
+    return _row_to_dict_e098(cursor, row) if row else None
+
+
+def _registrar_aud_ident(cursor, *, usuario_api, ip, acao, motivo,
+                          antes, depois, resultado="OK"):
+    base = depois or antes or {}
+    cursor.execute("""
+        INSERT INTO dbo.USU_AUD_IDENT_REGRA
+            (USUARIO_API, IP, ACAO, MOTIVO,
+             CODEMP, MODSIS, IDEREG, CODTNS,
+             DESREG_ANT, DESREG_NOV,
+             CODREG_ANT, CODREG_NOV,
+             OBSREG_ANT, OBSREG_NOV,
+             SITREG_ANT, SITREG_NOV,
+             DADOS_ANTES, DADOS_DEPOIS, RESULTADO)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, [
+        (usuario_api or "")[:100], (ip or "")[:60], acao[:40], motivo[:500],
+        int(base.get("CODEMP") or 0),
+        (base.get("MODSIS") or "")[:3],
+        (base.get("IDEREG") or "")[:40],
+        (base.get("CODTNS") or "")[:20] or None,
+        (antes or {}).get("DESREG"), (depois or {}).get("DESREG"),
+        (antes or {}).get("CODREG"), (depois or {}).get("CODREG"),
+        (antes or {}).get("OBSREG"), (depois or {}).get("OBSREG"),
+        (antes or {}).get("SITREG"), (depois or {}).get("SITREG"),
+        json.dumps(antes, ensure_ascii=False, default=str) if antes else None,
+        json.dumps(depois, ensure_ascii=False, default=str) if depois else None,
+        (resultado or "OK")[:500],
+    ])
+
+
+# Endpoints ----------------------------------------------------
+
+@app.get("/api/senior/identificadores")
+def senior_listar_identificadores(
+    codemp: Optional[int] = None,
+    modsis: Optional[str] = None,
+    idereg: Optional[str] = None,
+    situacao: Optional[str] = None,
+    codreg: Optional[int] = None,
+    texto: Optional[str] = None,
+    pagina: int = 1,
+    tamanho_pagina: int = 100,
+    usuario=Depends(validar_token),
+):
+    """Consulta paginada de E098REG (read-only). Filtros: codemp, modsis,
+    idereg (LIKE), situacao (A/I/X/TODOS), codreg exato, texto (LIKE em
+    IDEREG/DESREG/OBSREG)."""
+    pagina = max(1, int(pagina or 1))
+    tamanho_pagina = max(1, min(int(tamanho_pagina or 100), 500))
+    offset = (pagina - 1) * tamanho_pagina
+
+    where = ["1=1"]
+    params: list = []
+    if codemp:
+        where.append("R.CODEMP = ?")
+        params.append(int(codemp))
+    if modsis:
+        where.append("LTRIM(RTRIM(ISNULL(R.MODSIS, ''))) = ?")
+        params.append(modsis.strip().upper())
+    if idereg:
+        where.append("LTRIM(RTRIM(ISNULL(R.IDEREG, ''))) LIKE ?")
+        params.append(f"%{idereg.strip().upper()}%")
+    if situacao and situacao.upper() != "TODOS":
+        where.append("LTRIM(RTRIM(ISNULL(R.SITREG, ''))) = ?")
+        params.append(situacao.strip().upper()[0])
+    if codreg is not None:
+        where.append("R.CODREG = ?")
+        params.append(int(codreg))
+    if texto:
+        where.append("(R.IDEREG LIKE ? OR R.DESREG LIKE ? OR R.OBSREG LIKE ?)")
+        like = f"%{texto}%"
+        params.extend([like, like, like])
+    where_sql = " AND ".join(where)
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT COUNT(1) FROM E098REG R WHERE {where_sql}", params)
+        total = int(cursor.fetchone()[0] or 0)
+
+        cursor.execute(f"""
+            SELECT
+                R.CODEMP,
+                LTRIM(RTRIM(ISNULL(R.MODSIS, ''))) AS MODSIS,
+                LTRIM(RTRIM(ISNULL(R.IDEREG, ''))) AS IDEREG,
+                LTRIM(RTRIM(ISNULL(R.CODTNS, ''))) AS CODTNS,
+                LTRIM(RTRIM(ISNULL(R.DESREG, ''))) AS DESREG,
+                R.CODREG, R.REGGUP,
+                LTRIM(RTRIM(ISNULL(R.OBSREG, ''))) AS OBSREG,
+                LTRIM(RTRIM(ISNULL(R.SITREG, ''))) AS SITREG,
+                R.USUGER, R.DATGER, R.HORGER
+            FROM E098REG R
+            WHERE {where_sql}
+            ORDER BY R.CODEMP, R.MODSIS, R.IDEREG, R.CODTNS
+            OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+        """, params + [offset, tamanho_pagina])
+        dados = [_row_to_dict_e098(cursor, r) for r in cursor.fetchall()]
+        return {
+            "pagina": pagina,
+            "tamanho_pagina": tamanho_pagina,
+            "total": total,
+            "total_paginas": (total + tamanho_pagina - 1) // tamanho_pagina if total else 0,
+            "dados": dados,
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/senior/identificadores/log")
+def senior_log_identificador(
+    codemp: int,
+    modsis: str,
+    idereg: str,
+    codtns: str = "",
+    usuario=Depends(validar_token),
+):
+    """Consulta E098LOG ordenado por SEQREG DESC (mais recente primeiro)."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT
+                CODEMP,
+                LTRIM(RTRIM(ISNULL(MODSIS, ''))) AS MODSIS,
+                LTRIM(RTRIM(ISNULL(IDEREG, ''))) AS IDEREG,
+                LTRIM(RTRIM(ISNULL(CODTNS, ''))) AS CODTNS,
+                SEQREG,
+                LTRIM(RTRIM(ISNULL(DESREG, ''))) AS DESREG,
+                CODREG,
+                LTRIM(RTRIM(ISNULL(OBSREG, ''))) AS OBSREG,
+                LTRIM(RTRIM(ISNULL(SITREG, ''))) AS SITREG,
+                USUGER, DATGER, HORGER
+            FROM E098LOG
+            WHERE CODEMP = ?
+              AND LTRIM(RTRIM(ISNULL(MODSIS, ''))) = ?
+              AND LTRIM(RTRIM(ISNULL(IDEREG, ''))) = ?
+              AND LTRIM(RTRIM(ISNULL(CODTNS, ''))) = ?
+            ORDER BY SEQREG DESC
+        """, [
+            int(codemp),
+            modsis.strip().upper(),
+            idereg.strip().upper(),
+            codtns.strip().upper(),
+        ])
+        dados = [_row_to_dict_e098(cursor, r) for r in cursor.fetchall()]
+        return {"total": len(dados), "dados": dados}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/api/senior/identificadores/alterar-situacao")
+def senior_alterar_situacao_identificador(
+    body: SeniorIdentAlterarSituacaoPayload,
+    request: Request,
+    usuario=Depends(validar_token),
+):
+    """Altera E098REG.SITREG com auditoria. Sit aceitas: A (Ativo),
+    I (Inativo), X (Teste/Suspenso, varia por instalação)."""
+    usuario_api = str(usuario or "").upper().strip()
+    if usuario_api not in ADMINS_SENIOR_REGRAS:
+        raise HTTPException(
+            status_code=403,
+            detail="Usuário sem permissão para administrar regras Senior.",
+        )
+    if not PERMITE_ALTERAR_E098REG:
+        raise HTTPException(
+            status_code=403,
+            detail="Alteração de E098REG desabilitada (PERMITE_ALTERAR_E098REG=False).",
+        )
+    if not body.confirmar:
+        raise HTTPException(status_code=400, detail="Confirmação obrigatória (confirmar=true).")
+    motivo = (body.motivo or "").strip()
+    if not motivo:
+        raise HTTPException(status_code=400, detail="Motivo obrigatório.")
+    nova = (body.nova_situacao or "").strip().upper()
+    if nova not in {"A", "I", "X"}:
+        raise HTTPException(status_code=400, detail="Situação permitida: A, I ou X.")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        antes = _buscar_identificador_e098(
+            cursor, body.codemp, body.modsis, body.idereg, body.codtns or "",
+        )
+        if not antes:
+            raise HTTPException(status_code=404, detail="Identificador não encontrado em E098REG.")
+
+        cursor.execute("""
+            UPDATE E098REG
+               SET SITREG = ?,
+                   OBSREG = LEFT(
+                        CONCAT(
+                            ISNULL(OBSREG, ''),
+                            CASE WHEN ISNULL(OBSREG, '') = '' THEN '' ELSE ' | ' END,
+                            'API: ', ?
+                        ),
+                        250
+                   )
+             WHERE CODEMP = ?
+               AND LTRIM(RTRIM(ISNULL(MODSIS, ''))) = ?
+               AND LTRIM(RTRIM(ISNULL(IDEREG, ''))) = ?
+               AND LTRIM(RTRIM(ISNULL(CODTNS, ''))) = ?
+        """, [
+            nova, motivo,
+            int(body.codemp),
+            body.modsis.strip().upper(),
+            body.idereg.strip().upper(),
+            (body.codtns or "").strip().upper(),
+        ])
+        depois = _buscar_identificador_e098(
+            cursor, body.codemp, body.modsis, body.idereg, body.codtns or "",
+        )
+        _registrar_aud_ident(
+            cursor, usuario_api=usuario_api, ip=_ip_request(request),
+            acao="ALTERAR_SITUACAO", motivo=motivo,
+            antes=antes, depois=depois, resultado="OK",
+        )
+        conn.commit()
+        return {
+            "status": "OK",
+            "mensagem": (
+                "Situação alterada. Avaliar reinício do ERP/Middleware "
+                "quando aplicável."
+            ),
+            "antes": antes,
+            "depois": depois,
+        }
+    except HTTPException:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Erro ao alterar situação: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/api/senior/identificadores/alterar-regra")
+def senior_alterar_regra_identificador(
+    body: SeniorIdentAlterarRegraPayload,
+    request: Request,
+    usuario=Depends(validar_token),
+):
+    """Troca E098REG.CODREG (regra vinculada ao identificador) com auditoria."""
+    usuario_api = str(usuario or "").upper().strip()
+    if usuario_api not in ADMINS_SENIOR_REGRAS:
+        raise HTTPException(status_code=403,
+            detail="Usuário sem permissão para administrar regras Senior.")
+    if not PERMITE_ALTERAR_E098REG:
+        raise HTTPException(status_code=403,
+            detail="Alteração de E098REG desabilitada.")
+    if not body.confirmar:
+        raise HTTPException(status_code=400, detail="Confirmação obrigatória (confirmar=true).")
+    motivo = (body.motivo or "").strip()
+    if not motivo:
+        raise HTTPException(status_code=400, detail="Motivo obrigatório.")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        antes = _buscar_identificador_e098(
+            cursor, body.codemp, body.modsis, body.idereg, body.codtns or "",
+        )
+        if not antes:
+            raise HTTPException(status_code=404, detail="Identificador não encontrado em E098REG.")
+
+        cursor.execute("""
+            UPDATE E098REG
+               SET CODREG = ?,
+                   OBSREG = LEFT(
+                        CONCAT(
+                            ISNULL(OBSREG, ''),
+                            CASE WHEN ISNULL(OBSREG, '') = '' THEN '' ELSE ' | ' END,
+                            'API troca regra: ', ?
+                        ),
+                        250
+                   )
+             WHERE CODEMP = ?
+               AND LTRIM(RTRIM(ISNULL(MODSIS, ''))) = ?
+               AND LTRIM(RTRIM(ISNULL(IDEREG, ''))) = ?
+               AND LTRIM(RTRIM(ISNULL(CODTNS, ''))) = ?
+        """, [
+            int(body.novo_codreg), motivo,
+            int(body.codemp),
+            body.modsis.strip().upper(),
+            body.idereg.strip().upper(),
+            (body.codtns or "").strip().upper(),
+        ])
+        depois = _buscar_identificador_e098(
+            cursor, body.codemp, body.modsis, body.idereg, body.codtns or "",
+        )
+        _registrar_aud_ident(
+            cursor, usuario_api=usuario_api, ip=_ip_request(request),
+            acao="ALTERAR_CODREG", motivo=motivo,
+            antes=antes, depois=depois, resultado="OK",
+        )
+        conn.commit()
+        return {
+            "status": "OK",
+            "mensagem": (
+                "Regra vinculada alterada. Confirmar compilação da regra "
+                "no Editor Senior antes de ativar em produção."
+            ),
+            "antes": antes,
+            "depois": depois,
+        }
+    except HTTPException:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Erro ao alterar regra vinculada: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/api/senior/identificadores/snapshot")
+def senior_snapshot_identificadores(
+    usuario=Depends(validar_token),
+):
+    """Tira foto completa de E098REG. Cria um LOTE em
+    USU_SNAP_IDENT_REGRA_LOTE e N linhas em USU_SNAP_IDENT_REGRA
+    vinculadas ao LOTE. Compare lotes via /snapshots/diff."""
+    usuario_api = str(usuario or "").upper().strip()
+    if usuario_api not in ADMINS_SENIOR_REGRAS:
+        raise HTTPException(status_code=403,
+            detail="Usuário sem permissão para administrar regras Senior.")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        # 1) Cria o LOTE primeiro — captura ID via OUTPUT
+        cursor.execute("""
+            INSERT INTO dbo.USU_SNAP_IDENT_REGRA_LOTE (USUARIO_API, TOTAL_REGISTROS)
+            OUTPUT INSERTED.ID_LOTE
+            VALUES (?, 0)
+        """, [usuario_api])
+        id_lote = int(cursor.fetchone()[0])
+
+        # 2) Insere snapshots ligados ao LOTE
+        cursor.execute("""
+            INSERT INTO dbo.USU_SNAP_IDENT_REGRA
+                (ID_LOTE, CODEMP, MODSIS, IDEREG, CODTNS, DESREG, CODREG,
+                 REGGUP, OBSREG, SITREG, USUGER, DATGER, HORGER,
+                 HASH_REGISTRO)
+            SELECT
+                ?,
+                CODEMP,
+                LTRIM(RTRIM(ISNULL(MODSIS, ''))),
+                LTRIM(RTRIM(ISNULL(IDEREG, ''))),
+                LTRIM(RTRIM(ISNULL(CODTNS, ''))),
+                LTRIM(RTRIM(ISNULL(DESREG, ''))),
+                CODREG,
+                REGGUP,
+                LTRIM(RTRIM(ISNULL(OBSREG, ''))),
+                LTRIM(RTRIM(ISNULL(SITREG, ''))),
+                USUGER, DATGER, HORGER,
+                CONVERT(VARCHAR(64), HASHBYTES(
+                    'SHA2_256',
+                    CONCAT(
+                        CODEMP, '|', ISNULL(MODSIS,''), '|', ISNULL(IDEREG,''), '|',
+                        ISNULL(CODTNS,''), '|', ISNULL(DESREG,''), '|',
+                        ISNULL(CONVERT(VARCHAR(20), CODREG), ''), '|',
+                        ISNULL(OBSREG,''), '|', ISNULL(SITREG,'')
+                    )
+                ), 2)
+            FROM E098REG
+        """, [id_lote])
+        total = cursor.rowcount or 0
+
+        # 3) Atualiza total no LOTE
+        cursor.execute(
+            "UPDATE dbo.USU_SNAP_IDENT_REGRA_LOTE SET TOTAL_REGISTROS = ? WHERE ID_LOTE = ?",
+            [total, id_lote],
+        )
+        conn.commit()
+        return {
+            "status": "OK",
+            "id_lote": id_lote,
+            "registros": total,
+            "usuario": usuario_api,
+            "data_snapshot": datetime.now().isoformat(timespec="seconds"),
+        }
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Erro ao gerar snapshot: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/senior/identificadores/snapshots")
+def senior_listar_snapshots(
+    limite: int = 50,
+    usuario=Depends(validar_token),
+):
+    """Lista os lotes de snapshot (cada execução de POST /snapshot gera
+    1 lote com N linhas em USU_SNAP_IDENT_REGRA). Frontend usa para
+    popular seletor de antes/depois."""
+    limite = max(1, min(int(limite or 50), 200))
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT TOP (?)
+                ID_LOTE                                      AS id_lote,
+                CONVERT(VARCHAR(19), DATA_SNAPSHOT, 120)     AS data_snapshot,
+                USUARIO_API                                  AS usuario_api,
+                TOTAL_REGISTROS                              AS total_registros
+            FROM dbo.USU_SNAP_IDENT_REGRA_LOTE
+            ORDER BY ID_LOTE DESC
+        """, [limite])
+        cols = [c[0] for c in cursor.description]
+        dados = []
+        for row in cursor.fetchall():
+            item = {}
+            for i, c in enumerate(cols):
+                v = row[i]
+                if isinstance(v, str):
+                    v = v.strip()
+                item[c] = v
+            dados.append(item)
+        # `items` é alias para compat com clientes que esperam esse nome
+        return {"total": len(dados), "dados": dados, "items": dados}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/senior/identificadores/snapshots/{id_lote}")
+def senior_snapshot_detalhe(id_lote: int, usuario=Depends(validar_token)):
+    """Retorna todas as linhas de um lote de snapshot."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        # Header do lote
+        cursor.execute("""
+            SELECT
+                ID_LOTE, CONVERT(VARCHAR(19), DATA_SNAPSHOT, 120) AS DATA_SNAPSHOT,
+                USUARIO_API, TOTAL_REGISTROS
+            FROM dbo.USU_SNAP_IDENT_REGRA_LOTE
+            WHERE ID_LOTE = ?
+        """, [id_lote])
+        row_lote = cursor.fetchone()
+        if not row_lote:
+            raise HTTPException(status_code=404, detail="Lote de snapshot não encontrado.")
+
+        lote = {
+            "id_lote": int(row_lote[0]),
+            "data_snapshot": row_lote[1],
+            "usuario_api": (row_lote[2] or "").strip() if isinstance(row_lote[2], str) else row_lote[2],
+            "total_registros": int(row_lote[3] or 0),
+        }
+
+        cursor.execute("""
+            SELECT
+                ID_SNAPSHOT, ID_LOTE,
+                CONVERT(VARCHAR(19), DATA_SNAPSHOT, 120) AS DATA_SNAPSHOT,
+                CODEMP, MODSIS, IDEREG, CODTNS,
+                DESREG, CODREG, REGGUP, OBSREG, SITREG,
+                USUGER, DATGER, HORGER, HASH_REGISTRO
+            FROM dbo.USU_SNAP_IDENT_REGRA
+            WHERE ID_LOTE = ?
+            ORDER BY CODEMP, MODSIS, IDEREG, CODTNS
+        """, [id_lote])
+        cols = [c[0] for c in cursor.description]
+        dados = []
+        for row in cursor.fetchall():
+            item = {}
+            for i, c in enumerate(cols):
+                v = row[i]
+                if isinstance(v, str):
+                    v = v.strip()
+                item[c] = v
+            dados.append(item)
+
+        return {**lote, "total": len(dados), "dados": dados, "items": dados}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/senior/identificadores/snapshots/diff")
+def senior_diff_snapshots(
+    data_antes: str,
+    data_depois: str,
+    estado: Optional[str] = None,  # CRIADO | REMOVIDO | ALTERADO | TODOS
+    modsis: Optional[str] = None,
+    codemp: Optional[int] = None,
+    idereg: Optional[str] = None,
+    limite: int = 1000,
+    usuario=Depends(validar_token),
+):
+    """Diferença entre 2 snapshots de E098REG, identificados por
+    DATA_SNAPSHOT (string YYYY-MM-DD HH:MM:SS). Retorna registros que
+    mudaram entre os dois momentos.
+
+    Filtro `estado`:
+      - `CRIADO`   → existia em `depois` mas não em `antes`
+      - `REMOVIDO` → existia em `antes` mas não em `depois`
+      - `ALTERADO` → existia em ambos, mas HASH_REGISTRO mudou
+      - `TODOS`    → inclui IGUAL também
+      - (omitido)  → CRIADO + REMOVIDO + ALTERADO (sem os iguais)
+
+    Chave de comparação: (codemp, modsis, idereg, codtns)."""
+    estado_norm = (estado or "").upper().strip() or None
+    if estado_norm and estado_norm not in {"CRIADO", "REMOVIDO", "ALTERADO", "TODOS", "IGUAL"}:
+        raise HTTPException(
+            status_code=422,
+            detail="estado inválido. Use: CRIADO, REMOVIDO, ALTERADO, IGUAL, TODOS",
+        )
+    limite = max(1, min(int(limite or 1000), 10000))
+
+    where_extra = ["1=1"]
+    params_extra: list = []
+    if modsis:
+        where_extra.append("COALESCE(a.MODSIS, d.MODSIS) = ?")
+        params_extra.append(modsis.strip().upper())
+    if codemp:
+        where_extra.append("COALESCE(a.CODEMP, d.CODEMP) = ?")
+        params_extra.append(int(codemp))
+    if idereg:
+        where_extra.append("COALESCE(a.IDEREG, d.IDEREG) LIKE ?")
+        params_extra.append(f"%{idereg.strip().upper()}%")
+    extra_sql = " AND ".join(where_extra)
+
+    # CTE com FULL JOIN entre os 2 snapshots
+    sql = f"""
+        WITH s_antes AS (
+            SELECT *
+            FROM dbo.USU_SNAP_IDENT_REGRA
+            WHERE CONVERT(VARCHAR(19), DATA_SNAPSHOT, 120) = ?
+        ),
+        s_depois AS (
+            SELECT *
+            FROM dbo.USU_SNAP_IDENT_REGRA
+            WHERE CONVERT(VARCHAR(19), DATA_SNAPSHOT, 120) = ?
+        ),
+        diff AS (
+            SELECT
+                COALESCE(a.CODEMP, d.CODEMP)                     AS codemp,
+                COALESCE(a.MODSIS, d.MODSIS)                     AS modsis,
+                COALESCE(a.IDEREG, d.IDEREG)                     AS idereg,
+                COALESCE(NULLIF(a.CODTNS, ''), NULLIF(d.CODTNS, ''), '') AS codtns,
+                CASE
+                    WHEN a.HASH_REGISTRO IS NULL THEN 'CRIADO'
+                    WHEN d.HASH_REGISTRO IS NULL THEN 'REMOVIDO'
+                    WHEN a.HASH_REGISTRO <> d.HASH_REGISTRO THEN 'ALTERADO'
+                    ELSE 'IGUAL'
+                END                                              AS estado,
+                a.DESREG AS desreg_antes, d.DESREG AS desreg_depois,
+                a.CODREG AS codreg_antes, d.CODREG AS codreg_depois,
+                a.OBSREG AS obsreg_antes, d.OBSREG AS obsreg_depois,
+                a.SITREG AS sitreg_antes, d.SITREG AS sitreg_depois,
+                a.HASH_REGISTRO AS hash_antes, d.HASH_REGISTRO AS hash_depois
+            FROM s_antes a
+            FULL JOIN s_depois d
+              ON d.CODEMP = a.CODEMP
+             AND d.MODSIS = a.MODSIS
+             AND d.IDEREG = a.IDEREG
+             AND ISNULL(d.CODTNS, '') = ISNULL(a.CODTNS, '')
+        )
+        SELECT TOP (?) *
+        FROM diff a
+        FULL JOIN (SELECT 1 AS x) z ON 1=1
+        WHERE {extra_sql}
+    """
+    # Ajuste para evitar o JOIN dummy: rewrite simpler
+    sql = f"""
+        WITH s_antes AS (
+            SELECT *
+            FROM dbo.USU_SNAP_IDENT_REGRA
+            WHERE CONVERT(VARCHAR(19), DATA_SNAPSHOT, 120) = ?
+        ),
+        s_depois AS (
+            SELECT *
+            FROM dbo.USU_SNAP_IDENT_REGRA
+            WHERE CONVERT(VARCHAR(19), DATA_SNAPSHOT, 120) = ?
+        ),
+        diff AS (
+            SELECT
+                COALESCE(a.CODEMP, d.CODEMP)                                  AS codemp,
+                COALESCE(a.MODSIS, d.MODSIS)                                  AS modsis,
+                COALESCE(a.IDEREG, d.IDEREG)                                  AS idereg,
+                COALESCE(NULLIF(a.CODTNS, ''), NULLIF(d.CODTNS, ''), '')      AS codtns,
+                CASE
+                    WHEN a.HASH_REGISTRO IS NULL THEN 'CRIADO'
+                    WHEN d.HASH_REGISTRO IS NULL THEN 'REMOVIDO'
+                    WHEN a.HASH_REGISTRO <> d.HASH_REGISTRO THEN 'ALTERADO'
+                    ELSE 'IGUAL'
+                END                                                            AS estado,
+                a.DESREG AS desreg_antes, d.DESREG AS desreg_depois,
+                a.CODREG AS codreg_antes, d.CODREG AS codreg_depois,
+                a.OBSREG AS obsreg_antes, d.OBSREG AS obsreg_depois,
+                a.SITREG AS sitreg_antes, d.SITREG AS sitreg_depois,
+                a.HASH_REGISTRO AS hash_antes, d.HASH_REGISTRO AS hash_depois
+            FROM s_antes a
+            FULL JOIN s_depois d
+              ON d.CODEMP = a.CODEMP
+             AND d.MODSIS = a.MODSIS
+             AND d.IDEREG = a.IDEREG
+             AND ISNULL(d.CODTNS, '') = ISNULL(a.CODTNS, '')
+        )
+        SELECT TOP (?) *
+        FROM diff
+        WHERE {extra_sql}
+    """
+
+    params: list = [data_antes, data_depois, limite] + params_extra
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(sql, params)
+        cols = [c[0] for c in cursor.description]
+        todas: list = []
+        for row in cursor.fetchall():
+            item = {}
+            for i, c in enumerate(cols):
+                v = row[i]
+                if isinstance(v, str):
+                    v = v.strip()
+                item[c] = v
+            todas.append(item)
+
+        # Conferência: snapshots existem?
+        if not todas:
+            cursor.execute("""
+                SELECT
+                    SUM(CASE WHEN CONVERT(VARCHAR(19), DATA_SNAPSHOT, 120) = ? THEN 1 ELSE 0 END) AS qtd_antes,
+                    SUM(CASE WHEN CONVERT(VARCHAR(19), DATA_SNAPSHOT, 120) = ? THEN 1 ELSE 0 END) AS qtd_depois
+                FROM dbo.USU_SNAP_IDENT_REGRA
+            """, [data_antes, data_depois])
+            row = cursor.fetchone()
+            qtd_antes = int(row[0] or 0)
+            qtd_depois = int(row[1] or 0)
+            if qtd_antes == 0 or qtd_depois == 0:
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"Snapshot não encontrado: antes={qtd_antes} linhas, "
+                        f"depois={qtd_depois} linhas. Use "
+                        "GET /api/senior/identificadores/snapshots para listar "
+                        "as DATA_SNAPSHOT disponíveis."
+                    ),
+                )
+
+        # Filtro de estado em Python (mais simples que parametrizar no SQL)
+        if estado_norm and estado_norm != "TODOS":
+            if estado_norm == "IGUAL":
+                dados = [r for r in todas if r.get("estado") == "IGUAL"]
+            else:
+                dados = [r for r in todas if r.get("estado") == estado_norm]
+        else:
+            # Default: omite os IGUAL (que tendem a ser a maioria)
+            dados = [r for r in todas if r.get("estado") != "IGUAL"]
+
+        # Resumo por estado
+        resumo: dict = {}
+        for r in todas:
+            est = r.get("estado") or "?"
+            resumo[est] = resumo.get(est, 0) + 1
+
+        return {
+            "data_antes": data_antes,
+            "data_depois": data_depois,
+            "filtro_estado": estado_norm or "CRIADO+REMOVIDO+ALTERADO",
+            "resumo": resumo,
+            "total_comparado": len(todas),
+            "total_retornado": len(dados),
+            "dados": dados,
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/senior/identificadores/auditoria")
+def senior_listar_auditoria_ident(
+    codemp: Optional[int] = None,
+    modsis: Optional[str] = None,
+    idereg: Optional[str] = None,
+    usuario_api: Optional[str] = None,
+    data_ini: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    pagina: int = 1,
+    tamanho_pagina: int = 100,
+    usuario=Depends(validar_token),
+):
+    """Consulta USU_AUD_IDENT_REGRA — histórico das alterações feitas
+    via API. Distinto de E098LOG (que é o log nativo do ERP)."""
+    pagina = max(1, int(pagina or 1))
+    tamanho_pagina = max(1, min(int(tamanho_pagina or 100), 500))
+    offset = (pagina - 1) * tamanho_pagina
+
+    where = ["1=1"]
+    params: list = []
+    if codemp:
+        where.append("CODEMP = ?")
+        params.append(int(codemp))
+    if modsis:
+        where.append("MODSIS = ?")
+        params.append(modsis.strip().upper())
+    if idereg:
+        where.append("IDEREG LIKE ?")
+        params.append(f"%{idereg.strip().upper()}%")
+    if usuario_api:
+        where.append("USUARIO_API = ?")
+        params.append(usuario_api.strip().upper())
+    if data_ini:
+        where.append("DATA_HORA >= ?")
+        params.append(data_ini)
+    if data_fim:
+        where.append("DATA_HORA <= ?")
+        params.append(data_fim)
+    where_sql = " AND ".join(where)
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT COUNT(*) FROM dbo.USU_AUD_IDENT_REGRA WHERE {where_sql}",
+            params,
+        )
+        total = int(cursor.fetchone()[0] or 0)
+
+        cursor.execute(f"""
+            SELECT
+                ID_LOG, CONVERT(VARCHAR(19), DATA_HORA, 120) AS DATA_HORA,
+                USUARIO_API, IP, ACAO, MOTIVO,
+                CODEMP, MODSIS, IDEREG, CODTNS,
+                DESREG_ANT, DESREG_NOV,
+                CODREG_ANT, CODREG_NOV,
+                SITREG_ANT, SITREG_NOV,
+                RESULTADO
+            FROM dbo.USU_AUD_IDENT_REGRA
+            WHERE {where_sql}
+            ORDER BY DATA_HORA DESC, ID_LOG DESC
+            OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+        """, params + [offset, tamanho_pagina])
+        dados = [_row_to_dict_e098(cursor, r) for r in cursor.fetchall()]
+        return {
+            "pagina": pagina,
+            "tamanho_pagina": tamanho_pagina,
+            "total": total,
+            "total_paginas": (total + tamanho_pagina - 1) // tamanho_pagina if total else 0,
+            "dados": dados,
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ============================================================
+# ALIASES + DASHBOARDS — desbloqueia o frontend Lovable que chama
+# rotas com nomes ligeiramente diferentes das que implementamos.
+# ============================================================
+
+
+@app.get("/api/senior/resumo")
+def senior_resumo(usuario=Depends(validar_token)):
+    """Dashboard agregado: contagens de regras por status, total/ativos/
+    inativos de identificadores E098REG, alterações de hoje e últimas 10."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+
+        def scalar(sql, params=None):
+            cursor.execute(sql, params or [])
+            row = cursor.fetchone()
+            return int(row[0] or 0) if row else 0
+
+        total_regras = scalar("SELECT COUNT(1) FROM dbo.USU_SENIOR_REGRA")
+        regras_rascunho = scalar(
+            "SELECT COUNT(1) FROM dbo.USU_SENIOR_REGRA WHERE STATUS_REGRA = 'RASCUNHO'"
+        )
+        regras_revisao = scalar(
+            "SELECT COUNT(1) FROM dbo.USU_SENIOR_REGRA WHERE STATUS_REGRA = 'EM_REVISAO'"
+        )
+        regras_aprovadas = scalar(
+            "SELECT COUNT(1) FROM dbo.USU_SENIOR_REGRA WHERE STATUS_REGRA = 'APROVADA'"
+        )
+
+        # Identificadores — protege se E098REG não existir nesse banco
+        try:
+            identificadores_total = scalar("SELECT COUNT(1) FROM E098REG")
+            identificadores_ativos = scalar(
+                "SELECT COUNT(1) FROM E098REG "
+                "WHERE LTRIM(RTRIM(ISNULL(SITREG,''))) = 'A'"
+            )
+            identificadores_inativos = scalar(
+                "SELECT COUNT(1) FROM E098REG "
+                "WHERE LTRIM(RTRIM(ISNULL(SITREG,''))) <> 'A'"
+            )
+        except Exception:
+            identificadores_total = 0
+            identificadores_ativos = 0
+            identificadores_inativos = 0
+
+        alteracoes_hoje = scalar("""
+            SELECT COUNT(1)
+            FROM dbo.USU_AUD_IDENT_REGRA
+            WHERE CAST(DATA_HORA AS DATE) = CAST(GETDATE() AS DATE)
+        """)
+
+        cursor.execute("""
+            SELECT TOP 10
+                ID_LOG,
+                CONVERT(VARCHAR(19), DATA_HORA, 120) AS DATA_HORA,
+                USUARIO_API, ACAO, CODEMP, MODSIS, IDEREG, CODTNS,
+                CODREG_ANT, CODREG_NOV, SITREG_ANT, SITREG_NOV,
+                MOTIVO, RESULTADO
+            FROM dbo.USU_AUD_IDENT_REGRA
+            ORDER BY DATA_HORA DESC
+        """)
+        cols = [c[0] for c in cursor.description]
+        ultimas = []
+        for row in cursor.fetchall():
+            item = {}
+            for i, c in enumerate(cols):
+                v = row[i]
+                if isinstance(v, str):
+                    v = v.strip()
+                item[c] = v
+            ultimas.append(item)
+
+        # Retorna nomes em snake_case e camelCase (compat com qualquer
+        # cliente, evita ter que normalizar no frontend)
+        return {
+            # snake_case
+            "total_regras": total_regras,
+            "regras_rascunho": regras_rascunho,
+            "regras_em_revisao": regras_revisao,
+            "regras_aprovadas": regras_aprovadas,
+            "identificadores_total": identificadores_total,
+            "identificadores_ativos": identificadores_ativos,
+            "identificadores_inativos": identificadores_inativos,
+            "alteracoes_hoje": alteracoes_hoje,
+            "ultimas_alteracoes": ultimas,
+            # camelCase (compat com clientes que esperam essa convenção)
+            "totalRegras": total_regras,
+            "regrasRascunho": regras_rascunho,
+            "regrasEmRevisao": regras_revisao,
+            "regrasAprovadas": regras_aprovadas,
+            "identificadoresTotal": identificadores_total,
+            "identificadoresAtivos": identificadores_ativos,
+            "identificadoresInativos": identificadores_inativos,
+            "alteracoesHoje": alteracoes_hoje,
+            "ultimasAlteracoes": ultimas,
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/senior/auditoria")
+def senior_auditoria_alias(
+    de: Optional[str] = None,
+    ate: Optional[str] = None,
+    acao: Optional[str] = None,
+    usuario_filtro: Optional[str] = Query(None, alias="usuario"),
+    codemp: Optional[int] = None,
+    modsis: Optional[str] = None,
+    idereg: Optional[str] = None,
+    pagina: int = 1,
+    tamanho_pagina: int = 100,
+    usuario=Depends(validar_token),
+):
+    """Atalho de /api/senior/identificadores/auditoria com:
+       - `de`/`ate` no lugar de `data_ini`/`data_fim`
+       - `acao` filtra por ACAO exata (ALTERAR_SITUACAO/ALTERAR_CODREG/...)
+       - `usuario` (alias do query param)
+       - retorna `items` alias para `dados` (compat frontend)."""
+    pagina = max(1, int(pagina or 1))
+    tamanho_pagina = max(1, min(int(tamanho_pagina or 100), 500))
+    offset = (pagina - 1) * tamanho_pagina
+
+    where = ["1=1"]
+    params: list = []
+    if de:
+        where.append("DATA_HORA >= ?")
+        params.append(de)
+    if ate:
+        where.append("DATA_HORA < DATEADD(DAY, 1, CAST(? AS DATE))")
+        params.append(ate)
+    if acao:
+        where.append("ACAO = ?")
+        params.append(acao.strip().upper())
+    if usuario_filtro:
+        where.append("USUARIO_API LIKE ?")
+        params.append(f"%{usuario_filtro.strip().upper()}%")
+    if codemp:
+        where.append("CODEMP = ?")
+        params.append(int(codemp))
+    if modsis:
+        where.append("MODSIS = ?")
+        params.append(modsis.strip().upper())
+    if idereg:
+        where.append("IDEREG LIKE ?")
+        params.append(f"%{idereg.strip().upper()}%")
+    where_sql = " AND ".join(where)
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT COUNT(1) FROM dbo.USU_AUD_IDENT_REGRA WHERE {where_sql}",
+            params,
+        )
+        total = int(cursor.fetchone()[0] or 0)
+
+        cursor.execute(f"""
+            SELECT
+                ID_LOG, CONVERT(VARCHAR(19), DATA_HORA, 120) AS DATA_HORA,
+                USUARIO_API, IP, ACAO, MOTIVO,
+                CODEMP, MODSIS, IDEREG, CODTNS,
+                DESREG_ANT, DESREG_NOV,
+                CODREG_ANT, CODREG_NOV,
+                OBSREG_ANT, OBSREG_NOV,
+                SITREG_ANT, SITREG_NOV,
+                RESULTADO
+            FROM dbo.USU_AUD_IDENT_REGRA
+            WHERE {where_sql}
+            ORDER BY DATA_HORA DESC, ID_LOG DESC
+            OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+        """, params + [offset, tamanho_pagina])
+        cols = [c[0] for c in cursor.description]
+        dados = []
+        for row in cursor.fetchall():
+            item = {}
+            for i, c in enumerate(cols):
+                v = row[i]
+                if isinstance(v, str):
+                    v = v.strip()
+                item[c] = v
+            dados.append(item)
+        return {
+            "pagina": pagina,
+            "tamanho_pagina": tamanho_pagina,
+            "total": total,
+            "dados": dados,
+            "items": dados,
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# Aliases POST/GET para compat com URLs que o frontend chama --------
+
+@app.post("/api/senior/regras/{id_regra:int}")
+def senior_atualizar_regra_post_alias(
+    id_regra: int,
+    body: SeniorRegraAtualizarPayload,
+    usuario=Depends(validar_token),
+):
+    """Alias POST de PUT /api/senior/regras/{id} — alguns clientes só
+    enviam POST. Delega ao handler PUT."""
+    return atualizar_regra_senior(id_regra, body, usuario)
+
+
+@app.post("/api/senior/regras/{id_regra:int}/status")
+def senior_status_regra_alias(
+    id_regra: int,
+    body: SeniorRegraTransicionarPayload,
+    usuario=Depends(validar_token),
+):
+    """Alias de /transicionar — usa o mesmo payload (novo_status + motivo)."""
+    return transicionar_regra_senior(id_regra, body, usuario)
+
+
+@app.get("/api/senior/regras/{id_regra:int}/export")
+def senior_exportar_regra_alias(
+    id_regra: int,
+    usuario=Depends(validar_token),
+):
+    """Alias inglês de /exportar."""
+    return exportar_regra_senior_txt(id_regra, usuario)
+
+
+@app.post("/api/senior/regras/{id_regra:int}/validar")
+def senior_validar_regra_alias(
+    id_regra: int,
+    usuario=Depends(validar_token),
+):
+    """Alias de /validar-riscos com shape mínimo (id_regra + alertas)."""
+    resultado = validar_riscos_regra_senior(id_regra, usuario)
+    return {
+        "id_regra": id_regra,
+        "hash_fonte": resultado.get("hash_fonte"),
+        "alertas": [i.get("mensagem") for i in resultado.get("issues", []) if i],
+        "valido_para_exportacao": resultado.get("ok", True),
+        "issues": resultado.get("issues", []),
+        "observacao": (
+            "Validação básica da API. Compilação oficial continua no "
+            "Editor de Regras Senior."
+        ),
+    }
+
+
+@app.get("/api/senior/regras/clonar-de-e098reg/preview")
+def senior_preview_clone_e098reg(
+    codemp: int,
+    modsis: str,
+    idereg: str,
+    codtns: str = "",
+    usuario=Depends(validar_token),
+):
+    """Lê uma linha de E098REG e devolve um payload pronto para
+    pré-preencher a modal 'Clonar para portal'. Frontend ainda precisa
+    pedir o `fonte_lsp` (cola do Editor de Regras Senior) + `motivo`
+    antes de fazer POST /api/senior/regras."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        row = _buscar_identificador_e098(cursor, codemp, modsis, idereg, codtns)
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Identificador não encontrado em E098REG: "
+                    f"codemp={codemp}, modsis={modsis}, idereg={idereg}, "
+                    f"codtns={codtns!r}."
+                ),
+            )
+
+        codreg = row.get("CODREG")
+        if not codreg:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Identificador sem CODREG vinculado. "
+                    "Clonagem só faz sentido para identificadores com regra."
+                ),
+            )
+
+        # Verifica se já existe regra no portal com esse CODREG_ERP (ou
+        # com a mesma chave IDEREG/MODSIS/CODTNS) — evita duplicação.
+        cursor.execute("""
+            SELECT TOP 1
+                ID_REGRA,
+                NOME_REGRA,
+                STATUS_REGRA,
+                CONVERT(VARCHAR(19), DATA_CRIACAO, 120) AS DATA_CRIACAO
+            FROM dbo.USU_SENIOR_REGRA
+            WHERE (CODREG_ERP = ? AND ? > 0)
+               OR (
+                    COALESCE(MODSIS, '') = ?
+                AND COALESCE(IDEREG, IDENTIFICADOR, '') = ?
+                AND COALESCE(CODTNS, '') = ?
+               )
+            ORDER BY ID_REGRA DESC
+        """, [
+            int(codreg), int(codreg),
+            (modsis or "").strip().upper(),
+            (idereg or "").strip().upper(),
+            (codtns or "").strip().upper(),
+        ])
+        existing = cursor.fetchone()
+        existente_no_portal = None
+        if existing:
+            existente_no_portal = {
+                "id_regra": int(existing[0]),
+                "nome_regra": (existing[1] or "").strip(),
+                "status_regra": (existing[2] or "").strip(),
+                "data_criacao": existing[3],
+            }
+
+        modsis_clean = (row.get("MODSIS") or "").strip()
+        idereg_clean = (row.get("IDEREG") or "").strip()
+        nome_sugerido = f"Regra ERP {codreg} - {modsis_clean}-{idereg_clean}"
+
+        return {
+            "origem_erp": row,
+            "ja_existe_no_portal": existente_no_portal is not None,
+            "regra_existente_no_portal": existente_no_portal,
+            "payload_sugerido": {
+                "nome_regra": nome_sugerido,
+                "codreg_erp": int(codreg),
+                "codemp": int(row.get("CODEMP") or codemp),
+                "modsis": modsis_clean,
+                "idereg": idereg_clean,
+                "codtns": (row.get("CODTNS") or "").strip(),
+                "descricao": (row.get("DESREG") or "").strip(),
+                "ambiente": "HOMOLOGACAO",
+                "ticket": "",
+                "motivo": "Clonada da E098REG para controle no portal",
+                "fonte_lsp": "",  # frontend pede para o usuário colar
+            },
+            "instrucoes": (
+                "1. Abra o Editor de Regras Senior. "
+                "2. Localize a regra (CODREG=" + str(codreg) + "). "
+                "3. Copie o fonte LSP. "
+                "4. Cole no campo 'Fonte LSP' da modal. "
+                "5. Confirme o motivo e clique em Clonar. "
+                "A regra é criada com STATUS=RASCUNHO no portal — "
+                "não altera nada no ERP."
+            ),
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# Endpoints /codigo, /importar-fonte, /fontes e /{id_regra}/codigo
+# foram movidos para ANTES de /api/senior/regras/{id_regra} para
+# evitar conflito de roteamento (FastAPI matcheia rotas na ordem
+# de declaração — caso contrário /codigo seria interpretado como
+# {id_regra: int} e falharia com 422).
 
 
 if __name__ == '__main__':
