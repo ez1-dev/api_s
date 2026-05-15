@@ -29807,10 +29807,201 @@ def auditoria_genius_ops_jato_peso(
       - SEM_COMPONENTES_E900CMO: OP sem componentes mapeados
       - PESO_ZERO: tem componentes, mas nenhum calculou peso
       - PESO_PARCIAL: alguns componentes sem PESLIQ
-      - OK: todos os componentes calcularam peso"""
+      - OK: todos os componentes calcularam peso
+
+    Fase 2 (`usar_multinivel=true`): explode E700CTM até chegar em itens
+    finais. Adiciona campos qtd_componentes_finais/expandidos, nivel_maximo,
+    qtd_ciclos e peso_kg_multinivel."""
     pagina = max(1, int(pagina or 1))
     tamanho_pagina = max(1, min(int(tamanho_pagina or 100), 500))
     offset = (pagina - 1) * tamanho_pagina
+    nivel_maximo = max(1, min(int(nivel_maximo or 10), 20))
+
+    # ------------------------------------------------------------------
+    # Fase 2 — multinivel via CTE recursiva (E700CTM)
+    # ------------------------------------------------------------------
+    if usar_multinivel:
+        cte_sql, params_base = _ops_jato_peso_cte_multinivel(
+            codemp,
+            data_ini=data_ini, data_fim=data_fim,
+            origem=origem, numero_op=numero_op,
+            codigo_produto=codigo_produto, situacao_op=situacao_op,
+            nivel_max=nivel_maximo,
+        )
+
+        having_peso: list = []
+        if somente_com_peso:
+            having_peso.append("agregado.peso_kg_multinivel > 0")
+        if somente_sem_peso:
+            having_peso.append("agregado.peso_kg_multinivel = 0")
+        if somente_peso_parcial:
+            having_peso.append("agregado.status_peso = 'PESO_PARCIAL'")
+        having_sql = (" WHERE " + " AND ".join(having_peso)) if having_peso else ""
+
+        select_agregado = """
+            SELECT
+                F.CODEMP                                       AS CODEMP,
+                F.CODORI                                       AS origem,
+                F.NUMORP                                       AS numero_op,
+                F.CODPRO_OP                                    AS codigo_produto,
+                COALESCE(PRO_OP.DESPRO, '')                    AS descricao_produto,
+                F.SITORP                                       AS situacao_op,
+                CONVERT(VARCHAR(10), F.DATA_JATO, 120)         AS data_jato,
+                F.QTD_APONTAMENTOS_JATO                        AS qtd_apontamentos_jato,
+                COUNT(CASE WHEN F.NIVEL = 1 THEN 1 END)        AS qtd_componentes_diretos,
+                COUNT(CASE WHEN F.COMPONENTE_FINAL = 1 THEN 1 END) AS qtd_componentes_finais,
+                COUNT(CASE WHEN F.DEVE_EXPANDIR = 1 THEN 1 END)    AS qtd_componentes_expandidos,
+                SUM(CASE WHEN F.CICLO_DETECTADO = 1 THEN 1 ELSE 0 END) AS qtd_ciclos,
+                SUM(
+                    CASE WHEN F.COMPONENTE_FINAL = 1
+                          AND COALESCE(F.PESO_KG_CALCULADO, 0) = 0
+                         THEN 1 ELSE 0 END
+                ) AS qtd_componentes_sem_peso,
+                MAX(F.NIVEL)                                   AS nivel_maximo_encontrado,
+                CAST(SUM(
+                    CASE WHEN F.COMPONENTE_FINAL = 1
+                         THEN COALESCE(F.PESO_KG_CALCULADO, 0)
+                         ELSE 0 END
+                ) AS FLOAT)                                    AS peso_kg_multinivel,
+                CASE
+                    WHEN COUNT(*) = 0 THEN 'SEM_COMPONENTES_E900CMO'
+                    WHEN SUM(CASE WHEN F.CICLO_DETECTADO = 1 THEN 1 ELSE 0 END) > 0
+                        THEN 'CICLO_BOM'
+                    WHEN SUM(
+                            CASE WHEN F.COMPONENTE_FINAL = 1
+                                  AND COALESCE(F.PESO_KG_CALCULADO, 0) = 0
+                                 THEN 1 ELSE 0 END
+                         ) > 0
+                     AND SUM(
+                            CASE WHEN F.COMPONENTE_FINAL = 1
+                                 THEN COALESCE(F.PESO_KG_CALCULADO, 0)
+                                 ELSE 0 END
+                         ) > 0
+                        THEN 'PESO_PARCIAL'
+                    WHEN SUM(
+                            CASE WHEN F.COMPONENTE_FINAL = 1
+                                 THEN COALESCE(F.PESO_KG_CALCULADO, 0)
+                                 ELSE 0 END
+                         ) = 0
+                        THEN 'PESO_ZERO'
+                    ELSE 'OK'
+                END AS status_peso
+            FROM Folhas F
+            LEFT JOIN E075PRO PRO_OP
+                   ON PRO_OP.CODEMP = F.CODEMP
+                  AND PRO_OP.CODPRO = F.CODPRO_OP
+            GROUP BY
+                F.CODEMP, F.CODORI, F.NUMORP, F.CODPRO_OP,
+                PRO_OP.DESPRO, F.SITORP, F.DATA_JATO, F.QTD_APONTAMENTOS_JATO
+        """
+
+        sql_total = cte_sql + f"""
+            SELECT COUNT(*) FROM (
+                {select_agregado}
+            ) agregado
+            {having_sql}
+            OPTION (MAXRECURSION {nivel_maximo})
+        """
+        sql_resumo = cte_sql + f"""
+            SELECT
+                COUNT(*) AS total_ops,
+                SUM(CASE WHEN agregado.peso_kg_multinivel > 0 THEN 1 ELSE 0 END) AS ops_com_peso,
+                SUM(CASE WHEN agregado.peso_kg_multinivel = 0 THEN 1 ELSE 0 END) AS ops_sem_peso,
+                SUM(CASE WHEN agregado.status_peso = 'PESO_PARCIAL' THEN 1 ELSE 0 END) AS ops_peso_parcial,
+                SUM(CASE WHEN agregado.qtd_ciclos > 0 THEN 1 ELSE 0 END) AS ops_com_ciclo,
+                CAST(SUM(COALESCE(agregado.peso_kg_multinivel, 0)) AS FLOAT) AS peso_total_kg_multinivel,
+                MAX(agregado.nivel_maximo_encontrado) AS maior_nivel_encontrado
+            FROM (
+                {select_agregado}
+            ) agregado
+            {having_sql}
+            OPTION (MAXRECURSION {nivel_maximo})
+        """
+        sql_dados = cte_sql + f"""
+            SELECT *
+            FROM (
+                {select_agregado}
+            ) agregado
+            {having_sql}
+            ORDER BY agregado.origem, agregado.numero_op
+            OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+            OPTION (MAXRECURSION {nivel_maximo})
+        """
+
+        conn = get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(sql_total, params_base)
+            total_registros = int(cursor.fetchone()[0] or 0)
+
+            cursor.execute(sql_resumo, params_base)
+            row_r = cursor.fetchone()
+            resumo = {
+                "total_ops": int(row_r[0] or 0),
+                "ops_com_peso": int(row_r[1] or 0),
+                "ops_sem_peso": int(row_r[2] or 0),
+                "ops_peso_parcial": int(row_r[3] or 0),
+                "ops_com_ciclo": int(row_r[4] or 0),
+                "peso_total_kg_multinivel": round(float(row_r[5] or 0), 3),
+                "maior_nivel_encontrado": int(row_r[6] or 0),
+            }
+
+            cursor.execute(sql_dados, params_base + [offset, tamanho_pagina])
+            cols = [c[0] for c in cursor.description]
+            dados = []
+            for row in cursor.fetchall():
+                item = {}
+                for i, c in enumerate(cols):
+                    v = row[i]
+                    if isinstance(v, str):
+                        v = v.strip()
+                    item[c] = v
+                # Remove CODEMP do payload (interno)
+                item.pop("CODEMP", None)
+                if item.get("peso_kg_multinivel") is not None:
+                    item["peso_kg_multinivel"] = round(float(item["peso_kg_multinivel"]), 3)
+                # Compat com Fase 1: peso_kg_direto fica None
+                item["peso_kg_direto"] = None
+                dados.append(item)
+
+            total_paginas = (total_registros + tamanho_pagina - 1) // tamanho_pagina if total_registros else 0
+            return {
+                "modo": "MULTINIVEL",
+                "nivel_maximo": nivel_maximo,
+                "pagina": pagina,
+                "tamanho_pagina": tamanho_pagina,
+                "total_registros": total_registros,
+                "total_paginas": total_paginas,
+                "dados": dados,
+                "resumo": resumo,
+                "filtros_aplicados": {
+                    "codemp": codemp,
+                    "data_ini": data_ini, "data_fim": data_fim,
+                    "origem": origem, "numero_op": numero_op,
+                    "codigo_produto": codigo_produto, "situacao_op": situacao_op,
+                    "somente_com_peso": somente_com_peso,
+                    "somente_sem_peso": somente_sem_peso,
+                    "somente_peso_parcial": somente_peso_parcial,
+                    "usar_multinivel": True,
+                    "nivel_maximo": nivel_maximo,
+                },
+                "observacao": (
+                    "Peso via CTE recursiva (E900CMO → E700CTM). Subconjuntos "
+                    "produzidos Genius são EXPANDIDOS até chegar em itens "
+                    "finais (TIPPRO='C' OU origem fora Genius OU sem modelo). "
+                    f"MAXRECURSION={nivel_maximo}. Ciclos detectados via "
+                    "CHARINDEX no caminho."
+                ),
+            }
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Fase 1 — peso direto (default — `usar_multinivel=false`)
+    # ------------------------------------------------------------------
 
     # WHERE dinâmico da CTE OpsJato (origens fixas + filtros opcionais)
     origens_sql = ", ".join(f"'{o}'" for o in GENIUS_ORIGENS)
@@ -30054,6 +30245,132 @@ def auditoria_genius_ops_jato_peso(
             pass
 
 
+@app.get("/api/auditoria-apontamento-genius/ops-jato-peso/{origem}/{numero_op}/componentes")
+def auditoria_genius_ops_jato_componentes(
+    origem: str,
+    numero_op: int,
+    codemp: int = EMPRESA_PADRAO,
+    nivel_maximo: int = 10,
+    incluir_expandidos: bool = True,
+    usuario=Depends(validar_token),
+):
+    """Retorna a árvore aberta de componentes multinível de UMA OP
+    específica. Frontend usa para o modal/drawer 'Ver componentes' que
+    mostra a explosão da estrutura."""
+    nivel_maximo = max(1, min(int(nivel_maximo or 10), 20))
+
+    cte_sql, params_base = _ops_jato_peso_cte_multinivel(
+        codemp,
+        origem=origem,
+        numero_op=numero_op,
+        nivel_max=nivel_maximo,
+    )
+
+    sql_detalhe = cte_sql + f"""
+        SELECT
+            F.NIVEL                                       AS nivel,
+            F.CAMINHO                                     AS caminho,
+            F.CODPRO_OP                                   AS codigo_pai_op,
+            F.CODIGO_COMPONENTE                           AS codigo_componente,
+            F.DERIVACAO_COMPONENTE                        AS derivacao_componente,
+            COALESCE(F.DESCRICAO_COMPONENTE, '')          AS descricao_componente,
+            F.TIPO_PRODUTO                                AS tipo_produto,
+            F.ORIGEM_COMPONENTE                           AS origem_componente,
+            CAST(F.QTD_NIVEL AS FLOAT)                    AS quantidade_nivel,
+            CAST(F.QTD_ACUMULADA AS FLOAT)                AS quantidade_acumulada,
+            F.UNIDADE                                     AS unidade,
+            CAST(F.PESO_UNITARIO AS FLOAT)                AS peso_unitario,
+            CAST(F.PESO_KG_CALCULADO AS FLOAT)            AS peso_calculado,
+            CASE WHEN F.DEVE_EXPANDIR = 1 THEN 1 ELSE 0 END AS foi_expandido,
+            CASE WHEN F.COMPONENTE_FINAL = 1 THEN 1 ELSE 0 END AS componente_final,
+            CASE WHEN F.CICLO_DETECTADO = 1 THEN 1 ELSE 0 END AS ciclo_detectado
+        FROM Folhas F
+        ORDER BY F.NIVEL, F.CAMINHO, F.CODIGO_COMPONENTE
+        OPTION (MAXRECURSION {nivel_maximo})
+    """
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(sql_detalhe, params_base)
+        cols = [c[0] for c in cursor.description]
+        componentes = []
+        peso_total = 0.0
+        nivel_max_encontrado = 0
+        for row in cursor.fetchall():
+            item = {}
+            for i, c in enumerate(cols):
+                v = row[i]
+                if isinstance(v, str):
+                    v = v.strip()
+                item[c] = v
+            # Booleanos pra ficar mais natural no frontend
+            item["foi_expandido"] = bool(item.get("foi_expandido"))
+            item["componente_final"] = bool(item.get("componente_final"))
+            item["ciclo_detectado"] = bool(item.get("ciclo_detectado"))
+            # Rounds
+            for k in ("quantidade_nivel", "quantidade_acumulada", "peso_unitario", "peso_calculado"):
+                if item.get(k) is not None:
+                    item[k] = round(float(item[k]), 4)
+            nivel_max_encontrado = max(nivel_max_encontrado, int(item.get("nivel") or 0))
+            if item["componente_final"]:
+                peso_total += float(item.get("peso_calculado") or 0)
+            componentes.append(item)
+
+        if not componentes:
+            raise HTTPException(
+                status_code=404,
+                detail=f"OP não encontrada ou sem apontamento de JATO: origem={origem} numero_op={numero_op}",
+            )
+
+        if not incluir_expandidos:
+            componentes = [c for c in componentes if c["componente_final"] or c["nivel"] == 1]
+
+        # Cabeçalho da OP (codpro, descrição) — pega da primeira linha
+        primeiro = componentes[0] if componentes else {}
+        produto_op = primeiro.get("codigo_pai_op")
+
+        # Buscar descrição do produto da OP
+        descricao_op = ""
+        try:
+            cursor.execute(
+                "SELECT TOP 1 DESPRO FROM E075PRO WHERE CODEMP = ? AND CODPRO = ?",
+                [codemp, produto_op],
+            )
+            r = cursor.fetchone()
+            if r and r[0]:
+                descricao_op = r[0].strip() if isinstance(r[0], str) else r[0]
+        except Exception:
+            pass
+
+        return {
+            "codemp": codemp,
+            "origem": origem,
+            "numero_op": numero_op,
+            "produto_op": produto_op,
+            "descricao_produto": descricao_op,
+            "peso_kg_multinivel": round(peso_total, 3),
+            "nivel_maximo": nivel_maximo,
+            "nivel_maximo_encontrado": nivel_max_encontrado,
+            "qtd_total_linhas": len(componentes),
+            "qtd_componentes_finais": sum(1 for c in componentes if c["componente_final"]),
+            "qtd_componentes_expandidos": sum(1 for c in componentes if c["foi_expandido"]),
+            "qtd_ciclos": sum(1 for c in componentes if c["ciclo_detectado"]),
+            "componentes": componentes,
+            "observacao": (
+                "Árvore completa de componentes da OP. Itens com "
+                "foi_expandido=true são subconjuntos Genius já explodidos "
+                "(não somam peso direto). Itens com componente_final=true "
+                "são os que contribuem com peso_kg_multinivel."
+            ),
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 @app.get("/api/export/auditoria-apontamento-genius/ops-jato-peso")
 def exportar_auditoria_genius_ops_jato_peso(
     codemp: int = EMPRESA_PADRAO,
@@ -30065,10 +30382,14 @@ def exportar_auditoria_genius_ops_jato_peso(
     situacao_op: Optional[str] = None,
     somente_com_peso: bool = False,
     somente_sem_peso: bool = False,
+    somente_peso_parcial: bool = False,
+    usar_multinivel: bool = False,
+    nivel_maximo: int = 10,
     usuario=Depends(validar_token_download),
 ):
     """Exporta para Excel todas as OPs (sem paginação) usando o mesmo
-    filtro do endpoint principal."""
+    filtro do endpoint principal. Aceita `usar_multinivel` para incluir
+    o peso explodido via E700CTM."""
     dados = _collect_paginated_data(
         auditoria_genius_ops_jato_peso,
         usuario,
@@ -30083,24 +30404,45 @@ def exportar_auditoria_genius_ops_jato_peso(
         situacao_op=situacao_op,
         somente_com_peso=somente_com_peso,
         somente_sem_peso=somente_sem_peso,
+        somente_peso_parcial=somente_peso_parcial,
+        usar_multinivel=usar_multinivel,
+        nivel_maximo=nivel_maximo,
     )
-    cabecalhos = {
-        "origem": "Origem",
-        "numero_op": "Número OP",
-        "codigo_produto": "Cód. Produto",
-        "descricao_produto": "Descrição Produto",
-        "situacao_op": "Sit. OP",
-        "data_jato": "Data JATO",
-        "qtd_apontamentos_jato": "Qtd. Apontamentos",
-        "qtd_componentes": "Qtd. Componentes",
-        "peso_kg_componentes": "Peso (KG)",
-        "qtd_componentes_sem_peso": "Componentes sem Peso",
-        "status_peso": "Status Peso",
-    }
-    return _xlsx_response(
-        "auditoria_genius_ops_jato_peso.xlsx",
-        [("OPs JATO/Pintura", dados, cabecalhos)],
-    )
+    if usar_multinivel:
+        cabecalhos = {
+            "origem": "Origem",
+            "numero_op": "Número OP",
+            "codigo_produto": "Cód. Produto",
+            "descricao_produto": "Descrição Produto",
+            "situacao_op": "Sit. OP",
+            "data_jato": "Data JATO",
+            "qtd_apontamentos_jato": "Qtd. Apontamentos",
+            "qtd_componentes_diretos": "Qtd. Comp. Diretos",
+            "qtd_componentes_finais": "Qtd. Comp. Finais",
+            "qtd_componentes_expandidos": "Qtd. Comp. Expandidos",
+            "qtd_componentes_sem_peso": "Componentes sem Peso",
+            "qtd_ciclos": "Ciclos Detectados",
+            "nivel_maximo_encontrado": "Nível Máximo",
+            "peso_kg_multinivel": "Peso KG Multinível",
+            "status_peso": "Status Peso",
+        }
+        nome = "auditoria_genius_ops_jato_peso_multinivel.xlsx"
+    else:
+        cabecalhos = {
+            "origem": "Origem",
+            "numero_op": "Número OP",
+            "codigo_produto": "Cód. Produto",
+            "descricao_produto": "Descrição Produto",
+            "situacao_op": "Sit. OP",
+            "data_jato": "Data JATO",
+            "qtd_apontamentos_jato": "Qtd. Apontamentos",
+            "qtd_componentes": "Qtd. Componentes",
+            "peso_kg_componentes": "Peso (KG)",
+            "qtd_componentes_sem_peso": "Componentes sem Peso",
+            "status_peso": "Status Peso",
+        }
+        nome = "auditoria_genius_ops_jato_peso.xlsx"
+    return _xlsx_response(nome, [("OPs JATO/Pintura", dados, cabecalhos)])
 
 
 if __name__ == '__main__':
