@@ -29670,38 +29670,18 @@ def _ops_jato_peso_cte_multinivel(codemp: int, *, data_ini=None, data_fim=None,
                 OJ.CODPRO    AS CODPRO_OP,
                 OJ.SITORP, OJ.DATA_JATO, OJ.QTD_APONTAMENTOS_JATO,
                 1 AS NIVEL,
-                CAST(OJ.CODPRO AS VARCHAR(500)) AS CAMINHO,
+                CAST(OJ.CODPRO + '>' + CMO.CODCMP AS VARCHAR(1000)) AS CAMINHO,
                 CMO.CODCMP   AS CODIGO_COMPONENTE,
                 CMO.CODDER   AS DERIVACAO_COMPONENTE,
                 CAST(CMO.QTDPRV AS FLOAT) AS QTD_NIVEL,
                 CAST(CMO.QTDPRV AS FLOAT) AS QTD_ACUMULADA,
                 CMO.UNIMED   AS UNIDADE,
-                PRO.DESPRO   AS DESCRICAO_COMPONENTE,
-                PRO.TIPPRO   AS TIPO_PRODUTO,
-                PRO.CODORI   AS ORIGEM_COMPONENTE,
-                CAST(COALESCE(DER.PESLIQ, PRO.PESLIQ, 0) AS FLOAT) AS PESO_UNITARIO,
-                CASE
-                    WHEN PRO.CODORI IN ({origens_sql})
-                     AND EXISTS (
-                            SELECT 1 FROM E700MOD M
-                            WHERE M.CODEMP = CMO.CODEMP
-                              AND M.CODMOD = CMO.CODCMP
-                        )
-                    THEN 1 ELSE 0
-                END AS DEVE_EXPANDIR,
                 0 AS CICLO_DETECTADO
             FROM OpsJato OJ
             INNER JOIN E900CMO CMO
                     ON CMO.CODEMP = OJ.CODEMP
                    AND CMO.CODORI = OJ.CODORI
                    AND CMO.NUMORP = OJ.NUMORP
-            LEFT JOIN E075PRO PRO
-                   ON PRO.CODEMP = CMO.CODEMP
-                  AND PRO.CODPRO = CMO.CODCMP
-            LEFT JOIN E075DER DER
-                   ON DER.CODEMP = CMO.CODEMP
-                  AND DER.CODPRO = CMO.CODCMP
-                  AND DER.CODDER = CMO.CODDER
         ),
         BomRecursiva AS (
             SELECT
@@ -29710,33 +29690,19 @@ def _ops_jato_peso_cte_multinivel(codemp: int, *, data_ini=None, data_fim=None,
                 R.NIVEL, R.CAMINHO,
                 R.CODIGO_COMPONENTE, R.DERIVACAO_COMPONENTE,
                 R.QTD_NIVEL, R.QTD_ACUMULADA, R.UNIDADE,
-                R.DESCRICAO_COMPONENTE, R.TIPO_PRODUTO, R.ORIGEM_COMPONENTE,
-                R.PESO_UNITARIO, R.DEVE_EXPANDIR, R.CICLO_DETECTADO
+                R.CICLO_DETECTADO
             FROM RaizComponentes R
             UNION ALL
             SELECT
                 B.CODEMP, B.CODORI, B.NUMORP, B.CODPRO_OP,
                 B.SITORP, B.DATA_JATO, B.QTD_APONTAMENTOS_JATO,
                 B.NIVEL + 1 AS NIVEL,
-                CAST(B.CAMINHO + '>' + CT.CODCMP AS VARCHAR(500)) AS CAMINHO,
+                CAST(B.CAMINHO + '>' + CT.CODCMP AS VARCHAR(1000)) AS CAMINHO,
                 CT.CODCMP AS CODIGO_COMPONENTE,
                 CT.DERCMP AS DERIVACAO_COMPONENTE,
                 CAST(CT.QTDUTI AS FLOAT) AS QTD_NIVEL,
                 CAST(B.QTD_ACUMULADA * CT.QTDUTI AS FLOAT) AS QTD_ACUMULADA,
                 CT.UNIME2 AS UNIDADE,
-                PRO.DESPRO AS DESCRICAO_COMPONENTE,
-                PRO.TIPPRO AS TIPO_PRODUTO,
-                PRO.CODORI AS ORIGEM_COMPONENTE,
-                CAST(COALESCE(DER.PESLIQ, PRO.PESLIQ, 0) AS FLOAT) AS PESO_UNITARIO,
-                CASE
-                    WHEN PRO.CODORI IN ({origens_sql})
-                     AND EXISTS (
-                            SELECT 1 FROM E700MOD M
-                            WHERE M.CODEMP = CT.CODEMP
-                              AND M.CODMOD = CT.CODCMP
-                        )
-                    THEN 1 ELSE 0
-                END AS DEVE_EXPANDIR,
                 CASE
                     WHEN CHARINDEX('>' + CT.CODCMP + '>', '>' + B.CAMINHO + '>') > 0
                     THEN 1 ELSE 0
@@ -29750,16 +29716,38 @@ def _ops_jato_peso_cte_multinivel(codemp: int, *, data_ini=None, data_fim=None,
                         OR B.DERIVACAO_COMPONENTE = ''
                         OR CT.CODDER = B.DERIVACAO_COMPONENTE
                    )
-            LEFT JOIN E075PRO PRO
-                   ON PRO.CODEMP = CT.CODEMP
-                  AND PRO.CODPRO = CT.CODCMP
-            LEFT JOIN E075DER DER
-                   ON DER.CODEMP = CT.CODEMP
-                  AND DER.CODPRO = CT.CODCMP
-                  AND DER.CODDER = CT.DERCMP
-            WHERE B.DEVE_EXPANDIR = 1
+            WHERE B.NIVEL < {int(nivel_max)}
               AND B.CICLO_DETECTADO = 0
-              AND B.NIVEL < {int(nivel_max)}
+        ),
+        BomEnriquecida AS (
+            SELECT
+                B.CODEMP, B.CODORI, B.NUMORP, B.CODPRO_OP,
+                B.SITORP, B.DATA_JATO, B.QTD_APONTAMENTOS_JATO,
+                B.NIVEL, B.CAMINHO,
+                B.CODIGO_COMPONENTE, B.DERIVACAO_COMPONENTE,
+                B.QTD_NIVEL, B.QTD_ACUMULADA, B.UNIDADE,
+                B.CICLO_DETECTADO,
+                PRO.DESPRO   AS DESCRICAO_COMPONENTE,
+                PRO.TIPPRO   AS TIPO_PRODUTO,
+                PRO.CODORI   AS ORIGEM_COMPONENTE,
+                CAST(COALESCE(DER.PESLIQ, PRO.PESLIQ, 0) AS FLOAT) AS PESO_UNITARIO,
+                CASE
+                    WHEN PRO.CODORI IN ({origens_sql})
+                     AND EXISTS (
+                            SELECT 1 FROM E700CTM CTX
+                            WHERE CTX.CODEMP = B.CODEMP
+                              AND CTX.CODMOD = B.CODIGO_COMPONENTE
+                        )
+                    THEN 1 ELSE 0
+                END AS DEVE_EXPANDIR
+            FROM BomRecursiva B
+            LEFT JOIN E075PRO PRO
+                   ON PRO.CODEMP = B.CODEMP
+                  AND PRO.CODPRO = B.CODIGO_COMPONENTE
+            LEFT JOIN E075DER DER
+                   ON DER.CODEMP = B.CODEMP
+                  AND DER.CODPRO = B.CODIGO_COMPONENTE
+                  AND DER.CODDER = B.DERIVACAO_COMPONENTE
         ),
         Folhas AS (
             SELECT
@@ -29771,7 +29759,7 @@ def _ops_jato_peso_cte_multinivel(codemp: int, *, data_ini=None, data_fim=None,
                         THEN COALESCE(B.QTD_ACUMULADA, 0)
                     ELSE COALESCE(B.QTD_ACUMULADA, 0) * COALESCE(B.PESO_UNITARIO, 0)
                 END AS PESO_KG_CALCULADO
-            FROM BomRecursiva B
+            FROM BomEnriquecida B
         )
     """
     return cte, params
