@@ -29611,6 +29611,172 @@ def senior_preview_clone_e098reg(
 GENIUS_OPR_JATO = (2160, 2161)  # 2160=JATEAR AUTO, 2161=JATEAR MANUAL
 
 
+def _ops_jato_peso_cte_multinivel(codemp: int, *, data_ini=None, data_fim=None,
+                                   origem=None, numero_op=None,
+                                   codigo_produto=None, situacao_op=None,
+                                   ops_extras_where: str = "",
+                                   nivel_max: int = 10) -> tuple[str, list]:
+    """Constrói o CTE recursivo BOM multinível e retorna (sql_cte, params).
+    O caller adiciona o SELECT final (agregado ou detalhe). Não inclui
+    OPTION(MAXRECURSION) — caller anexa."""
+    origens_sql = ", ".join(f"'{o}'" for o in GENIUS_ORIGENS)
+    codopr_sql = ", ".join(str(c) for c in GENIUS_OPR_JATO)
+
+    where_op: list = []
+    params: list = [codemp]
+    if data_ini:
+        where_op.append("EOQ.DATREA >= ?")
+        params.append(data_ini)
+    if data_fim:
+        where_op.append("EOQ.DATREA <= ?")
+        params.append(data_fim)
+    if origem:
+        where_op.append("COP.CODORI = ?")
+        params.append(str(origem).strip())
+    if numero_op:
+        where_op.append("COP.NUMORP = ?")
+        params.append(int(numero_op))
+    if codigo_produto:
+        where_op.append("COP.CODPRO LIKE ?")
+        params.append(f"%{codigo_produto.strip()}%")
+    if situacao_op:
+        where_op.append("COP.SITORP = ?")
+        params.append(situacao_op.strip().upper())
+    if ops_extras_where:
+        where_op.append(ops_extras_where)
+    where_op_sql = (" AND " + " AND ".join(where_op)) if where_op else ""
+
+    cte = f"""
+        WITH OpsJato AS (
+            SELECT
+                COP.CODEMP, COP.CODORI, COP.NUMORP, COP.CODPRO, COP.SITORP,
+                MAX(EOQ.DATREA) AS DATA_JATO,
+                COUNT(*) AS QTD_APONTAMENTOS_JATO
+            FROM E900COP COP
+            INNER JOIN E900EOQ EOQ
+                    ON EOQ.CODEMP = COP.CODEMP
+                   AND EOQ.CODORI = COP.CODORI
+                   AND EOQ.NUMORP = COP.NUMORP
+            WHERE COP.CODEMP = ?
+              AND COP.CODORI IN ({origens_sql})
+              AND EOQ.CODOPR IN ({codopr_sql})
+              AND EOQ.DATREA > CONVERT(DATE, '19001231', 112)
+              {where_op_sql}
+            GROUP BY COP.CODEMP, COP.CODORI, COP.NUMORP, COP.CODPRO, COP.SITORP
+        ),
+        RaizComponentes AS (
+            SELECT
+                OJ.CODEMP, OJ.CODORI, OJ.NUMORP,
+                OJ.CODPRO    AS CODPRO_OP,
+                OJ.SITORP, OJ.DATA_JATO, OJ.QTD_APONTAMENTOS_JATO,
+                1 AS NIVEL,
+                CAST(OJ.CODPRO AS VARCHAR(500)) AS CAMINHO,
+                CMO.CODCMP   AS CODIGO_COMPONENTE,
+                CMO.CODDER   AS DERIVACAO_COMPONENTE,
+                CAST(CMO.QTDPRV AS FLOAT) AS QTD_NIVEL,
+                CAST(CMO.QTDPRV AS FLOAT) AS QTD_ACUMULADA,
+                CMO.UNIMED   AS UNIDADE,
+                PRO.DESPRO   AS DESCRICAO_COMPONENTE,
+                PRO.TIPPRO   AS TIPO_PRODUTO,
+                PRO.CODORI   AS ORIGEM_COMPONENTE,
+                CAST(COALESCE(DER.PESLIQ, PRO.PESLIQ, 0) AS FLOAT) AS PESO_UNITARIO,
+                CASE
+                    WHEN PRO.CODORI IN ({origens_sql})
+                     AND EXISTS (
+                            SELECT 1 FROM E700MOD M
+                            WHERE M.CODEMP = CMO.CODEMP
+                              AND M.CODMOD = CMO.CODCMP
+                        )
+                    THEN 1 ELSE 0
+                END AS DEVE_EXPANDIR,
+                0 AS CICLO_DETECTADO
+            FROM OpsJato OJ
+            INNER JOIN E900CMO CMO
+                    ON CMO.CODEMP = OJ.CODEMP
+                   AND CMO.CODORI = OJ.CODORI
+                   AND CMO.NUMORP = OJ.NUMORP
+            LEFT JOIN E075PRO PRO
+                   ON PRO.CODEMP = CMO.CODEMP
+                  AND PRO.CODPRO = CMO.CODCMP
+            LEFT JOIN E075DER DER
+                   ON DER.CODEMP = CMO.CODEMP
+                  AND DER.CODPRO = CMO.CODCMP
+                  AND DER.CODDER = CMO.CODDER
+        ),
+        BomRecursiva AS (
+            SELECT
+                R.CODEMP, R.CODORI, R.NUMORP, R.CODPRO_OP,
+                R.SITORP, R.DATA_JATO, R.QTD_APONTAMENTOS_JATO,
+                R.NIVEL, R.CAMINHO,
+                R.CODIGO_COMPONENTE, R.DERIVACAO_COMPONENTE,
+                R.QTD_NIVEL, R.QTD_ACUMULADA, R.UNIDADE,
+                R.DESCRICAO_COMPONENTE, R.TIPO_PRODUTO, R.ORIGEM_COMPONENTE,
+                R.PESO_UNITARIO, R.DEVE_EXPANDIR, R.CICLO_DETECTADO
+            FROM RaizComponentes R
+            UNION ALL
+            SELECT
+                B.CODEMP, B.CODORI, B.NUMORP, B.CODPRO_OP,
+                B.SITORP, B.DATA_JATO, B.QTD_APONTAMENTOS_JATO,
+                B.NIVEL + 1 AS NIVEL,
+                CAST(B.CAMINHO + '>' + CT.CODCMP AS VARCHAR(500)) AS CAMINHO,
+                CT.CODCMP AS CODIGO_COMPONENTE,
+                CT.DERCMP AS DERIVACAO_COMPONENTE,
+                CAST(CT.QTDUTI AS FLOAT) AS QTD_NIVEL,
+                CAST(B.QTD_ACUMULADA * CT.QTDUTI AS FLOAT) AS QTD_ACUMULADA,
+                CT.UNIME2 AS UNIDADE,
+                PRO.DESPRO AS DESCRICAO_COMPONENTE,
+                PRO.TIPPRO AS TIPO_PRODUTO,
+                PRO.CODORI AS ORIGEM_COMPONENTE,
+                CAST(COALESCE(DER.PESLIQ, PRO.PESLIQ, 0) AS FLOAT) AS PESO_UNITARIO,
+                CASE
+                    WHEN PRO.CODORI IN ({origens_sql})
+                     AND EXISTS (
+                            SELECT 1 FROM E700MOD M
+                            WHERE M.CODEMP = CT.CODEMP
+                              AND M.CODMOD = CT.CODCMP
+                        )
+                    THEN 1 ELSE 0
+                END AS DEVE_EXPANDIR,
+                CASE
+                    WHEN CHARINDEX('>' + CT.CODCMP + '>', '>' + B.CAMINHO + '>') > 0
+                    THEN 1 ELSE 0
+                END AS CICLO_DETECTADO
+            FROM BomRecursiva B
+            INNER JOIN E700CTM CT
+                    ON CT.CODEMP = B.CODEMP
+                   AND CT.CODMOD = B.CODIGO_COMPONENTE
+                   AND (
+                        B.DERIVACAO_COMPONENTE IS NULL
+                        OR B.DERIVACAO_COMPONENTE = ''
+                        OR CT.CODDER = B.DERIVACAO_COMPONENTE
+                   )
+            LEFT JOIN E075PRO PRO
+                   ON PRO.CODEMP = CT.CODEMP
+                  AND PRO.CODPRO = CT.CODCMP
+            LEFT JOIN E075DER DER
+                   ON DER.CODEMP = CT.CODEMP
+                  AND DER.CODPRO = CT.CODCMP
+                  AND DER.CODDER = CT.DERCMP
+            WHERE B.DEVE_EXPANDIR = 1
+              AND B.CICLO_DETECTADO = 0
+              AND B.NIVEL < {int(nivel_max)}
+        ),
+        Folhas AS (
+            SELECT
+                B.*,
+                CASE WHEN B.DEVE_EXPANDIR = 1 THEN 0 ELSE 1 END AS COMPONENTE_FINAL,
+                CASE
+                    WHEN B.DEVE_EXPANDIR = 1 THEN CAST(0 AS FLOAT)
+                    WHEN UPPER(LTRIM(RTRIM(COALESCE(B.UNIDADE, '')))) = 'KG'
+                        THEN COALESCE(B.QTD_ACUMULADA, 0)
+                    ELSE COALESCE(B.QTD_ACUMULADA, 0) * COALESCE(B.PESO_UNITARIO, 0)
+                END AS PESO_KG_CALCULADO
+            FROM BomRecursiva B
+        )
+    """
+    return cte, params
+
+
 @app.get("/api/auditoria-apontamento-genius/ops-jato-peso")
 def auditoria_genius_ops_jato_peso(
     codemp: int = EMPRESA_PADRAO,
@@ -29622,6 +29788,9 @@ def auditoria_genius_ops_jato_peso(
     situacao_op: Optional[str] = None,
     somente_com_peso: bool = False,
     somente_sem_peso: bool = False,
+    somente_peso_parcial: bool = False,
+    usar_multinivel: bool = False,
+    nivel_maximo: int = 10,
     pagina: int = 1,
     tamanho_pagina: int = 100,
     usuario=Depends(validar_token),
