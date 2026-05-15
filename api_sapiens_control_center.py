@@ -29601,6 +29601,339 @@ def senior_preview_clone_e098reg(
 # {id_regra: int} e falharia com 422).
 
 
+# ============================================================
+# AUDITORIA APONTAMENTO GENIUS — OPs Pintura/Jato com peso
+# ============================================================
+# Fase 1 (esta): peso calculado a partir de E900COP + E900EOQ + E900CMO + E075PRO
+# Fase 2 (futura): explosão multinível para componentes produzidos Genius
+# ============================================================
+
+GENIUS_OPR_JATO = (2160, 2161)  # 2160=JATEAR AUTO, 2161=JATEAR MANUAL
+
+
+@app.get("/api/auditoria-apontamento-genius/ops-jato-peso")
+def auditoria_genius_ops_jato_peso(
+    codemp: int = EMPRESA_PADRAO,
+    data_ini: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    origem: Optional[str] = None,
+    numero_op: Optional[int] = None,
+    codigo_produto: Optional[str] = None,
+    situacao_op: Optional[str] = None,
+    somente_com_peso: bool = False,
+    somente_sem_peso: bool = False,
+    pagina: int = 1,
+    tamanho_pagina: int = 100,
+    usuario=Depends(validar_token),
+):
+    """Lista OPs Genius que passaram pelo JATO/Pintura (CODOPR 2160/2161)
+    e calcula o peso em KG via componentes reais da OP (E900CMO + E075PRO).
+
+    Fase 1: peso baseado no nível imediato dos componentes em E900CMO.
+            Componentes que também são produzidos Genius mostram peso 0
+            quando seu PESLIQ não está cadastrado — a fase 2 explodirá
+            esses subconjuntos.
+
+    Status do peso:
+      - SEM_COMPONENTES_E900CMO: OP sem componentes mapeados
+      - PESO_ZERO: tem componentes, mas nenhum calculou peso
+      - PESO_PARCIAL: alguns componentes sem PESLIQ
+      - OK: todos os componentes calcularam peso"""
+    pagina = max(1, int(pagina or 1))
+    tamanho_pagina = max(1, min(int(tamanho_pagina or 100), 500))
+    offset = (pagina - 1) * tamanho_pagina
+
+    # WHERE dinâmico da CTE OpsJato (origens fixas + filtros opcionais)
+    origens_sql = ", ".join(f"'{o}'" for o in GENIUS_ORIGENS)
+    where_op: list = []
+    params_base: list = [codemp]
+
+    if data_ini:
+        where_op.append("EOQ.DATREA >= ?")
+        params_base.append(data_ini)
+    if data_fim:
+        where_op.append("EOQ.DATREA <= ?")
+        params_base.append(data_fim)
+    if origem:
+        where_op.append("COP.CODORI = ?")
+        params_base.append(str(origem).strip())
+    if numero_op:
+        where_op.append("COP.NUMORP = ?")
+        params_base.append(int(numero_op))
+    if codigo_produto:
+        where_op.append("COP.CODPRO LIKE ?")
+        params_base.append(f"%{codigo_produto.strip()}%")
+    if situacao_op:
+        where_op.append("COP.SITORP = ?")
+        params_base.append(situacao_op.strip().upper())
+
+    where_op_sql = (" AND " + " AND ".join(where_op)) if where_op else ""
+
+    # Filtros pós-agregação por peso
+    having_peso: list = []
+    if somente_com_peso:
+        having_peso.append("COALESCE(P.PESO_KG_COMPONENTES, 0) > 0")
+    if somente_sem_peso:
+        having_peso.append("COALESCE(P.PESO_KG_COMPONENTES, 0) = 0")
+    where_peso_sql = (" AND " + " AND ".join(having_peso)) if having_peso else ""
+
+    cte_sql = f"""
+        WITH OpsJato AS (
+            SELECT
+                COP.CODEMP,
+                COP.CODORI,
+                COP.NUMORP,
+                COP.CODPRO,
+                COP.SITORP,
+                MAX(EOQ.DATREA) AS DATA_JATO,
+                COUNT(*) AS QTD_APONTAMENTOS_JATO
+            FROM E900COP COP
+            INNER JOIN E900EOQ EOQ
+                    ON EOQ.CODEMP = COP.CODEMP
+                   AND EOQ.CODORI = COP.CODORI
+                   AND EOQ.NUMORP = COP.NUMORP
+            WHERE COP.CODEMP = ?
+              AND COP.CODORI IN ({origens_sql})
+              AND EOQ.CODOPR IN ({", ".join(str(c) for c in GENIUS_OPR_JATO)})
+              AND EOQ.DATREA > CONVERT(DATE, '19001231', 112)
+              {where_op_sql}
+            GROUP BY
+                COP.CODEMP, COP.CODORI, COP.NUMORP, COP.CODPRO, COP.SITORP
+        ),
+        ComponentesOP AS (
+            SELECT
+                OJ.CODEMP,
+                OJ.CODORI,
+                OJ.NUMORP,
+                OJ.CODPRO   AS CODPRO_OP,
+                OJ.SITORP,
+                OJ.DATA_JATO,
+                OJ.QTD_APONTAMENTOS_JATO,
+                CMO.CODCMP  AS COMPONENTE,
+                CMO.QTDPRV  AS QTD_PREVISTA,
+                CMO.UNIMED  AS UNIDADE,
+                PRO.DESPRO  AS DESCRICAO_COMPONENTE,
+                PRO.TIPPRO  AS TIPO_PRODUTO,
+                PRO.CODORI  AS ORIGEM_COMPONENTE,
+                COALESCE(PRO.PESLIQ, 0) AS PESO_UNITARIO
+            FROM OpsJato OJ
+            LEFT JOIN E900CMO CMO
+                   ON CMO.CODEMP = OJ.CODEMP
+                  AND CMO.CODORI = OJ.CODORI
+                  AND CMO.NUMORP = OJ.NUMORP
+            LEFT JOIN E075PRO PRO
+                   ON PRO.CODEMP = CMO.CODEMP
+                  AND PRO.CODPRO = CMO.CODCMP
+        ),
+        PesoOP AS (
+            SELECT
+                C.CODEMP,
+                C.CODORI,
+                C.NUMORP,
+                C.CODPRO_OP,
+                C.SITORP,
+                C.DATA_JATO,
+                C.QTD_APONTAMENTOS_JATO,
+                COUNT(C.COMPONENTE) AS QTD_COMPONENTES,
+                CAST(SUM(
+                    CASE
+                        WHEN UPPER(LTRIM(RTRIM(COALESCE(C.UNIDADE, '')))) = 'KG'
+                            THEN COALESCE(C.QTD_PREVISTA, 0)
+                        ELSE COALESCE(C.QTD_PREVISTA, 0) * COALESCE(C.PESO_UNITARIO, 0)
+                    END
+                ) AS FLOAT) AS PESO_KG_COMPONENTES,
+                SUM(CASE WHEN C.COMPONENTE IS NULL THEN 1 ELSE 0 END) AS SEM_COMPONENTE,
+                SUM(
+                    CASE
+                        WHEN (
+                            CASE
+                                WHEN UPPER(LTRIM(RTRIM(COALESCE(C.UNIDADE, '')))) = 'KG'
+                                    THEN COALESCE(C.QTD_PREVISTA, 0)
+                                ELSE COALESCE(C.QTD_PREVISTA, 0) * COALESCE(C.PESO_UNITARIO, 0)
+                            END
+                        ) = 0 AND C.COMPONENTE IS NOT NULL THEN 1
+                        ELSE 0
+                    END
+                ) AS QTD_COMPONENTES_SEM_PESO
+            FROM ComponentesOP C
+            -- Filtro: considera só componentes finais (comprados ou origem não-Genius)
+            WHERE (
+                C.TIPO_PRODUTO = 'C'
+                OR C.ORIGEM_COMPONENTE NOT IN ({origens_sql})
+                OR C.COMPONENTE IS NULL
+            )
+            GROUP BY
+                C.CODEMP, C.CODORI, C.NUMORP, C.CODPRO_OP, C.SITORP,
+                C.DATA_JATO, C.QTD_APONTAMENTOS_JATO
+        )
+    """
+
+    # SELECT base aplicado em duas formas: COUNT (para total) e SELECT detalhado paginado
+    select_dados = f"""
+        SELECT
+            P.CODORI                                  AS origem,
+            P.NUMORP                                  AS numero_op,
+            P.CODPRO_OP                               AS codigo_produto,
+            COALESCE(PRO.DESPRO, '')                  AS descricao_produto,
+            P.SITORP                                  AS situacao_op,
+            CONVERT(VARCHAR(10), P.DATA_JATO, 120)    AS data_jato,
+            P.QTD_APONTAMENTOS_JATO                   AS qtd_apontamentos_jato,
+            P.QTD_COMPONENTES                         AS qtd_componentes,
+            COALESCE(P.PESO_KG_COMPONENTES, 0)        AS peso_kg_componentes,
+            P.QTD_COMPONENTES_SEM_PESO                AS qtd_componentes_sem_peso,
+            CASE
+                WHEN P.QTD_COMPONENTES = 0 THEN 'SEM_COMPONENTES_E900CMO'
+                WHEN COALESCE(P.PESO_KG_COMPONENTES, 0) = 0 THEN 'PESO_ZERO'
+                WHEN P.QTD_COMPONENTES_SEM_PESO > 0 THEN 'PESO_PARCIAL'
+                ELSE 'OK'
+            END AS status_peso
+        FROM PesoOP P
+        LEFT JOIN E075PRO PRO
+               ON PRO.CODEMP = P.CODEMP
+              AND PRO.CODPRO = P.CODPRO_OP
+        WHERE 1=1 {where_peso_sql}
+    """
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+
+        # ---- COUNT ----
+        sql_total = cte_sql + f"""
+            SELECT COUNT(*)
+            FROM ({select_dados}) X
+        """
+        cursor.execute(sql_total, params_base)
+        total_registros = int(cursor.fetchone()[0] or 0)
+
+        # ---- RESUMO ----
+        sql_resumo = cte_sql + f"""
+            SELECT
+                COUNT(*) AS total_ops,
+                SUM(CASE WHEN qtd_componentes > 0 THEN 1 ELSE 0 END)  AS ops_com_componentes,
+                SUM(CASE WHEN qtd_componentes = 0 THEN 1 ELSE 0 END)  AS ops_sem_componentes,
+                CAST(SUM(COALESCE(peso_kg_componentes, 0)) AS FLOAT) AS peso_total_kg,
+                SUM(CASE WHEN COALESCE(peso_kg_componentes, 0) > 0 THEN 1 ELSE 0 END) AS ops_com_peso,
+                SUM(CASE WHEN COALESCE(peso_kg_componentes, 0) = 0 THEN 1 ELSE 0 END) AS ops_sem_peso,
+                SUM(CASE WHEN status_peso = 'PESO_PARCIAL' THEN 1 ELSE 0 END) AS ops_peso_parcial
+            FROM ({select_dados}) X
+        """
+        cursor.execute(sql_resumo, params_base)
+        row_r = cursor.fetchone()
+        resumo = {
+            "total_ops": int(row_r[0] or 0),
+            "ops_com_componentes": int(row_r[1] or 0),
+            "ops_sem_componentes": int(row_r[2] or 0),
+            "peso_total_kg": round(float(row_r[3] or 0), 3),
+            "ops_com_peso": int(row_r[4] or 0),
+            "ops_sem_peso": int(row_r[5] or 0),
+            "ops_peso_parcial": int(row_r[6] or 0),
+        }
+
+        # ---- DADOS PAGINADOS ----
+        sql_dados = cte_sql + f"""
+            {select_dados}
+            ORDER BY P.CODORI, P.NUMORP
+            OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+        """
+        cursor.execute(sql_dados, params_base + [offset, tamanho_pagina])
+        cols = [c[0] for c in cursor.description]
+        dados = []
+        for row in cursor.fetchall():
+            item = {}
+            for i, c in enumerate(cols):
+                v = row[i]
+                if isinstance(v, str):
+                    v = v.strip()
+                item[c] = v
+            # Arredonda o peso para apresentação
+            if item.get("peso_kg_componentes") is not None:
+                item["peso_kg_componentes"] = round(float(item["peso_kg_componentes"]), 3)
+            dados.append(item)
+
+        total_paginas = (total_registros + tamanho_pagina - 1) // tamanho_pagina if total_registros else 0
+
+        return {
+            "pagina": pagina,
+            "tamanho_pagina": tamanho_pagina,
+            "total_registros": total_registros,
+            "total_paginas": total_paginas,
+            "dados": dados,
+            "resumo": resumo,
+            "filtros_aplicados": {
+                "codemp": codemp,
+                "data_ini": data_ini,
+                "data_fim": data_fim,
+                "origem": origem,
+                "numero_op": numero_op,
+                "codigo_produto": codigo_produto,
+                "situacao_op": situacao_op,
+                "somente_com_peso": somente_com_peso,
+                "somente_sem_peso": somente_sem_peso,
+            },
+            "observacao": (
+                "Peso calculado pelos componentes em E900CMO × E075PRO.PESLIQ. "
+                "Não é peso de balança. Componentes que também são produzidos "
+                "Genius e estão sem PESLIQ cadastrado mostram peso 0 — fase 2 "
+                "explodirá esses subconjuntos multinível."
+            ),
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/export/auditoria-apontamento-genius/ops-jato-peso")
+def exportar_auditoria_genius_ops_jato_peso(
+    codemp: int = EMPRESA_PADRAO,
+    data_ini: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    origem: Optional[str] = None,
+    numero_op: Optional[int] = None,
+    codigo_produto: Optional[str] = None,
+    situacao_op: Optional[str] = None,
+    somente_com_peso: bool = False,
+    somente_sem_peso: bool = False,
+    usuario=Depends(validar_token_download),
+):
+    """Exporta para Excel todas as OPs (sem paginação) usando o mesmo
+    filtro do endpoint principal."""
+    dados = _collect_paginated_data(
+        auditoria_genius_ops_jato_peso,
+        usuario,
+        batch_size=500,
+        max_pages=5000,
+        codemp=codemp,
+        data_ini=data_ini,
+        data_fim=data_fim,
+        origem=origem,
+        numero_op=numero_op,
+        codigo_produto=codigo_produto,
+        situacao_op=situacao_op,
+        somente_com_peso=somente_com_peso,
+        somente_sem_peso=somente_sem_peso,
+    )
+    cabecalhos = {
+        "origem": "Origem",
+        "numero_op": "Número OP",
+        "codigo_produto": "Cód. Produto",
+        "descricao_produto": "Descrição Produto",
+        "situacao_op": "Sit. OP",
+        "data_jato": "Data JATO",
+        "qtd_apontamentos_jato": "Qtd. Apontamentos",
+        "qtd_componentes": "Qtd. Componentes",
+        "peso_kg_componentes": "Peso (KG)",
+        "qtd_componentes_sem_peso": "Componentes sem Peso",
+        "status_peso": "Status Peso",
+    }
+    return _xlsx_response(
+        "auditoria_genius_ops_jato_peso.xlsx",
+        [("OPs JATO/Pintura", dados, cabecalhos)],
+    )
+
+
 if __name__ == '__main__':
     import uvicorn
     uvicorn.run(app, host='0.0.0.0', port=8001)
