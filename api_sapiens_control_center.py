@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import pyodbc
 from jose import jwt
 from jose.exceptions import ExpiredSignatureError, JWTError
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional, Any, List, Dict
 from pydantic import BaseModel, Field, AliasChoices, ConfigDict
 from openpyxl import Workbook
@@ -29804,6 +29804,17 @@ def auditoria_genius_ops_jato_peso(
     tamanho_pagina = max(1, min(int(tamanho_pagina or 100), 500))
     offset = (pagina - 1) * tamanho_pagina
     nivel_maximo = max(1, min(int(nivel_maximo or 10), 20))
+
+    # Datas: pyodbc + SQL Server falham na conversão implícita nvarchar→datetime
+    # dependendo da configuração regional. Converte para `date` no Python.
+    def _parse_data(v):
+        if v is None or v == "":
+            return None
+        if isinstance(v, date):
+            return v
+        return datetime.strptime(str(v)[:10], "%Y-%m-%d").date()
+    data_ini = _parse_data(data_ini)
+    data_fim = _parse_data(data_fim)
 
     # ------------------------------------------------------------------
     # Fase 2 — multinivel via CTE recursiva (E700CTM)
