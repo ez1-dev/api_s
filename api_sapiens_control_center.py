@@ -9764,122 +9764,824 @@ def consultar_demonstrativo_compras_recebimentos(
     condicao_pagamento: Optional[str] = None,
     transacao: Optional[str] = None,
     descricao_item: Optional[str] = None,
+    deposito: Optional[str] = None,
+    familia: Optional[str] = None,
+    origem_material: Optional[str] = None,
+    numero_oc: Optional[str] = None,
+    numero_nf: Optional[str] = None,
+    documento: Optional[str] = None,
+    tipo_item: Optional[str] = None,
     data_ini: Optional[str] = None,
     data_fim: Optional[str] = None,
+    incluir_detalhe: bool = False,
+    limite_detalhe: int = 500,
     usuario=Depends(validar_token),
 ):
-    """Demonstrativo agregado de compras x recebimentos com drill-down.
+    """
+    Demonstrativo gerencial de Compras x Recebimentos.
 
-    ``nivel`` define a chave de agrupamento (ver DRILL_DEMONSTRATIVO).
-    ``origem``: TODOS | COMPRAS | RECEBIMENTOS (alias: NF).
-    Os demais parâmetros aplicam filtros que se acumulam ao drill."""
+    Retorna:
+    - KPIs gerais
+    - gráficos gerenciais
+    - drill-down por nível
+    - detalhe opcional
+
+    Níveis aceitos:
+    projeto_macro, numero_projeto, centro_custo, tipo_despesa,
+    mes_competencia, fornecedor, documento, item, transacao, deposito.
+    """
+
     origem = (origem or "TODOS").upper().strip()
     nivel = (nivel or "projeto_macro").strip()
-    if nivel not in DRILL_DEMONSTRATIVO:
+
+    drill_map = {
+        "projeto_macro": {
+            "campo": "projeto_macro",
+            "label": "projeto_macro",
+            "order": "ABS(SUM(valor_comprado) + SUM(valor_recebido)) DESC",
+        },
+        "numero_projeto": {
+            "campo": "CAST(numero_projeto AS VARCHAR(30))",
+            "label": "MAX(nome_projeto)",
+            "order": "ABS(SUM(valor_comprado) + SUM(valor_recebido)) DESC",
+        },
+        "centro_custo": {
+            "campo": "codigo_centro_custo",
+            "label": "MAX(descricao_centro_custo)",
+            "order": "ABS(SUM(valor_comprado) + SUM(valor_recebido)) DESC",
+        },
+        "tipo_despesa": {
+            "campo": "tipo_despesa",
+            "label": "tipo_despesa",
+            "order": "ABS(SUM(valor_comprado) + SUM(valor_recebido)) DESC",
+        },
+        "mes_competencia": {
+            "campo": "mes_competencia",
+            "label": "mes_competencia",
+            "order": "mes_competencia",
+        },
+        "fornecedor": {
+            "campo": "CAST(codigo_fornecedor AS VARCHAR(30))",
+            "label": "MAX(nome_fornecedor)",
+            "order": "ABS(SUM(valor_comprado) + SUM(valor_recebido)) DESC",
+        },
+        "documento": {
+            "campo": "documento",
+            "label": "documento",
+            "order": "documento",
+        },
+        "item": {
+            "campo": "codigo_item",
+            "label": "MAX(descricao_item)",
+            "order": "ABS(SUM(valor_comprado) + SUM(valor_recebido)) DESC",
+        },
+        "transacao": {
+            "campo": "transacao",
+            "label": "transacao",
+            "order": "ABS(SUM(valor_comprado) + SUM(valor_recebido)) DESC",
+        },
+        "deposito": {
+            "campo": "deposito",
+            "label": "deposito",
+            "order": "ABS(SUM(valor_comprado) + SUM(valor_recebido)) DESC",
+        },
+    }
+
+    if nivel not in drill_map:
         raise HTTPException(
             status_code=422,
-            detail=f"Nível inválido. Use um destes: {', '.join(DRILL_DEMONSTRATIVO)}",
+            detail=f"Nível inválido. Use: {', '.join(drill_map.keys())}",
         )
 
-    dados: list = []
+    if origem not in ("TODOS", "COMPRAS", "RECEBIMENTOS", "NF"):
+        raise HTTPException(
+            status_code=422,
+            detail="Origem inválida. Use TODOS, COMPRAS ou RECEBIMENTOS.",
+        )
 
-    if origem in ("TODOS", "COMPRAS"):
-        try:
-            compras = _collect_paginated_data(
-                consultar_painel_compras,
-                usuario,
-                numero_projeto=numero_projeto,
-                centro_custo=centro_custo,
-                fornecedor=fornecedor,
-                descricao_item=descricao_item,
-                transacao=transacao,
-                data_emissao_ini=data_ini,
-                data_emissao_fim=data_fim,
-                somente_pendentes=False,
-                agrupar_por_fornecedor=False,
-            )
-        except Exception as exc:
-            print(f"[demonstrativo] falha ao coletar compras: {exc}")
-            compras = []
-        for it in compras:
-            dados.append(_normalizar_linha_demonstrativo(it, "COMPRAS"))
+    limite_detalhe = max(1, min(int(limite_detalhe or 500), 5000))
 
-    if origem in ("TODOS", "RECEBIMENTOS", "NF"):
-        try:
-            recebimentos = _collect_paginated_data(
-                consultar_notas_recebimento,
-                usuario,
-                numero_projeto=numero_projeto,
-                centro_custo=centro_custo,
-                fornecedor=fornecedor,
-                descricao_item=descricao_item,
-                transacao=transacao,
-                data_recebimento_ini=data_ini,
-                data_recebimento_fim=data_fim,
-            )
-        except Exception as exc:
-            print(f"[demonstrativo] falha ao coletar recebimentos: {exc}")
-            recebimentos = []
-        for it in recebimentos:
-            dados.append(_normalizar_linha_demonstrativo(it, "RECEBIMENTOS"))
+    conn = get_connection()
+    cursor = conn.cursor()
 
-    # Filtros pós-coleta (campos derivados em Python)
-    if projeto_macro:
-        pm = projeto_macro.upper()
-        dados = [x for x in dados if str(x.get("projeto_macro") or "").upper() == pm]
-    if tipo_despesa:
-        td = tipo_despesa.upper()
-        dados = [x for x in dados if str(x.get("tipo_despesa") or "").upper() == td]
-    if mes_competencia:
-        dados = [x for x in dados if str(x.get("mes_competencia") or "") == mes_competencia]
-    if condicao_pagamento:
-        cond = condicao_pagamento.upper()
-        dados = [
-            x for x in dados
-            if cond in str(x.get("condicao_pagamento") or "").upper()
-            or cond in str(x.get("descricao_condicao_pagamento") or "").upper()
+    try:
+        # ============================================================
+        # 1) Monta base temporária consolidada
+        # ============================================================
+
+        sql_base = """
+        IF OBJECT_ID('tempdb..#BASE_DEM') IS NOT NULL
+            DROP TABLE #BASE_DEM;
+
+        ;WITH COMPRAS AS (
+
+            /* =========================
+               COMPRAS - PRODUTOS
+               ========================= */
+            SELECT
+                'COMPRAS' AS origem_dado,
+                O.CodEmp AS codigo_empresa,
+                O.CodFil AS codigo_filial,
+
+                CASE
+                    WHEN ISNULL(I.NumPrj, 0) >= 600 THEN 'ESTRUTURAL ZORTEA'
+                    WHEN ISNULL(P.CodOri, '') IN (
+                        '110','120','130','135','140','150',
+                        '205','208','210','220','230','235','240','245','250'
+                    ) THEN 'GENIUS'
+                    WHEN UPPER(ISNULL(PRJ.NomPrj, '')) LIKE '%GENI%' THEN 'GENIUS'
+                    WHEN UPPER(ISNULL(PRJ.NomPrj, '')) LIKE '%ESTRUT%' THEN 'ESTRUTURAL ZORTEA'
+                    WHEN UPPER(ISNULL(PRJ.NomPrj, '')) LIKE '%ZORTEA%' THEN 'ESTRUTURAL ZORTEA'
+                    ELSE 'OUTROS'
+                END AS projeto_macro,
+
+                CONVERT(CHAR(7), O.DatEmi, 120) AS mes_competencia,
+
+                O.CodFor AS codigo_fornecedor,
+                ISNULL(F.NomFor, '') AS nome_fornecedor,
+                ISNULL(F.ApeFor, '') AS fantasia_fornecedor,
+
+                ISNULL(I.NumPrj, 0) AS numero_projeto,
+                ISNULL(PRJ.NomPrj, '') AS nome_projeto,
+
+                ISNULL(I.CodCcu, '') AS codigo_centro_custo,
+                ISNULL(CC.DesCcu, '') AS descricao_centro_custo,
+
+                CASE
+                    WHEN UPPER(ISNULL(P.CodFam, ISNULL(I.CodFam, ''))) IN (
+                        'MP','MPM','MAT-PRI','MATPRIMA',
+                        'BR-CHA','BR-QUA','BR-RED','PER-U','PER-T','TUBO'
+                    )
+                    OR ISNULL(P.CodOri, '') IN ('MP','MPM','200')
+                        THEN 'MATERIA_PRIMA'
+
+                    WHEN UPPER(ISNULL(P.DesPro, '')) LIKE '%EPI%'
+                      OR UPPER(ISNULL(P.DesPro, '')) LIKE '%FERRAMENTA%'
+                      OR UPPER(ISNULL(P.DesPro, '')) LIKE '%BROCA%'
+                      OR UPPER(ISNULL(P.DesPro, '')) LIKE '%DISCO%'
+                      OR UPPER(ISNULL(P.DesPro, '')) LIKE '%LIXA%'
+                      OR UPPER(ISNULL(P.DesPro, '')) LIKE '%CONSUMO%'
+                      OR UPPER(ISNULL(P.DesPro, '')) LIKE '%MANUTENCAO%'
+                      OR UPPER(ISNULL(P.DesPro, '')) LIKE '%MANUTENÇÃO%'
+                      OR UPPER(ISNULL(P.DesPro, '')) LIKE '%INSUMO%'
+                        THEN 'USO_CONSUMO'
+
+                    ELSE 'DESPESAS_GERAIS'
+                END AS tipo_despesa,
+
+                CAST(O.NumOcp AS VARCHAR(30)) AS documento,
+                O.NumOcp AS numero_oc,
+                CAST(0 AS INT) AS numero_nf,
+                CAST('' AS VARCHAR(20)) AS serie_nf,
+
+                'PRODUTO' AS tipo_item,
+                I.SeqIpo AS sequencia_item,
+                ISNULL(I.CodPro, '') AS codigo_item,
+                ISNULL(P.DesPro, ISNULL(I.CplIpo, '')) AS descricao_item,
+                ISNULL(I.CodDer, '') AS derivacao,
+                ISNULL(I.UniMed, '') AS unidade_medida,
+                ISNULL(I.CodFam, ISNULL(P.CodFam, '')) AS codigo_familia,
+                ISNULL(P.CodOri, '') AS origem_material,
+                ISNULL(I.TnsPro, '') AS transacao,
+                ISNULL(I.CodDep, '') AS deposito,
+
+                O.DatEmi AS data_base,
+
+                CAST(ISNULL(I.QtdPed, 0) AS DECIMAL(18,5)) AS quantidade_pedida,
+                CAST(ISNULL(I.QtdRec, 0) AS DECIMAL(18,5)) AS quantidade_recebida,
+                CAST(ISNULL(I.QtdAbe, 0) AS DECIMAL(18,5)) AS quantidade_pendente,
+
+                CAST(ISNULL(I.VlrBru, 0) AS DECIMAL(18,2)) AS valor_bruto,
+                CAST(ISNULL(I.VlrLiq, 0) AS DECIMAL(18,2)) AS valor_comprado,
+                CAST(0 AS DECIMAL(18,2)) AS valor_recebido,
+                CAST(ISNULL(I.QtdAbe, 0) * ISNULL(I.PreUni, 0) AS DECIMAL(18,2)) AS valor_pendente
+
+            FROM E420OCP O
+            INNER JOIN E420IPO I
+                ON I.CodEmp = O.CodEmp
+               AND I.CodFil = O.CodFil
+               AND I.NumOcp = O.NumOcp
+            LEFT JOIN E095FOR F
+                ON F.CodFor = O.CodFor
+            LEFT JOIN E075PRO P
+                ON P.CodEmp = I.CodEmp
+               AND P.CodPro = I.CodPro
+            LEFT JOIN E044CCU CC
+                ON CC.CodEmp = I.CodEmp
+               AND CC.CodCcu = I.CodCcu
+            LEFT JOIN E615PRJ PRJ
+                ON PRJ.CodEmp = I.CodEmp
+               AND PRJ.NumPrj = I.NumPrj
+            WHERE O.CodEmp = ?
+              AND O.DatEmi >= ?
+              AND O.DatEmi <= ?
+
+            UNION ALL
+
+            /* =========================
+               COMPRAS - SERVIÇOS
+               ========================= */
+            SELECT
+                'COMPRAS' AS origem_dado,
+                O.CodEmp AS codigo_empresa,
+                O.CodFil AS codigo_filial,
+
+                CASE
+                    WHEN ISNULL(SI.NumPrj, 0) >= 600 THEN 'ESTRUTURAL ZORTEA'
+                    WHEN UPPER(ISNULL(PRJ.NomPrj, '')) LIKE '%GENI%' THEN 'GENIUS'
+                    WHEN UPPER(ISNULL(PRJ.NomPrj, '')) LIKE '%ESTRUT%' THEN 'ESTRUTURAL ZORTEA'
+                    WHEN UPPER(ISNULL(PRJ.NomPrj, '')) LIKE '%ZORTEA%' THEN 'ESTRUTURAL ZORTEA'
+                    ELSE 'OUTROS'
+                END AS projeto_macro,
+
+                CONVERT(CHAR(7), O.DatEmi, 120) AS mes_competencia,
+
+                O.CodFor AS codigo_fornecedor,
+                ISNULL(F.NomFor, '') AS nome_fornecedor,
+                ISNULL(F.ApeFor, '') AS fantasia_fornecedor,
+
+                ISNULL(SI.NumPrj, 0) AS numero_projeto,
+                ISNULL(PRJ.NomPrj, '') AS nome_projeto,
+
+                ISNULL(SI.CodCcu, '') AS codigo_centro_custo,
+                ISNULL(CC.DesCcu, '') AS descricao_centro_custo,
+
+                'SERVICOS' AS tipo_despesa,
+
+                CAST(O.NumOcp AS VARCHAR(30)) AS documento,
+                O.NumOcp AS numero_oc,
+                CAST(0 AS INT) AS numero_nf,
+                CAST('' AS VARCHAR(20)) AS serie_nf,
+
+                'SERVICO' AS tipo_item,
+                SI.SeqIso AS sequencia_item,
+                ISNULL(SI.CodSer, '') AS codigo_item,
+                ISNULL(S.DesSer, ISNULL(SI.CplIso, '')) AS descricao_item,
+                '' AS derivacao,
+                ISNULL(SI.UniMed, '') AS unidade_medida,
+                ISNULL(SI.CodFam, '') AS codigo_familia,
+                '' AS origem_material,
+                ISNULL(SI.TnsSer, '') AS transacao,
+                '' AS deposito,
+
+                O.DatEmi AS data_base,
+
+                CAST(ISNULL(SI.QtdPed, 0) AS DECIMAL(18,5)) AS quantidade_pedida,
+                CAST(ISNULL(SI.QtdRec, 0) AS DECIMAL(18,5)) AS quantidade_recebida,
+                CAST(ISNULL(SI.QtdAbe, 0) AS DECIMAL(18,5)) AS quantidade_pendente,
+
+                CAST(ISNULL(SI.VlrBru, 0) AS DECIMAL(18,2)) AS valor_bruto,
+                CAST(ISNULL(SI.VlrLiq, 0) AS DECIMAL(18,2)) AS valor_comprado,
+                CAST(0 AS DECIMAL(18,2)) AS valor_recebido,
+                CAST(ISNULL(SI.QtdAbe, 0) * ISNULL(SI.PreUni, 0) AS DECIMAL(18,2)) AS valor_pendente
+
+            FROM E420OCP O
+            INNER JOIN E420ISO SI
+                ON SI.CodEmp = O.CodEmp
+               AND SI.CodFil = O.CodFil
+               AND SI.NumOcp = O.NumOcp
+            LEFT JOIN E095FOR F
+                ON F.CodFor = O.CodFor
+            LEFT JOIN E080SER S
+                ON S.CodEmp = SI.CodEmp
+               AND S.CodSer = SI.CodSer
+            LEFT JOIN E044CCU CC
+                ON CC.CodEmp = SI.CodEmp
+               AND CC.CodCcu = SI.CodCcu
+            LEFT JOIN E615PRJ PRJ
+                ON PRJ.CodEmp = SI.CodEmp
+               AND PRJ.NumPrj = SI.NumPrj
+            WHERE O.CodEmp = ?
+              AND O.DatEmi >= ?
+              AND O.DatEmi <= ?
+        ),
+
+        RECEBIMENTOS AS (
+
+            /* =========================
+               RECEBIMENTOS - PRODUTOS
+               ========================= */
+            SELECT
+                'RECEBIMENTOS' AS origem_dado,
+                H.CodEmp AS codigo_empresa,
+                H.CodFil AS codigo_filial,
+
+                CASE
+                    WHEN ISNULL(I.NumPrj, 0) >= 600 THEN 'ESTRUTURAL ZORTEA'
+                    WHEN ISNULL(P.CodOri, '') IN (
+                        '110','120','130','135','140','150',
+                        '205','208','210','220','230','235','240','245','250'
+                    ) THEN 'GENIUS'
+                    WHEN UPPER(ISNULL(PRJ.NomPrj, '')) LIKE '%GENI%' THEN 'GENIUS'
+                    WHEN UPPER(ISNULL(PRJ.NomPrj, '')) LIKE '%ESTRUT%' THEN 'ESTRUTURAL ZORTEA'
+                    WHEN UPPER(ISNULL(PRJ.NomPrj, '')) LIKE '%ZORTEA%' THEN 'ESTRUTURAL ZORTEA'
+                    ELSE 'OUTROS'
+                END AS projeto_macro,
+
+                CONVERT(CHAR(7), H.DatEnt, 120) AS mes_competencia,
+
+                H.CodFor AS codigo_fornecedor,
+                ISNULL(F.NomFor, '') AS nome_fornecedor,
+                ISNULL(F.ApeFor, '') AS fantasia_fornecedor,
+
+                ISNULL(I.NumPrj, 0) AS numero_projeto,
+                ISNULL(PRJ.NomPrj, '') AS nome_projeto,
+
+                ISNULL(I.CodCcu, '') AS codigo_centro_custo,
+                ISNULL(CC.DesCcu, '') AS descricao_centro_custo,
+
+                CASE
+                    WHEN UPPER(ISNULL(P.CodFam, ISNULL(I.CodFam, ''))) IN (
+                        'MP','MPM','MAT-PRI','MATPRIMA',
+                        'BR-CHA','BR-QUA','BR-RED','PER-U','PER-T','TUBO'
+                    )
+                    OR ISNULL(P.CodOri, '') IN ('MP','MPM','200')
+                        THEN 'MATERIA_PRIMA'
+
+                    WHEN UPPER(ISNULL(P.DesPro, ISNULL(I.CplIpc, ''))) LIKE '%EPI%'
+                      OR UPPER(ISNULL(P.DesPro, ISNULL(I.CplIpc, ''))) LIKE '%FERRAMENTA%'
+                      OR UPPER(ISNULL(P.DesPro, ISNULL(I.CplIpc, ''))) LIKE '%BROCA%'
+                      OR UPPER(ISNULL(P.DesPro, ISNULL(I.CplIpc, ''))) LIKE '%DISCO%'
+                      OR UPPER(ISNULL(P.DesPro, ISNULL(I.CplIpc, ''))) LIKE '%LIXA%'
+                      OR UPPER(ISNULL(P.DesPro, ISNULL(I.CplIpc, ''))) LIKE '%CONSUMO%'
+                      OR UPPER(ISNULL(P.DesPro, ISNULL(I.CplIpc, ''))) LIKE '%MANUTENCAO%'
+                      OR UPPER(ISNULL(P.DesPro, ISNULL(I.CplIpc, ''))) LIKE '%MANUTENÇÃO%'
+                      OR UPPER(ISNULL(P.DesPro, ISNULL(I.CplIpc, ''))) LIKE '%INSUMO%'
+                        THEN 'USO_CONSUMO'
+
+                    ELSE 'DESPESAS_GERAIS'
+                END AS tipo_despesa,
+
+                CAST(H.NumNfc AS VARCHAR(30)) + '/' + ISNULL(H.CodSnf, '') AS documento,
+                ISNULL(I.NumOcp, 0) AS numero_oc,
+                H.NumNfc AS numero_nf,
+                H.CodSnf AS serie_nf,
+
+                'PRODUTO' AS tipo_item,
+                I.SeqIpc AS sequencia_item,
+                ISNULL(I.CodPro, '') AS codigo_item,
+                ISNULL(P.DesPro, ISNULL(I.CplIpc, '')) AS descricao_item,
+                ISNULL(I.CodDer, '') AS derivacao,
+                ISNULL(I.UniMed, '') AS unidade_medida,
+                ISNULL(I.CodFam, ISNULL(P.CodFam, '')) AS codigo_familia,
+                ISNULL(P.CodOri, '') AS origem_material,
+                ISNULL(I.TnsPro, '') AS transacao,
+                ISNULL(I.CodDep, '') AS deposito,
+
+                H.DatEnt AS data_base,
+
+                CAST(ISNULL(I.QtdRec, 0) AS DECIMAL(18,5)) AS quantidade_pedida,
+                CAST(ISNULL(I.QtdRec, 0) AS DECIMAL(18,5)) AS quantidade_recebida,
+                CAST(0 AS DECIMAL(18,5)) AS quantidade_pendente,
+
+                CAST(ISNULL(I.VlrBru, 0) AS DECIMAL(18,2)) AS valor_bruto,
+                CAST(0 AS DECIMAL(18,2)) AS valor_comprado,
+
+                CAST(
+                    ISNULL(I.VlrLiq, 0) *
+                    CASE
+                        WHEN ISNULL(H.SitNfc, 0) = 3 THEN 0
+                        WHEN LEFT(ISNULL(I.TnsPro, ''), 1) = '1' THEN 1
+                        WHEN LEFT(ISNULL(I.TnsPro, ''), 1) = '2' THEN -1
+                        WHEN LEFT(ISNULL(I.TnsPro, ''), 1) = '5' THEN -1
+                        ELSE 1
+                    END
+                AS DECIMAL(18,2)) AS valor_recebido,
+
+                CAST(0 AS DECIMAL(18,2)) AS valor_pendente
+
+            FROM E440NFC H
+            INNER JOIN E440IPC I
+                ON I.CodEmp = H.CodEmp
+               AND I.CodFil = H.CodFil
+               AND I.CodFor = H.CodFor
+               AND I.NumNfc = H.NumNfc
+               AND I.CodSnf = H.CodSnf
+            LEFT JOIN E095FOR F
+                ON F.CodFor = H.CodFor
+            LEFT JOIN E075PRO P
+                ON P.CodEmp = I.CodEmp
+               AND P.CodPro = I.CodPro
+            LEFT JOIN E044CCU CC
+                ON CC.CodEmp = I.CodEmp
+               AND CC.CodCcu = I.CodCcu
+            LEFT JOIN E615PRJ PRJ
+                ON PRJ.CodEmp = I.CodEmp
+               AND PRJ.NumPrj = I.NumPrj
+            WHERE H.CodEmp = ?
+              AND H.DatEnt >= ?
+              AND H.DatEnt <= ?
+
+            UNION ALL
+
+            /* =========================
+               RECEBIMENTOS - SERVIÇOS
+               ========================= */
+            SELECT
+                'RECEBIMENTOS' AS origem_dado,
+                H.CodEmp AS codigo_empresa,
+                H.CodFil AS codigo_filial,
+
+                CASE
+                    WHEN ISNULL(SI.NumPrj, 0) >= 600 THEN 'ESTRUTURAL ZORTEA'
+                    WHEN UPPER(ISNULL(PRJ.NomPrj, '')) LIKE '%GENI%' THEN 'GENIUS'
+                    WHEN UPPER(ISNULL(PRJ.NomPrj, '')) LIKE '%ESTRUT%' THEN 'ESTRUTURAL ZORTEA'
+                    WHEN UPPER(ISNULL(PRJ.NomPrj, '')) LIKE '%ZORTEA%' THEN 'ESTRUTURAL ZORTEA'
+                    ELSE 'OUTROS'
+                END AS projeto_macro,
+
+                CONVERT(CHAR(7), H.DatEnt, 120) AS mes_competencia,
+
+                H.CodFor AS codigo_fornecedor,
+                ISNULL(F.NomFor, '') AS nome_fornecedor,
+                ISNULL(F.ApeFor, '') AS fantasia_fornecedor,
+
+                ISNULL(SI.NumPrj, 0) AS numero_projeto,
+                ISNULL(PRJ.NomPrj, '') AS nome_projeto,
+
+                ISNULL(SI.CodCcu, '') AS codigo_centro_custo,
+                ISNULL(CC.DesCcu, '') AS descricao_centro_custo,
+
+                'SERVICOS' AS tipo_despesa,
+
+                CAST(H.NumNfc AS VARCHAR(30)) + '/' + ISNULL(H.CodSnf, '') AS documento,
+                ISNULL(SI.NumOcp, 0) AS numero_oc,
+                H.NumNfc AS numero_nf,
+                H.CodSnf AS serie_nf,
+
+                'SERVICO' AS tipo_item,
+                SI.SeqIsc AS sequencia_item,
+                ISNULL(SI.CodSer, '') AS codigo_item,
+                ISNULL(S.DesSer, ISNULL(SI.CplIsc, '')) AS descricao_item,
+                '' AS derivacao,
+                ISNULL(SI.UniMed, '') AS unidade_medida,
+                ISNULL(SI.CodFam, '') AS codigo_familia,
+                '' AS origem_material,
+                ISNULL(SI.TnsSer, '') AS transacao,
+                '' AS deposito,
+
+                H.DatEnt AS data_base,
+
+                CAST(ISNULL(SI.QtdRec, 0) AS DECIMAL(18,5)) AS quantidade_pedida,
+                CAST(ISNULL(SI.QtdRec, 0) AS DECIMAL(18,5)) AS quantidade_recebida,
+                CAST(0 AS DECIMAL(18,5)) AS quantidade_pendente,
+
+                CAST(ISNULL(SI.VlrBru, 0) AS DECIMAL(18,2)) AS valor_bruto,
+                CAST(0 AS DECIMAL(18,2)) AS valor_comprado,
+
+                CAST(
+                    ISNULL(SI.VlrLiq, 0) *
+                    CASE
+                        WHEN ISNULL(H.SitNfc, 0) = 3 THEN 0
+                        WHEN LEFT(ISNULL(SI.TnsSer, ''), 1) = '1' THEN 1
+                        WHEN LEFT(ISNULL(SI.TnsSer, ''), 1) = '2' THEN -1
+                        WHEN LEFT(ISNULL(SI.TnsSer, ''), 1) = '5' THEN -1
+                        ELSE 1
+                    END
+                AS DECIMAL(18,2)) AS valor_recebido,
+
+                CAST(0 AS DECIMAL(18,2)) AS valor_pendente
+
+            FROM E440NFC H
+            INNER JOIN E440ISC SI
+                ON SI.CodEmp = H.CodEmp
+               AND SI.CodFil = H.CodFil
+               AND SI.CodFor = H.CodFor
+               AND SI.NumNfc = H.NumNfc
+               AND SI.CodSnf = H.CodSnf
+            LEFT JOIN E095FOR F
+                ON F.CodFor = H.CodFor
+            LEFT JOIN E080SER S
+                ON S.CodEmp = SI.CodEmp
+               AND S.CodSer = SI.CodSer
+            LEFT JOIN E044CCU CC
+                ON CC.CodEmp = SI.CodEmp
+               AND CC.CodCcu = SI.CodCcu
+            LEFT JOIN E615PRJ PRJ
+                ON PRJ.CodEmp = SI.CodEmp
+               AND PRJ.NumPrj = SI.NumPrj
+            WHERE H.CodEmp = ?
+              AND H.DatEnt >= ?
+              AND H.DatEnt <= ?
+        )
+
+        SELECT *
+        INTO #BASE_DEM
+        FROM (
+            SELECT * FROM COMPRAS
+            UNION ALL
+            SELECT * FROM RECEBIMENTOS
+        ) X;
+        """
+
+        data_ini_sql = data_ini or "2026-01-01"
+        data_fim_sql = data_fim or datetime.now().strftime("%Y-%m-%d")
+
+        params_base = [
+            EMPRESA_PADRAO, data_ini_sql, data_fim_sql,
+            EMPRESA_PADRAO, data_ini_sql, data_fim_sql,
+            EMPRESA_PADRAO, data_ini_sql, data_fim_sql,
+            EMPRESA_PADRAO, data_ini_sql, data_fim_sql,
         ]
 
-    total_comprado = sum(_valor_num_demo(x.get("valor_comprado")) for x in dados)
-    total_recebido = sum(_valor_num_demo(x.get("valor_recebido")) for x in dados)
-    total_pendente = sum(_valor_num_demo(x.get("valor_pendente")) for x in dados)
+        cursor.execute(sql_base, params_base)
 
-    documentos = {
-        f"{x.get('origem_dado')}|{x.get('documento')}"
-        for x in dados if x.get("documento")
-    }
-    fornecedores = {
-        str(x.get("codigo_fornecedor"))
-        for x in dados if x.get("codigo_fornecedor")
-    }
+        # ============================================================
+        # 2) Aplica filtros sobre #BASE_DEM
+        # ============================================================
 
-    idx_nivel = DRILL_DEMONSTRATIVO.index(nivel)
-    proximo_nivel = (
-        DRILL_DEMONSTRATIVO[idx_nivel + 1]
-        if idx_nivel + 1 < len(DRILL_DEMONSTRATIVO) else None
-    )
+        filtros_delete = []
+        params_filtros = []
 
-    return {
-        "nivel": nivel,
-        "proximo_nivel": proximo_nivel,
-        "kpis": {
-            "valor_comprado": round(total_comprado, 2),
-            "valor_recebido": round(total_recebido, 2),
-            "valor_pendente": round(total_pendente, 2),
-            "diferenca_comprado_recebido": round(total_comprado - total_recebido, 2),
-            "qtd_linhas": len(dados),
-            "qtd_documentos": len(documentos),
-            "qtd_fornecedores": len(fornecedores),
-        },
-        "drill": _agrupar_demonstrativo(dados, nivel),
-        "detalhe": dados[:500],
-        "observacao": (
-            "O campo `detalhe` retorna até 500 linhas para navegação rápida. "
-            "Para exportação completa, usar /api/export/painel-compras e "
-            "/api/export/notas-recebimento. Campo `condicao_pagamento` ainda "
-            "vazio — pendente de SQL JOIN com E028CPG nos endpoints base."
-        ),
-    }
+        if origem == "COMPRAS":
+            filtros_delete.append("origem_dado <> ?")
+            params_filtros.append("COMPRAS")
+        elif origem in ("RECEBIMENTOS", "NF"):
+            filtros_delete.append("origem_dado <> ?")
+            params_filtros.append("RECEBIMENTOS")
+
+        def add_like(campo, valor):
+            if valor is not None and str(valor).strip() != "":
+                filtros_delete.append(f"UPPER(CAST({campo} AS VARCHAR(500))) NOT LIKE UPPER(?)")
+                params_filtros.append(f"%{str(valor).strip()}%")
+
+        def add_equal(campo, valor):
+            if valor is not None and str(valor).strip() != "":
+                filtros_delete.append(f"CAST({campo} AS VARCHAR(500)) <> ?")
+                params_filtros.append(str(valor).strip())
+
+        add_equal("projeto_macro", projeto_macro)
+        add_equal("numero_projeto", numero_projeto)
+        add_equal("codigo_centro_custo", centro_custo)
+        add_equal("tipo_despesa", normalizar_tipo_despesa(tipo_despesa) if tipo_despesa else None)
+        add_equal("mes_competencia", mes_competencia)
+        add_equal("codigo_fornecedor", fornecedor)
+        add_equal("transacao", transacao)
+        add_equal("deposito", deposito)
+        add_equal("codigo_familia", familia)
+        add_equal("origem_material", origem_material)
+        add_equal("numero_oc", numero_oc)
+        add_equal("numero_nf", numero_nf)
+        add_equal("tipo_item", tipo_item)
+
+        add_like("descricao_item", descricao_item)
+        add_like("documento", documento)
+
+        if filtros_delete:
+            sql_delete = "DELETE FROM #BASE_DEM WHERE " + " OR ".join(filtros_delete)
+            cursor.execute(sql_delete, params_filtros)
+
+        # ============================================================
+        # 3) Helpers locais
+        # ============================================================
+
+        def fetch_one_dict(sql, params=None):
+            cursor.execute(sql, params or [])
+            row = cursor.fetchone()
+            if not row:
+                return {}
+            cols = [c[0] for c in cursor.description]
+            return {cols[i]: row[i] for i in range(len(cols))}
+
+        def fetch_all_dict(sql, params=None):
+            cursor.execute(sql, params or [])
+            cols = [c[0] for c in cursor.description]
+            return [
+                {cols[i]: row[i] for i in range(len(cols))}
+                for row in cursor.fetchall()
+            ]
+
+        def to_float(v):
+            try:
+                return round(float(v or 0), 2)
+            except Exception:
+                return 0.0
+
+        def to_int(v):
+            try:
+                return int(v or 0)
+            except Exception:
+                return 0
+
+        def normalizar_lista_valores(rows):
+            saida = []
+            for r in rows:
+                saida.append({
+                    "chave": str(r.get("chave") or ""),
+                    "label": str(r.get("label") or r.get("chave") or ""),
+                    "valor_comprado": to_float(r.get("valor_comprado")),
+                    "valor_recebido": to_float(r.get("valor_recebido")),
+                    "valor_pendente": to_float(r.get("valor_pendente")),
+                    "diferenca_comprado_recebido": to_float(r.get("diferenca_comprado_recebido")),
+                    "qtd_linhas": to_int(r.get("qtd_linhas")),
+                    "qtd_fornecedores": to_int(r.get("qtd_fornecedores")),
+                    "qtd_documentos": to_int(r.get("qtd_documentos")),
+                })
+            return saida
+
+        # ============================================================
+        # 4) KPIs
+        # ============================================================
+
+        kpis_raw = fetch_one_dict("""
+            SELECT
+                SUM(valor_comprado) AS valor_comprado,
+                SUM(valor_recebido) AS valor_recebido,
+                SUM(valor_pendente) AS valor_pendente,
+                SUM(valor_comprado) - SUM(valor_recebido) AS diferenca_comprado_recebido,
+                COUNT(*) AS qtd_linhas,
+                COUNT(DISTINCT codigo_fornecedor) AS qtd_fornecedores,
+                COUNT(DISTINCT origem_dado + '|' + documento) AS qtd_documentos
+            FROM #BASE_DEM
+        """)
+
+        kpis = {
+            "valor_comprado": to_float(kpis_raw.get("valor_comprado")),
+            "valor_recebido": to_float(kpis_raw.get("valor_recebido")),
+            "valor_pendente": to_float(kpis_raw.get("valor_pendente")),
+            "diferenca_comprado_recebido": to_float(kpis_raw.get("diferenca_comprado_recebido")),
+            "qtd_linhas": to_int(kpis_raw.get("qtd_linhas")),
+            "qtd_fornecedores": to_int(kpis_raw.get("qtd_fornecedores")),
+            "qtd_documentos": to_int(kpis_raw.get("qtd_documentos")),
+        }
+
+        # ============================================================
+        # 5) Gráficos
+        # ============================================================
+
+        def grafico_por(campo, label_expr=None, top=15, order_expr=None):
+            label_expr = label_expr or campo
+            order_expr = order_expr or "ABS(SUM(valor_comprado) + SUM(valor_recebido)) DESC"
+
+            sql = f"""
+                SELECT TOP {int(top)}
+                    CAST({campo} AS VARCHAR(100)) AS chave,
+                    CAST({label_expr} AS VARCHAR(300)) AS label,
+                    SUM(valor_comprado) AS valor_comprado,
+                    SUM(valor_recebido) AS valor_recebido,
+                    SUM(valor_pendente) AS valor_pendente,
+                    SUM(valor_comprado) - SUM(valor_recebido) AS diferenca_comprado_recebido,
+                    COUNT(*) AS qtd_linhas,
+                    COUNT(DISTINCT codigo_fornecedor) AS qtd_fornecedores,
+                    COUNT(DISTINCT origem_dado + '|' + documento) AS qtd_documentos
+                FROM #BASE_DEM
+                GROUP BY {campo}
+                ORDER BY {order_expr}
+            """
+            return normalizar_lista_valores(fetch_all_dict(sql))
+
+        graficos = {
+            "comprado_recebido_pendente": [
+                {"chave": "comprado", "label": "Comprado", "valor": kpis["valor_comprado"]},
+                {"chave": "recebido", "label": "Recebido", "valor": kpis["valor_recebido"]},
+                {"chave": "pendente", "label": "Pendente", "valor": kpis["valor_pendente"]},
+                {
+                    "chave": "diferenca",
+                    "label": "Diferença Comprado x Recebido",
+                    "valor": kpis["diferenca_comprado_recebido"],
+                },
+            ],
+            "por_projeto_macro": grafico_por("projeto_macro", "projeto_macro", top=10),
+            "por_mes": grafico_por("mes_competencia", "mes_competencia", top=24, order_expr="mes_competencia"),
+            "por_centro_custo": grafico_por(
+                "codigo_centro_custo",
+                "MAX(descricao_centro_custo)",
+                top=20,
+            ),
+            "por_projeto": grafico_por(
+                "CAST(numero_projeto AS VARCHAR(30))",
+                "MAX(nome_projeto)",
+                top=20,
+            ),
+            "por_tipo_despesa": grafico_por("tipo_despesa", "tipo_despesa", top=10),
+            "por_fornecedor": grafico_por(
+                "CAST(codigo_fornecedor AS VARCHAR(30))",
+                "MAX(nome_fornecedor)",
+                top=20,
+            ),
+            "por_transacao": grafico_por("transacao", "transacao", top=20),
+        }
+
+        # ============================================================
+        # 6) Drill dinâmico
+        # ============================================================
+
+        cfg = drill_map[nivel]
+        sql_drill = f"""
+            SELECT
+                CAST({cfg["campo"]} AS VARCHAR(100)) AS chave,
+                CAST({cfg["label"]} AS VARCHAR(300)) AS label,
+                SUM(valor_comprado) AS valor_comprado,
+                SUM(valor_recebido) AS valor_recebido,
+                SUM(valor_pendente) AS valor_pendente,
+                SUM(valor_comprado) - SUM(valor_recebido) AS diferenca_comprado_recebido,
+                COUNT(*) AS qtd_linhas,
+                COUNT(DISTINCT codigo_fornecedor) AS qtd_fornecedores,
+                COUNT(DISTINCT origem_dado + '|' + documento) AS qtd_documentos
+            FROM #BASE_DEM
+            GROUP BY {cfg["campo"]}
+            ORDER BY {cfg["order"]}
+        """
+        drill = normalizar_lista_valores(fetch_all_dict(sql_drill))
+
+        detalhe = []
+        if incluir_detalhe:
+            detalhe = fetch_all_dict(f"""
+                SELECT TOP {limite_detalhe}
+                    origem_dado,
+                    projeto_macro,
+                    mes_competencia,
+                    numero_projeto,
+                    nome_projeto,
+                    codigo_centro_custo,
+                    descricao_centro_custo,
+                    tipo_despesa,
+                    codigo_fornecedor,
+                    nome_fornecedor,
+                    documento,
+                    numero_oc,
+                    numero_nf,
+                    serie_nf,
+                    tipo_item,
+                    sequencia_item,
+                    codigo_item,
+                    descricao_item,
+                    derivacao,
+                    unidade_medida,
+                    codigo_familia,
+                    origem_material,
+                    transacao,
+                    deposito,
+                    quantidade_pedida,
+                    quantidade_recebida,
+                    quantidade_pendente,
+                    valor_bruto,
+                    valor_comprado,
+                    valor_recebido,
+                    valor_pendente,
+                    valor_comprado - valor_recebido AS diferenca_comprado_recebido
+                FROM #BASE_DEM
+                ORDER BY
+                    projeto_macro,
+                    numero_projeto,
+                    codigo_centro_custo,
+                    tipo_despesa,
+                    mes_competencia,
+                    codigo_fornecedor,
+                    origem_dado,
+                    documento,
+                    sequencia_item
+            """)
+
+        return {
+            "atualizado_em": datetime.now().isoformat(),
+            "kpis": kpis,
+            "kpis_dashboard": kpis,
+            "graficos": graficos,
+            "drill": drill,
+            "nivel": nivel,
+            "detalhe": detalhe,
+            "filtros_aplicados": {
+                "origem": origem,
+                "projeto_macro": projeto_macro,
+                "numero_projeto": numero_projeto,
+                "centro_custo": centro_custo,
+                "tipo_despesa": tipo_despesa,
+                "mes_competencia": mes_competencia,
+                "fornecedor": fornecedor,
+                "condicao_pagamento": condicao_pagamento,
+                "transacao": transacao,
+                "descricao_item": descricao_item,
+                "deposito": deposito,
+                "familia": familia,
+                "origem_material": origem_material,
+                "numero_oc": numero_oc,
+                "numero_nf": numero_nf,
+                "documento": documento,
+                "tipo_item": tipo_item,
+                "data_ini": data_ini_sql,
+                "data_fim": data_fim_sql,
+                "incluir_detalhe": incluir_detalhe,
+            },
+            "observacao": (
+                "Demonstrativo calculado diretamente no SQL Server com a mesma base "
+                "validada nos selects. O campo valor_recebido considera o sinal da "
+                "transação: 1xxx positivo, 2xxx/5xxx negativo e NF cancelada zerada."
+            ),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao gerar Demonstrativo de Compras e Recebimentos: {str(exc)}",
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 @app.get('/api/auditoria-tributaria')
