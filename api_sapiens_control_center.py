@@ -9940,8 +9940,17 @@ def consultar_demonstrativo_compras_recebimentos(
         # ============================================================
         # 1) Monta base temporária consolidada
         # ============================================================
+        # IMPORTANTE: o cursor.execute deste bloco precisa rodar SEM
+        # parametros (?). pyodbc + ODBC Driver 17 envelopam queries
+        # parametrizadas em sp_executesql, e qualquer #temp criada
+        # dentro desse escopo eh descartada quando o sp_executesql
+        # retorna — fazendo com que os DELETE/SELECT seguintes nao
+        # encontrem #BASE_DEM. Por isso EMPRESA_PADRAO e as datas
+        # (ja validadas) sao inlinadas como literais no SQL.
 
         sql_base = """
+        SET NOCOUNT ON;
+
         IF OBJECT_ID('tempdb..#BASE_DEM') IS NOT NULL
             DROP TABLE #BASE_DEM;
 
@@ -10044,9 +10053,9 @@ def consultar_demonstrativo_compras_recebimentos(
             LEFT JOIN E615PRJ PRJ
                 ON PRJ.CodEmp = I.CodEmp
                AND PRJ.NumPrj = I.NumPrj
-            WHERE O.CodEmp = ?
-              AND CAST(O.DatEmi AS DATE) >= CAST(? AS DATE)
-              AND CAST(O.DatEmi AS DATE) <= CAST(? AS DATE)
+            WHERE O.CodEmp = {empresa}
+              AND CAST(O.DatEmi AS DATE) >= CAST('{data_ini}' AS DATE)
+              AND CAST(O.DatEmi AS DATE) <= CAST('{data_fim}' AS DATE)
 
             UNION ALL
 
@@ -10123,9 +10132,9 @@ def consultar_demonstrativo_compras_recebimentos(
             LEFT JOIN E615PRJ PRJ
                 ON PRJ.CodEmp = SI.CodEmp
                AND PRJ.NumPrj = SI.NumPrj
-            WHERE O.CodEmp = ?
-              AND CAST(O.DatEmi AS DATE) >= CAST(? AS DATE)
-              AND CAST(O.DatEmi AS DATE) <= CAST(? AS DATE)
+            WHERE O.CodEmp = {empresa}
+              AND CAST(O.DatEmi AS DATE) >= CAST('{data_ini}' AS DATE)
+              AND CAST(O.DatEmi AS DATE) <= CAST('{data_fim}' AS DATE)
         ),
 
         RECEBIMENTOS AS (
@@ -10240,9 +10249,9 @@ def consultar_demonstrativo_compras_recebimentos(
             LEFT JOIN E615PRJ PRJ
                 ON PRJ.CodEmp = I.CodEmp
                AND PRJ.NumPrj = I.NumPrj
-            WHERE H.CodEmp = ?
-              AND CAST(H.DatEnt AS DATE) >= CAST(? AS DATE)
-              AND CAST(H.DatEnt AS DATE) <= CAST(? AS DATE)
+            WHERE H.CodEmp = {empresa}
+              AND CAST(H.DatEnt AS DATE) >= CAST('{data_ini}' AS DATE)
+              AND CAST(H.DatEnt AS DATE) <= CAST('{data_fim}' AS DATE)
 
             UNION ALL
 
@@ -10332,9 +10341,9 @@ def consultar_demonstrativo_compras_recebimentos(
             LEFT JOIN E615PRJ PRJ
                 ON PRJ.CodEmp = SI.CodEmp
                AND PRJ.NumPrj = SI.NumPrj
-            WHERE H.CodEmp = ?
-              AND CAST(H.DatEnt AS DATE) >= CAST(? AS DATE)
-              AND CAST(H.DatEnt AS DATE) <= CAST(? AS DATE)
+            WHERE H.CodEmp = {empresa}
+              AND CAST(H.DatEnt AS DATE) >= CAST('{data_ini}' AS DATE)
+              AND CAST(H.DatEnt AS DATE) <= CAST('{data_fim}' AS DATE)
         )
 
         SELECT *
@@ -10362,14 +10371,17 @@ def consultar_demonstrativo_compras_recebimentos(
                 ),
             )
 
-        params_base = [
-            EMPRESA_PADRAO, data_ini_sql, data_fim_sql,
-            EMPRESA_PADRAO, data_ini_sql, data_fim_sql,
-            EMPRESA_PADRAO, data_ini_sql, data_fim_sql,
-            EMPRESA_PADRAO, data_ini_sql, data_fim_sql,
-        ]
-
-        cursor.execute(sql_base, params_base)
+        # Substitui os placeholders {empresa}/{data_ini}/{data_fim} no SQL.
+        # Valores ja foram validados (EMPRESA_PADRAO eh int constante; datas
+        # passaram por _parse_data_demonstrativo -> YYYY-MM-DD). Execucao
+        # SEM parametros para evitar sp_executesql e manter #BASE_DEM viva
+        # na sessao.
+        sql_base_render = sql_base.format(
+            empresa=int(EMPRESA_PADRAO),
+            data_ini=data_ini_sql,
+            data_fim=data_fim_sql,
+        )
+        cursor.execute(sql_base_render)
 
         # ============================================================
         # 2) Aplica filtros sobre #BASE_DEM
