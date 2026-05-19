@@ -61,6 +61,16 @@ OBJ_VM_CONCILIACAO_IMPOSTOS = None   # Defina se existir no ERP
 OBJ_V_FATURAMENTO_META    = None     # Defina se existir
 PROC_ATU_COMERCIAL        = None     # Defina se existir (ex: dbo.ATU_COMERCIAL)
 
+# =========================================
+# CONFIGURAÇÕES CONTABILIDADE
+# View base do Balanço Patrimonial. Confirme as colunas reais com
+#   SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+#   WHERE TABLE_NAME = 'V_BALANCO_PATRIMONIAL'
+# (ou use o endpoint /api/contabilidade/balanco/colunas).
+# =========================================
+SCHEMA_CONTABILIDADE = "dbo"
+OBJ_V_BALANCO_PATRIMONIAL = f"{SCHEMA_CONTABILIDADE}.V_BALANCO_PATRIMONIAL"
+
 USERS = {
     "ADMIN": "123",
     "RENATO": "123",
@@ -4302,6 +4312,242 @@ def consultar_notas_edocs_conciliacao(
         'dados': dados,
         'observacao': 'A conciliação compara a situação do ERP com a situação do EDocs, usando normalização de status para identificar casos como ERP cancelada x EDocs autorizada, ERP autorizada x EDocs cancelada e demais incompatibilidades operacionais.'
     }
+
+
+# ---------------------------------------------------------------------------
+# Cadastros auxiliares (autocomplete / combobox dos filtros)
+# ---------------------------------------------------------------------------
+@app.get('/api/cadastros/fornecedores')
+def listar_fornecedores(
+    q: Optional[str] = None,
+    limite: int = 50,
+    usuario=Depends(validar_token)
+):
+    """Autocomplete de fornecedores a partir de E095FOR. Filtra ativos quando
+    SITFOR existir; busca por código, nome ou apelido (fantasia)."""
+    limite = max(1, min(limite or 50, 200))
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        params: list = []
+        where = "WHERE COALESCE(F.SITFOR, 'A') = 'A'"
+
+        if q:
+            termo = f"%{q.strip()}%"
+            where += """
+                AND (
+                    CAST(F.CODFOR AS VARCHAR(20)) LIKE ?
+                    OR F.NOMFOR LIKE ?
+                    OR F.APEFOR LIKE ?
+                )
+            """
+            params.extend([termo, termo, termo])
+
+        sql = f"""
+            SELECT TOP {limite}
+                F.CODFOR,
+                F.NOMFOR,
+                F.APEFOR
+            FROM E095FOR F
+            {where}
+            ORDER BY F.NOMFOR
+        """
+
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao listar fornecedores: {str(e)}")
+    finally:
+        conn.close()
+
+    resultado = []
+    for row in rows:
+        try:
+            codigo_int = int(row[0])
+        except Exception:
+            codigo_int = None
+        nome = (row[1] or '').strip()
+        fantasia = (row[2] or '').strip()
+        resultado.append({
+            'codigo': codigo_int if codigo_int is not None else str(row[0]).strip(),
+            'descricao': nome,
+            'fantasia': fantasia,
+            'value': str(row[0]).strip(),
+            'label': f"{row[0]} - {nome}" if nome else str(row[0]).strip(),
+        })
+    return resultado
+
+
+@app.get('/api/cadastros/centros-custo')
+def listar_centros_custo(
+    q: Optional[str] = None,
+    limite: int = 100,
+    usuario=Depends(validar_token)
+):
+    """Autocomplete de centros de custo a partir de E044CCU."""
+    limite = max(1, min(limite or 100, 300))
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        params: list = [EMPRESA_PADRAO]
+        where = "WHERE C.CODEMP = ? AND COALESCE(C.ACERAT, 'S') = 'S'"
+
+        if q:
+            termo = f"%{q.strip()}%"
+            where += " AND (C.CODCCU LIKE ? OR C.DESCCU LIKE ?)"
+            params.extend([termo, termo])
+
+        sql = f"""
+            SELECT TOP {limite}
+                C.CODCCU,
+                C.DESCCU
+            FROM E044CCU C
+            {where}
+            ORDER BY C.CODCCU
+        """
+
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao listar centros de custo: {str(e)}")
+    finally:
+        conn.close()
+
+    resultado = []
+    for row in rows:
+        codigo = (row[0] or '').strip() if isinstance(row[0], str) else str(row[0]).strip()
+        descricao = (row[1] or '').strip()
+        resultado.append({
+            'codigo': codigo,
+            'descricao': descricao,
+            'value': codigo,
+            'label': f"{codigo} - {descricao}" if descricao else codigo,
+        })
+    return resultado
+
+
+@app.get('/api/cadastros/depositos')
+def listar_depositos(
+    q: Optional[str] = None,
+    limite: int = 100,
+    usuario=Depends(validar_token)
+):
+    """Autocomplete de depósitos a partir de E205DEP."""
+    limite = max(1, min(limite or 100, 300))
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        params: list = [EMPRESA_PADRAO]
+        where = "WHERE D.CODEMP = ?"
+
+        if q:
+            termo = f"%{q.strip()}%"
+            where += " AND (D.CODDEP LIKE ? OR D.DESDEP LIKE ?)"
+            params.extend([termo, termo])
+
+        sql = f"""
+            SELECT TOP {limite}
+                D.CODDEP,
+                D.DESDEP
+            FROM E205DEP D
+            {where}
+            ORDER BY D.CODDEP
+        """
+
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao listar depósitos: {str(e)}")
+    finally:
+        conn.close()
+
+    resultado = []
+    for row in rows:
+        codigo = (row[0] or '').strip() if isinstance(row[0], str) else str(row[0]).strip()
+        descricao = (row[1] or '').strip()
+        resultado.append({
+            'codigo': codigo,
+            'descricao': descricao,
+            'value': codigo,
+            'label': f"{codigo} - {descricao}" if descricao else codigo,
+        })
+    return resultado
+
+
+@app.get('/api/cadastros/transacoes-compras')
+def listar_transacoes_compras(
+    q: Optional[str] = None,
+    limite: int = 100,
+    usuario=Depends(validar_token)
+):
+    """Autocomplete de transações da E001TNS, restrito a transações já
+    utilizadas em itens de OC (E420IPO.TNSPRO) ou em serviços de OC
+    (E420ISO.TNSSER) — para evitar trazer transações irrelevantes ao Painel de
+    Compras."""
+    limite = max(1, min(limite or 100, 300))
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        params: list = [EMPRESA_PADRAO, EMPRESA_PADRAO]
+        where_extra = ""
+
+        if q:
+            termo = f"%{q.strip()}%"
+            where_extra = """
+                WHERE X.CODTNS LIKE ?
+                   OR X.DESTNS LIKE ?
+            """
+            params.extend([termo, termo])
+
+        sql = f"""
+            SELECT TOP {limite}
+                X.CODTNS,
+                X.DESTNS
+            FROM (
+                SELECT DISTINCT
+                    T.CODTNS,
+                    T.DESTNS
+                FROM E420IPO I
+                INNER JOIN E001TNS T
+                    ON T.CODEMP = ?
+                   AND T.CODTNS = I.TNSPRO
+
+                UNION
+
+                SELECT DISTINCT
+                    T.CODTNS,
+                    T.DESTNS
+                FROM E420ISO S
+                INNER JOIN E001TNS T
+                    ON T.CODEMP = ?
+                   AND T.CODTNS = S.TNSSER
+            ) X
+            {where_extra}
+            ORDER BY X.CODTNS
+        """
+
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao listar transações de compras: {str(e)}")
+    finally:
+        conn.close()
+
+    resultado = []
+    for row in rows:
+        codigo = (row[0] or '').strip() if isinstance(row[0], str) else str(row[0]).strip()
+        descricao = (row[1] or '').strip()
+        resultado.append({
+            'codigo': codigo,
+            'descricao': descricao,
+            'value': codigo,
+            'label': f"{codigo} - {descricao}" if descricao else codigo,
+        })
+    return resultado
 
 
 @app.get('/api/painel-compras')
@@ -30442,6 +30688,629 @@ def exportar_auditoria_genius_ops_jato_peso(
         }
         nome = "auditoria_genius_ops_jato_peso.xlsx"
     return _xlsx_response(nome, [("OPs JATO/Pintura", dados, cabecalhos)])
+
+
+# ============================================================
+# CONTABILIDADE — Balanço Patrimonial
+# Módulo separado do Faturamento/Comercial. Lê V_BALANCO_PATRIMONIAL.
+# ============================================================
+
+
+@app.get("/api/contabilidade/balanco/colunas")
+def contabilidade_balanco_colunas(usuario=Depends(validar_token)):
+    """Diagnóstico: lista as colunas reais de V_BALANCO_PATRIMONIAL.
+    Use para confirmar nomes antes de bater os campos do frontend."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT
+                COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH,
+                IS_NULLABLE, ORDINAL_POSITION
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = ?
+              AND TABLE_NAME = 'V_BALANCO_PATRIMONIAL'
+            ORDER BY ORDINAL_POSITION
+        """, [SCHEMA_CONTABILIDADE])
+        cols = [c[0] for c in cursor.description]
+        dados = []
+        for row in cursor.fetchall():
+            item = {}
+            for i, c in enumerate(cols):
+                v = row[i]
+                if isinstance(v, str):
+                    v = v.strip()
+                item[c.lower()] = v
+            dados.append(item)
+        if not dados:
+            raise HTTPException(
+                status_code=404,
+                detail=f"View {OBJ_V_BALANCO_PATRIMONIAL} não encontrada no schema.",
+            )
+        return {
+            "view": OBJ_V_BALANCO_PATRIMONIAL,
+            "total_colunas": len(dados),
+            "colunas": dados,
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/contabilidade/balanco")
+def consultar_balanco_patrimonial(
+    anomes_ini: str = Query(..., description="Competência inicial YYYYMM"),
+    anomes_fim: Optional[str] = Query(None, description="Competência final YYYYMM (default = anomes_ini)"),
+    codigo_empresa: int = EMPRESA_PADRAO,
+    codigo_filial: Optional[str] = None,
+    conta: Optional[str] = None,
+    grupo: Optional[str] = None,
+    subgrupo: Optional[str] = None,
+    pagina: int = 1,
+    tamanho_pagina: int = 100,
+    usuario=Depends(validar_token),
+):
+    """Consulta o Balanço Patrimonial (V_BALANCO_PATRIMONIAL).
+    Filtros: anomes_ini/anomes_fim (YYYYMM), codigo_empresa, codigo_filial,
+    conta (LIKE em código ou descrição), grupo, subgrupo."""
+    anomes_ini = _normalizar_anomes(anomes_ini)
+    anomes_fim = _normalizar_anomes(anomes_fim, anomes_ini)
+
+    pagina = max(1, int(pagina or 1))
+    tamanho_pagina = max(1, min(int(tamanho_pagina or 100), 500))
+    offset = (pagina - 1) * tamanho_pagina
+
+    where = ["B.ANOMES_REFERENTE BETWEEN ? AND ?"]
+    params: list = [int(anomes_ini), int(anomes_fim)]
+
+    where.append("B.CD_EMPRESA = ?")
+    params.append(int(codigo_empresa))
+
+    if codigo_filial:
+        where.append("CAST(B.CD_FILIAL AS VARCHAR(30)) LIKE ?")
+        params.append(f"%{codigo_filial.strip()}%")
+
+    if conta:
+        where.append("("
+                     " CAST(B.CD_CONTA_CONTABIL AS VARCHAR(50)) LIKE ? "
+                     " OR B.DS_CONTA_CONTABIL LIKE ? "
+                     ")")
+        t = f"%{conta.strip()}%"
+        params.extend([t, t])
+
+    if grupo:
+        where.append("B.DS_GRUPO LIKE ?")
+        params.append(f"%{grupo.strip()}%")
+
+    if subgrupo:
+        where.append("B.DS_SUBGRUPO LIKE ?")
+        params.append(f"%{subgrupo.strip()}%")
+
+    where_sql = " AND ".join(where)
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                f"SELECT COUNT(1) FROM {OBJ_V_BALANCO_PATRIMONIAL} B WHERE {where_sql}",
+                params,
+            )
+            total = int(cursor.fetchone()[0] or 0)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Falha ao consultar {OBJ_V_BALANCO_PATRIMONIAL}: {exc}. "
+                    "Use GET /api/contabilidade/balanco/colunas para conferir "
+                    "se a view existe e os nomes reais das colunas."
+                ),
+            )
+        total_paginas = (total + tamanho_pagina - 1) // tamanho_pagina if total else 0
+
+        cursor.execute(f"""
+            SELECT B.*
+            FROM {OBJ_V_BALANCO_PATRIMONIAL} B
+            WHERE {where_sql}
+            ORDER BY
+                B.ANOMES_REFERENTE,
+                B.DS_GRUPO,
+                B.DS_SUBGRUPO,
+                B.CD_CONTA_CONTABIL
+            OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+        """, params + [offset, tamanho_pagina])
+        cols = [c[0] for c in cursor.description]
+        dados = []
+        for row in cursor.fetchall():
+            item = {}
+            for i, c in enumerate(cols):
+                v = row[i]
+                if isinstance(v, str):
+                    v = v.strip()
+                item[c.lower()] = v
+            dados.append(item)
+
+        return {
+            "pagina": pagina,
+            "tamanho_pagina": tamanho_pagina,
+            "total_registros": total,
+            "total_paginas": total_paginas,
+            "anomes_ini": anomes_ini,
+            "anomes_fim": anomes_fim,
+            "codigo_empresa": codigo_empresa,
+            "dados": dados,
+            "observacao": (
+                f"Fonte: {OBJ_V_BALANCO_PATRIMONIAL}. Confirme os nomes das "
+                "colunas com /api/contabilidade/balanco/colunas se algum "
+                "campo vier ausente."
+            ),
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/export/contabilidade/balanco")
+def exportar_balanco_patrimonial(
+    anomes_ini: str = Query(...),
+    anomes_fim: Optional[str] = None,
+    codigo_empresa: int = EMPRESA_PADRAO,
+    codigo_filial: Optional[str] = None,
+    conta: Optional[str] = None,
+    grupo: Optional[str] = None,
+    subgrupo: Optional[str] = None,
+    usuario=Depends(validar_token_download),
+):
+    """Exporta Excel completo do Balanço Patrimonial (sem paginação)."""
+    dados = _collect_paginated_data(
+        consultar_balanco_patrimonial,
+        usuario,
+        batch_size=500,
+        max_pages=5000,
+        anomes_ini=anomes_ini,
+        anomes_fim=anomes_fim,
+        codigo_empresa=codigo_empresa,
+        codigo_filial=codigo_filial,
+        conta=conta,
+        grupo=grupo,
+        subgrupo=subgrupo,
+    )
+    # Sem mapa fixo de cabeçalhos — _xlsx_response usa os nomes das chaves
+    # diretamente (que vêm normalizados em lowercase pelo backend).
+    return _xlsx_response(
+        "balanco_patrimonial.xlsx",
+        [("Balanço Patrimonial", dados, None)],
+    )
+
+
+# ============================================================
+# CONTABILIDADE — Conciliação Comercial × Contábil
+# Endpoint SEPARADO do Balanço (não confundir). Compara faturamento
+# emitido (E140NFV/IPV/ISV + devoluções E440) com lançamentos
+# contábeis (E640LCT + E045PLA por USU_MCTCTA) por NF.
+# ============================================================
+
+
+@app.get("/api/contabilidade/conciliacao-comercial-contabil")
+def consultar_conciliacao_comercial_contabil(
+    anomes_ini: str = Query(..., description="YYYYMM"),
+    anomes_fim: Optional[str] = None,
+    codigo_empresa: Optional[int] = None,
+    cliente: Optional[str] = None,
+    apenas_diferencas: bool = True,
+    usuario=Depends(validar_token),
+):
+    """Compara COMERCIAL (E140NFV/IPV/ISV + E440 devoluções) com
+    CONTÁBIL (E640LCT × E045PLA via USU_MCTCTA) por NF. Retorna uma
+    linha por (CD_EMPRESA, CD_FILIAL, ANOMES_REFERENTE, CD_NF, CD_SERIE)
+    com VL_*_COM, VL_*_CTB e DIF_* + STATUS_VALIDACAO."""
+    anomes_ini = _normalizar_anomes(anomes_ini)
+    anomes_fim = _normalizar_anomes(anomes_fim, anomes_ini)
+
+    where_extra: list = []
+    params_extra: list = []
+    if codigo_empresa:
+        where_extra.append(
+            "COALESCE(COM.CD_EMPRESA, CTB.CD_EMPRESA) = ?"
+        )
+        params_extra.append(int(codigo_empresa))
+    if cliente:
+        where_extra.append("UPPER(ISNULL(COM.NM_CLIENTE, '')) LIKE ?")
+        params_extra.append(f"%{cliente.strip().upper()}%")
+    if apenas_diferencas:
+        where_extra.append("""(
+            COM.CD_NF IS NULL
+            OR CTB.CD_NF IS NULL
+            OR ABS(ISNULL(COM.VL_LIQUIDO_COM, 0) - ISNULL(CTB.VL_LIQUIDO_CTB, 0)) > 0.01
+        )""")
+    where_extra_sql = (" WHERE " + " AND ".join(where_extra)) if where_extra else ""
+
+    sql = f"""
+        DECLARE @ANOMES_INI INT = ?;
+        DECLARE @ANOMES_FIM INT = ?;
+
+        WITH COMERCIAL_BASE AS (
+            -- PRODUTOS
+            SELECT
+                E140NFV.CODEMP AS CD_EMPRESA,
+                CONVERT(VARCHAR, E140NFV.CODEMP) + '-' + CONVERT(VARCHAR, E140NFV.CODFIL) AS CD_FILIAL,
+                CAST(YEAR(E140NFV.DATEMI) * 100 + MONTH(E140NFV.DATEMI) AS INT) AS ANOMES_REFERENTE,
+                E140NFV.NUMNFV AS CD_NF,
+                E140NFV.CODSNF AS CD_SERIE,
+                E140NFV.CODCLI AS CD_CLIENTE,
+                E085CLI.NOMCLI AS NM_CLIENTE,
+                SUM(E140IPV.VLRBRU + E140IPV.VLRIPI
+                    - (E140IPV.VLRDSC + E140IPV.VLRDS1 + E140IPV.VLRDS2 + E140IPV.VLRDS3 + E140IPV.VLRDS4)
+                    + E140IPV.VLROUI + E140IPV.VLRICS) AS VL_BRUTO,
+                SUM(E140IPV.VLRDSC + E140IPV.VLRDS1 + E140IPV.VLRDS2 + E140IPV.VLRDS3 + E140IPV.VLRDS4) AS VL_DESCONTO,
+                SUM(CASE WHEN E001TNS.CODTNS IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+                              OR E001TNS.COMNAT IN ('6910','5910','6912','5912') THEN 0
+                          ELSE E140IPV.VLRICM * -1 END) AS VL_ICMS,
+                SUM(E140IPV.VLRDFA * -1) AS VL_DIFAL,
+                SUM(CASE WHEN E001TNS.CODTNS IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+                              OR E001TNS.COMNAT IN ('6910','5910','6912','5912') THEN 0
+                          ELSE E140IPV.VLRIPI * -1 END) AS VL_IPI,
+                SUM(CASE WHEN E001TNS.CODTNS IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+                              OR E001TNS.COMNAT IN ('6910','5910','6912','5912') THEN 0
+                          ELSE E140IPV.VLRPIF * -1 END) AS VL_PIS,
+                SUM(CASE WHEN E001TNS.CODTNS IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+                              OR E001TNS.COMNAT IN ('6910','5910','6912','5912') THEN 0
+                          ELSE E140IPV.VLRCFF * -1 END) AS VL_COFINS,
+                0 AS VL_ISS, 0 AS VL_ICMSST, 0 AS VL_DEVOLUCAO
+            FROM E140IPV
+            INNER JOIN E140NFV
+                ON E140NFV.CODEMP = E140IPV.CODEMP AND E140NFV.CODFIL = E140IPV.CODFIL
+               AND E140NFV.NUMNFV = E140IPV.NUMNFV AND E140NFV.CODSNF = E140IPV.CODSNF
+               AND E140NFV.TIPNFS <> 0
+            INNER JOIN E001TNS
+                ON E140IPV.CODEMP = E001TNS.CODEMP AND E140IPV.TNSPRO = E001TNS.CODTNS
+               AND E001TNS.VENFAT = 'S'
+            INNER JOIN E085CLI ON E085CLI.CODCLI = E140NFV.CODCLI
+            LEFT JOIN E140RAT
+                ON E140RAT.CODEMP = E140IPV.CODEMP AND E140RAT.CODFIL = E140IPV.CODFIL
+               AND E140RAT.CODSNF = E140IPV.CODSNF AND E140RAT.NUMNFV = E140IPV.NUMNFV
+               AND E140RAT.SEQIPV = E140IPV.SEQIPV
+            LEFT JOIN E044CCU
+                ON (E044CCU.CODEMP = E140RAT.CODEMP AND E044CCU.CODCCU = E140RAT.CODCCU)
+                OR (E044CCU.CODEMP = E140IPV.CODEMP AND E044CCU.CODCCU = E140IPV.CODCCU)
+            WHERE E140NFV.SITNFV = 2
+              AND E140NFV.CODCLI <> 1
+              AND SUBSTRING(E044CCU.CLACCU, 1, 3) IN ('503', '502')
+              AND CAST(YEAR(E140NFV.DATEMI) * 100 + MONTH(E140NFV.DATEMI) AS INT) BETWEEN @ANOMES_INI AND @ANOMES_FIM
+              AND E001TNS.CODTNS NOT IN ('5933O','6933O','5101A','6101A')
+            GROUP BY E140NFV.CODEMP, E140NFV.CODFIL,
+                     YEAR(E140NFV.DATEMI), MONTH(E140NFV.DATEMI),
+                     E140NFV.NUMNFV, E140NFV.CODSNF,
+                     E140NFV.CODCLI, E085CLI.NOMCLI
+
+            UNION ALL
+
+            -- SERVIÇOS
+            SELECT
+                E140NFV.CODEMP, CONVERT(VARCHAR, E140NFV.CODEMP) + '-' + CONVERT(VARCHAR, E140NFV.CODFIL),
+                CAST(YEAR(E140NFV.DATEMI) * 100 + MONTH(E140NFV.DATEMI) AS INT),
+                E140NFV.NUMNFV, E140NFV.CODSNF, E140NFV.CODCLI, E085CLI.NOMCLI,
+                SUM(E140ISV.VLRBRU + E140ISV.VLRIPI
+                    - (E140ISV.VLRDSC + E140ISV.VLRDS1 + E140ISV.VLRDS2 + E140ISV.VLRDS3 + E140ISV.VLRDS4)
+                    + E140ISV.VLROUI + E140ISV.VLRICS),
+                SUM(E140ISV.VLRDSC + E140ISV.VLRDS1 + E140ISV.VLRDS2 + E140ISV.VLRDS3 + E140ISV.VLRDS4),
+                SUM(CASE WHEN E001TNS.CODTNS IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+                              OR E001TNS.COMNAT IN ('6910','5910','6912','5912') THEN 0
+                          ELSE E140ISV.VLRICM * -1 END),
+                SUM(E140ISV.VLRDFA * -1),
+                SUM(CASE WHEN E001TNS.CODTNS IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+                              OR E001TNS.COMNAT IN ('6910','5910','6912','5912') THEN 0
+                          ELSE E140ISV.VLRIPI * -1 END),
+                SUM(CASE WHEN E001TNS.CODTNS IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+                              OR E001TNS.COMNAT IN ('6910','5910','6912','5912') THEN 0
+                          ELSE E140ISV.VLRPIF * -1 END),
+                SUM(CASE WHEN E001TNS.CODTNS IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+                              OR E001TNS.COMNAT IN ('6910','5910','6912','5912') THEN 0
+                          ELSE E140ISV.VLRCFF * -1 END),
+                SUM(E140ISV.VLRISS * -1), 0, 0
+            FROM E140ISV
+            INNER JOIN E140NFV
+                ON E140NFV.CODEMP = E140ISV.CODEMP AND E140NFV.CODFIL = E140ISV.CODFIL
+               AND E140NFV.NUMNFV = E140ISV.NUMNFV AND E140NFV.CODSNF = E140ISV.CODSNF
+               AND E140NFV.TIPNFS <> 0
+            INNER JOIN E001TNS
+                ON E140ISV.CODEMP = E001TNS.CODEMP AND E140ISV.TNSSER = E001TNS.CODTNS
+               AND E001TNS.VENFAT = 'S'
+            INNER JOIN E085CLI ON E085CLI.CODCLI = E140NFV.CODCLI
+            LEFT JOIN E140RAT
+                ON E140RAT.CODEMP = E140ISV.CODEMP AND E140RAT.CODFIL = E140ISV.CODFIL
+               AND E140RAT.CODSNF = E140ISV.CODSNF AND E140RAT.NUMNFV = E140ISV.NUMNFV
+               AND E140RAT.SEQISV = E140ISV.SEQISV
+            LEFT JOIN E044CCU
+                ON (E044CCU.CODEMP = E140RAT.CODEMP AND E044CCU.CODCCU = E140RAT.CODCCU)
+                OR (E044CCU.CODEMP = E140ISV.CODEMP AND E044CCU.CODCCU = E140ISV.CODCCU)
+            WHERE E140NFV.SITNFV = 2
+              AND E140NFV.CODCLI <> 1
+              AND SUBSTRING(E044CCU.CLACCU, 1, 3) IN ('503', '502')
+              AND CAST(YEAR(E140NFV.DATEMI) * 100 + MONTH(E140NFV.DATEMI) AS INT) BETWEEN @ANOMES_INI AND @ANOMES_FIM
+              AND E001TNS.CODTNS NOT IN ('5933O','6933O','5101A','6101A')
+            GROUP BY E140NFV.CODEMP, E140NFV.CODFIL,
+                     YEAR(E140NFV.DATEMI), MONTH(E140NFV.DATEMI),
+                     E140NFV.NUMNFV, E140NFV.CODSNF,
+                     E140NFV.CODCLI, E085CLI.NOMCLI
+
+            UNION ALL
+
+            -- DEVOLUÇÕES (E440)
+            SELECT
+                E440NFC.CODEMP, CONVERT(VARCHAR, E440NFC.CODEMP) + '-' + CONVERT(VARCHAR, E440NFC.CODFIL),
+                CAST(YEAR(E440NFC.DATENT) * 100 + MONTH(E440NFC.DATENT) AS INT),
+                E440NFC.NUMNFC, E440NFC.CODSNF, E085CLI.CODCLI, E085CLI.NOMCLI,
+                SUM((E440IPC.VLRBRU + E440IPC.VECIPI + E440IPC.VLRICS
+                    - (E440IPC.VLRDSC + E440IPC.VLRDS1 + E440IPC.VLRDS2 + E440IPC.VLRDS3 + E440IPC.VLRDS4)
+                    + E440IPC.VLROUI) * -1),
+                SUM(E440IPC.VLRDSC + E440IPC.VLRDS1 + E440IPC.VLRDS2 + E440IPC.VLRDS3 + E440IPC.VLRDS4),
+                SUM(CASE WHEN E001TNS.CODTNS IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+                              OR E001TNS.COMNAT IN ('6910','5910','6912','5912') THEN 0
+                          ELSE E440IPC.VECICM END),
+                SUM(E440IPC.VLRDFA),
+                SUM(CASE WHEN E001TNS.CODTNS IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+                              OR E001TNS.COMNAT IN ('6910','5910','6912','5912') THEN 0
+                          ELSE E440IPC.VECIPI END),
+                SUM(CASE WHEN E001TNS.CODTNS IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+                              OR E001TNS.COMNAT IN ('6910','5910','6912','5912') THEN 0
+                          ELSE E440IPC.VLRPIS END),
+                SUM(CASE WHEN E001TNS.CODTNS IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+                              OR E001TNS.COMNAT IN ('6910','5910','6912','5912') THEN 0
+                          ELSE E440IPC.VLRCOR END),
+                0, 0,
+                SUM(E440IPC.VLRBRU + E440IPC.VECIPI + E440IPC.VLRICS
+                    - (E440IPC.VLRDSC + E440IPC.VLRDS1 + E440IPC.VLRDS2 + E440IPC.VLRDS3 + E440IPC.VLRDS4)
+                    + E440IPC.VLROUI)
+            FROM E440IPC
+            INNER JOIN E440NFC
+                ON E440NFC.CODEMP = E440IPC.CODEMP AND E440NFC.CODFIL = E440IPC.CODFIL
+               AND E440NFC.NUMNFC = E440IPC.NUMNFC AND E440NFC.CODSNF = E440IPC.CODSNF
+               AND E440NFC.CODFOR = E440IPC.CODFOR
+            INNER JOIN E001TNS
+                ON E440IPC.CODEMP = E001TNS.CODEMP AND E440IPC.TNSPRO = E001TNS.CODTNS
+            LEFT JOIN E095FOR ON E095FOR.CODFOR = E440NFC.CODFOR
+            LEFT JOIN E085CLI ON E085CLI.CODCLI = E095FOR.CODCLI
+            LEFT JOIN E085HCL
+                ON E085CLI.CODCLI = E085HCL.CODCLI
+               AND E440NFC.CODEMP = E085HCL.CODEMP
+               AND E440NFC.CODFIL = E085HCL.CODFIL
+            LEFT JOIN E440RAT
+                ON E440RAT.CODEMP = E440IPC.CODEMP AND E440RAT.CODFIL = E440IPC.CODFIL
+               AND E440RAT.CODSNF = E440IPC.CODSNF AND E440RAT.CODFOR = E440IPC.CODFOR
+               AND E440RAT.NUMNFC = E440IPC.NUMNFC AND E440RAT.SEQIPC = E440IPC.SEQIPC
+            LEFT JOIN E044CCU
+                ON (E044CCU.CODEMP = E440RAT.CODEMP AND E044CCU.CODCCU = E440RAT.CODCCU)
+                OR (E044CCU.CODEMP = E440IPC.CODEMP AND E044CCU.CODCCU = E440IPC.CODCCU)
+            WHERE E440NFC.SITNFC = 2
+              AND ISNULL(E085HCL.CODCLI, 0) <> 1
+              AND E001TNS.COMNAT IN ('3211','3202','3201','2411','2410','2209',
+                                     '2204','2203','2202','2201','1411','1410',
+                                     '1204','1203','1202','1201')
+              AND SUBSTRING(E044CCU.CLACCU, 1, 3) IN ('503', '502')
+              AND CAST(YEAR(E440NFC.DATENT) * 100 + MONTH(E440NFC.DATENT) AS INT) BETWEEN @ANOMES_INI AND @ANOMES_FIM
+            GROUP BY E440NFC.CODEMP, E440NFC.CODFIL,
+                     YEAR(E440NFC.DATENT), MONTH(E440NFC.DATENT),
+                     E440NFC.NUMNFC, E440NFC.CODSNF,
+                     E085CLI.CODCLI, E085CLI.NOMCLI
+        ),
+        COMERCIAL AS (
+            SELECT CD_EMPRESA, CD_FILIAL, ANOMES_REFERENTE, CD_NF, CD_SERIE,
+                   MAX(CD_CLIENTE) AS CD_CLIENTE, MAX(NM_CLIENTE) AS NM_CLIENTE,
+                   SUM(VL_BRUTO) AS VL_BRUTO_COM, SUM(VL_DESCONTO) AS VL_DESCONTO_COM,
+                   SUM(VL_ICMS) AS VL_ICMS_COM, SUM(VL_DIFAL) AS VL_DIFAL_COM,
+                   SUM(VL_IPI) AS VL_IPI_COM, SUM(VL_PIS) AS VL_PIS_COM,
+                   SUM(VL_COFINS) AS VL_COFINS_COM, SUM(VL_ISS) AS VL_ISS_COM,
+                   SUM(VL_ICMSST) AS VL_ICMSST_COM, SUM(VL_DEVOLUCAO) AS VL_DEVOLUCAO_COM,
+                   SUM(VL_BRUTO + VL_ICMS + VL_DIFAL + VL_IPI + VL_PIS + VL_COFINS + VL_ISS + VL_ICMSST) AS VL_LIQUIDO_COM
+            FROM COMERCIAL_BASE
+            GROUP BY CD_EMPRESA, CD_FILIAL, ANOMES_REFERENTE, CD_NF, CD_SERIE
+        ),
+        CONTABIL_BASE AS (
+            -- DÉBITO
+            SELECT
+                L.CODEMP AS CD_EMPRESA,
+                CONVERT(VARCHAR, L.CODEMP) + '-' + CONVERT(VARCHAR, L.CODFIL) AS CD_FILIAL,
+                CAST(YEAR(L.DATLCT) * 100 + MONTH(L.DATLCT) AS INT) AS ANOMES_REFERENTE,
+                ISNULL(E644LNF.NUMNFI, 0) AS CD_NF,
+                ISNULL(E644LNF.CODSNF, '0') AS CD_SERIE,
+                SUM(CASE WHEN E045PLA.USU_MCTCTA IN ('01','02','03') THEN L.VLRLCT * -1 ELSE 0 END) AS VL_BRUTO,
+                SUM(CASE WHEN E045PLA.USU_MCTCTA IN ('17') THEN L.VLRLCT * -1 ELSE 0 END) AS VL_DESCONTO,
+                SUM(CASE WHEN E045PLA.USU_MCTCTA IN ('04') THEN L.VLRLCT * -1 ELSE 0 END) AS VL_ICMS,
+                0 AS VL_DIFAL,
+                SUM(CASE WHEN E045PLA.USU_MCTCTA IN ('05') THEN L.VLRLCT * -1 ELSE 0 END) AS VL_IPI,
+                SUM(CASE WHEN E045PLA.USU_MCTCTA IN ('06') THEN L.VLRLCT * -1 ELSE 0 END) AS VL_PIS,
+                SUM(CASE WHEN E045PLA.USU_MCTCTA IN ('07') THEN L.VLRLCT * -1 ELSE 0 END) AS VL_COFINS,
+                SUM(CASE WHEN E045PLA.USU_MCTCTA IN ('08') THEN L.VLRLCT * -1 ELSE 0 END) AS VL_ISS,
+                SUM(CASE WHEN E045PLA.USU_MCTCTA IN ('16') THEN L.VLRLCT * -1 ELSE 0 END) AS VL_ICMSST,
+                SUM(CASE WHEN E045PLA.USU_MCTCTA IN ('12') THEN L.VLRLCT * -1 ELSE 0 END) AS VL_DEVOLUCAO
+            FROM E640LCT L
+            INNER JOIN E045PLA ON L.CODEMP = E045PLA.CODEMP AND L.CTADEB = E045PLA.CTARED
+            LEFT JOIN E644LNF ON L.CODEMP = E644LNF.CODEMP AND L.NUMLCT = E644LNF.NUMLCT
+            WHERE L.SITLCT = 2
+              AND ISNULL(L.CODHPD, 0) <> 712
+              AND CAST(CASE WHEN ISNULL(E045PLA.USU_MCTCTA, ' ') = ' '
+                              OR ISNULL(E045PLA.USU_MCTCTA, '  ') = '  '
+                            THEN '0' ELSE E045PLA.USU_MCTCTA END AS INT) BETWEEN 1 AND 20
+              AND CAST(YEAR(L.DATLCT) * 100 + MONTH(L.DATLCT) AS INT) BETWEEN @ANOMES_INI AND @ANOMES_FIM
+            GROUP BY L.CODEMP, L.CODFIL,
+                     YEAR(L.DATLCT), MONTH(L.DATLCT),
+                     ISNULL(E644LNF.NUMNFI, 0), ISNULL(E644LNF.CODSNF, '0')
+
+            UNION ALL
+
+            -- CRÉDITO
+            SELECT
+                L.CODEMP, CONVERT(VARCHAR, L.CODEMP) + '-' + CONVERT(VARCHAR, L.CODFIL),
+                CAST(YEAR(L.DATLCT) * 100 + MONTH(L.DATLCT) AS INT),
+                ISNULL(E644LNF.NUMNFI, 0), ISNULL(E644LNF.CODSNF, '0'),
+                SUM(CASE WHEN E045PLA.USU_MCTCTA IN ('01','02','03','12') THEN L.VLRLCT ELSE 0 END),
+                SUM(CASE WHEN E045PLA.USU_MCTCTA IN ('17') THEN L.VLRLCT ELSE 0 END),
+                SUM(CASE WHEN E045PLA.USU_MCTCTA IN ('04') THEN L.VLRLCT ELSE 0 END),
+                0,
+                SUM(CASE WHEN E045PLA.USU_MCTCTA IN ('05') THEN L.VLRLCT ELSE 0 END),
+                SUM(CASE WHEN E045PLA.USU_MCTCTA IN ('06') THEN L.VLRLCT ELSE 0 END),
+                SUM(CASE WHEN E045PLA.USU_MCTCTA IN ('07') THEN L.VLRLCT ELSE 0 END),
+                SUM(CASE WHEN E045PLA.USU_MCTCTA IN ('08') THEN L.VLRLCT ELSE 0 END),
+                SUM(CASE WHEN E045PLA.USU_MCTCTA IN ('16') THEN L.VLRLCT * -1 ELSE 0 END),
+                SUM(CASE WHEN E045PLA.USU_MCTCTA IN ('12') THEN L.VLRLCT ELSE 0 END)
+            FROM E640LCT L
+            INNER JOIN E045PLA ON L.CODEMP = E045PLA.CODEMP AND L.CTACRE = E045PLA.CTARED
+            LEFT JOIN E644LNF ON L.CODEMP = E644LNF.CODEMP AND L.NUMLCT = E644LNF.NUMLCT
+            WHERE L.SITLCT = 2
+              AND ISNULL(L.CODHPD, 0) <> 712
+              AND CAST(CASE WHEN ISNULL(E045PLA.USU_MCTCTA, ' ') = ' '
+                              OR ISNULL(E045PLA.USU_MCTCTA, '  ') = '  '
+                            THEN '0' ELSE E045PLA.USU_MCTCTA END AS INT) BETWEEN 1 AND 20
+              AND CAST(YEAR(L.DATLCT) * 100 + MONTH(L.DATLCT) AS INT) BETWEEN @ANOMES_INI AND @ANOMES_FIM
+            GROUP BY L.CODEMP, L.CODFIL,
+                     YEAR(L.DATLCT), MONTH(L.DATLCT),
+                     ISNULL(E644LNF.NUMNFI, 0), ISNULL(E644LNF.CODSNF, '0')
+        ),
+        CONTABIL AS (
+            SELECT CD_EMPRESA, CD_FILIAL, ANOMES_REFERENTE, CD_NF, CD_SERIE,
+                   SUM(VL_BRUTO) AS VL_BRUTO_CTB, SUM(VL_DESCONTO) AS VL_DESCONTO_CTB,
+                   SUM(VL_ICMS) AS VL_ICMS_CTB, SUM(VL_DIFAL) AS VL_DIFAL_CTB,
+                   SUM(VL_IPI) AS VL_IPI_CTB, SUM(VL_PIS) AS VL_PIS_CTB,
+                   SUM(VL_COFINS) AS VL_COFINS_CTB, SUM(VL_ISS) AS VL_ISS_CTB,
+                   SUM(VL_ICMSST) AS VL_ICMSST_CTB, SUM(VL_DEVOLUCAO) AS VL_DEVOLUCAO_CTB,
+                   SUM(VL_BRUTO + VL_ICMS + VL_DIFAL + VL_IPI + VL_PIS + VL_COFINS + VL_ISS + VL_ICMSST) AS VL_LIQUIDO_CTB
+            FROM CONTABIL_BASE
+            GROUP BY CD_EMPRESA, CD_FILIAL, ANOMES_REFERENTE, CD_NF, CD_SERIE
+        )
+        SELECT
+            COALESCE(COM.CD_EMPRESA, CTB.CD_EMPRESA) AS cd_empresa,
+            COALESCE(COM.CD_FILIAL, CTB.CD_FILIAL) AS cd_filial,
+            COALESCE(COM.ANOMES_REFERENTE, CTB.ANOMES_REFERENTE) AS anomes_referente,
+            COALESCE(COM.CD_NF, CTB.CD_NF) AS cd_nf,
+            COALESCE(COM.CD_SERIE, CTB.CD_SERIE) AS cd_serie,
+            COM.CD_CLIENTE AS cd_cliente,
+            COM.NM_CLIENTE AS nm_cliente,
+            ISNULL(COM.VL_BRUTO_COM, 0) AS vl_bruto_com,
+            ISNULL(CTB.VL_BRUTO_CTB, 0) AS vl_bruto_ctb,
+            ISNULL(COM.VL_BRUTO_COM, 0) - ISNULL(CTB.VL_BRUTO_CTB, 0) AS dif_bruto,
+            ISNULL(COM.VL_ICMS_COM, 0) AS vl_icms_com, ISNULL(CTB.VL_ICMS_CTB, 0) AS vl_icms_ctb,
+            ISNULL(COM.VL_ICMS_COM, 0) - ISNULL(CTB.VL_ICMS_CTB, 0) AS dif_icms,
+            ISNULL(COM.VL_DIFAL_COM, 0) AS vl_difal_com, ISNULL(CTB.VL_DIFAL_CTB, 0) AS vl_difal_ctb,
+            ISNULL(COM.VL_DIFAL_COM, 0) - ISNULL(CTB.VL_DIFAL_CTB, 0) AS dif_difal,
+            ISNULL(COM.VL_IPI_COM, 0) AS vl_ipi_com, ISNULL(CTB.VL_IPI_CTB, 0) AS vl_ipi_ctb,
+            ISNULL(COM.VL_IPI_COM, 0) - ISNULL(CTB.VL_IPI_CTB, 0) AS dif_ipi,
+            ISNULL(COM.VL_PIS_COM, 0) AS vl_pis_com, ISNULL(CTB.VL_PIS_CTB, 0) AS vl_pis_ctb,
+            ISNULL(COM.VL_PIS_COM, 0) - ISNULL(CTB.VL_PIS_CTB, 0) AS dif_pis,
+            ISNULL(COM.VL_COFINS_COM, 0) AS vl_cofins_com, ISNULL(CTB.VL_COFINS_CTB, 0) AS vl_cofins_ctb,
+            ISNULL(COM.VL_COFINS_COM, 0) - ISNULL(CTB.VL_COFINS_CTB, 0) AS dif_cofins,
+            ISNULL(COM.VL_ISS_COM, 0) AS vl_iss_com, ISNULL(CTB.VL_ISS_CTB, 0) AS vl_iss_ctb,
+            ISNULL(COM.VL_ISS_COM, 0) - ISNULL(CTB.VL_ISS_CTB, 0) AS dif_iss,
+            ISNULL(COM.VL_ICMSST_COM, 0) AS vl_icmsst_com, ISNULL(CTB.VL_ICMSST_CTB, 0) AS vl_icmsst_ctb,
+            ISNULL(COM.VL_ICMSST_COM, 0) - ISNULL(CTB.VL_ICMSST_CTB, 0) AS dif_icmsst,
+            ISNULL(COM.VL_DEVOLUCAO_COM, 0) AS vl_devolucao_com,
+            ISNULL(CTB.VL_DEVOLUCAO_CTB, 0) AS vl_devolucao_ctb,
+            ISNULL(COM.VL_DEVOLUCAO_COM, 0) - ISNULL(CTB.VL_DEVOLUCAO_CTB, 0) AS dif_devolucao,
+            ISNULL(COM.VL_LIQUIDO_COM, 0) AS vl_liquido_com,
+            ISNULL(CTB.VL_LIQUIDO_CTB, 0) AS vl_liquido_ctb,
+            ISNULL(COM.VL_LIQUIDO_COM, 0) - ISNULL(CTB.VL_LIQUIDO_CTB, 0) AS dif_liquido,
+            CASE
+                WHEN COM.CD_NF IS NULL THEN 'SOMENTE_CONTABIL'
+                WHEN CTB.CD_NF IS NULL THEN 'SOMENTE_COMERCIAL'
+                WHEN ABS(ISNULL(COM.VL_LIQUIDO_COM, 0) - ISNULL(CTB.VL_LIQUIDO_CTB, 0)) > 0.01 THEN 'DIFERENCA'
+                ELSE 'OK'
+            END AS status_validacao
+        FROM COMERCIAL COM
+        FULL OUTER JOIN CONTABIL CTB
+            ON CTB.CD_EMPRESA = COM.CD_EMPRESA
+           AND CTB.CD_FILIAL = COM.CD_FILIAL
+           AND CTB.ANOMES_REFERENTE = COM.ANOMES_REFERENTE
+           AND CTB.CD_NF = COM.CD_NF
+           AND CTB.CD_SERIE = COM.CD_SERIE
+        {where_extra_sql}
+        ORDER BY
+            ABS(ISNULL(COM.VL_LIQUIDO_COM, 0) - ISNULL(CTB.VL_LIQUIDO_CTB, 0)) DESC,
+            COALESCE(COM.ANOMES_REFERENTE, CTB.ANOMES_REFERENTE),
+            COALESCE(COM.CD_NF, CTB.CD_NF)
+    """
+    params: list = [int(anomes_ini), int(anomes_fim)] + params_extra
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(sql, params)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Erro SQL na conciliação comercial × contábil: {exc}",
+            )
+        cols = [c[0] for c in cursor.description]
+        dados = []
+        for row in cursor.fetchall():
+            item = {}
+            for i, c in enumerate(cols):
+                v = row[i]
+                if isinstance(v, str):
+                    v = v.strip()
+                item[c] = v
+            dados.append(item)
+
+        # Resumo agregado
+        total = len(dados)
+        ok = sum(1 for d in dados if d.get("status_validacao") == "OK")
+        diferenca = sum(1 for d in dados if d.get("status_validacao") == "DIFERENCA")
+        somente_com = sum(1 for d in dados if d.get("status_validacao") == "SOMENTE_COMERCIAL")
+        somente_ctb = sum(1 for d in dados if d.get("status_validacao") == "SOMENTE_CONTABIL")
+        soma_dif_liq = round(sum(float(d.get("dif_liquido") or 0) for d in dados), 2)
+
+        return {
+            "anomes_ini": anomes_ini,
+            "anomes_fim": anomes_fim,
+            "apenas_diferencas": apenas_diferencas,
+            "total": total,
+            "resumo": {
+                "ok": ok,
+                "diferenca": diferenca,
+                "somente_comercial": somente_com,
+                "somente_contabil": somente_ctb,
+                "soma_dif_liquido": soma_dif_liq,
+            },
+            "dados": dados,
+            "observacao": (
+                "Comparação por (CD_EMPRESA, CD_FILIAL, ANOMES_REFERENTE, "
+                "CD_NF, CD_SERIE). Esta é a conciliação Comercial × Contábil, "
+                "NÃO confunda com o Balanço Patrimonial (que vive em "
+                "/api/contabilidade/balanco)."
+            ),
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/export/contabilidade/conciliacao-comercial-contabil")
+def exportar_conciliacao_comercial_contabil(
+    anomes_ini: str = Query(...),
+    anomes_fim: Optional[str] = None,
+    codigo_empresa: Optional[int] = None,
+    cliente: Optional[str] = None,
+    apenas_diferencas: bool = True,
+    usuario=Depends(validar_token_download),
+):
+    """Excel da conciliação. Sem paginação interna (a query nativa já
+    não pagina) — chama o endpoint direto."""
+    resp = consultar_conciliacao_comercial_contabil(
+        anomes_ini=anomes_ini, anomes_fim=anomes_fim,
+        codigo_empresa=codigo_empresa, cliente=cliente,
+        apenas_diferencas=apenas_diferencas, usuario=usuario,
+    )
+    dados = resp.get("dados", [])
+    return _xlsx_response(
+        "conciliacao_comercial_contabil.xlsx",
+        [("Conciliação Com × Ctb", dados, None)],
+    )
 
 
 if __name__ == '__main__':
