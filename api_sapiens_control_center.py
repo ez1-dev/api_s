@@ -9751,6 +9751,78 @@ def consultar_notas_recebimento_dashboard(
     }
 
 
+_FORMATOS_DATA_DEMONSTRATIVO = (
+    "%Y-%m-%d",
+    "%Y/%m/%d",
+    "%d/%m/%Y",
+    "%d-%m-%Y",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S.%f",
+    "%Y-%m-%dT%H:%M:%SZ",
+)
+
+
+def _parse_data_demonstrativo(valor: Optional[str], nome_campo: str) -> Optional[str]:
+    """Aceita várias variações comuns e devolve sempre ``YYYY-MM-DD``.
+    Levanta ``HTTPException(422)`` se o valor não casar com nenhum formato."""
+    if valor is None:
+        return None
+    s = str(valor).strip()
+    if not s:
+        return None
+    # Recorta sufixo ISO 8601 com timezone (+/-HH:MM) que strptime não digere bem
+    if len(s) >= 6 and (s[-6] in ("+", "-")) and s[-3] == ":":
+        s = s[:-6]
+    for fmt in _FORMATOS_DATA_DEMONSTRATIVO:
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    raise HTTPException(
+        status_code=422,
+        detail=(
+            f"Filtro '{nome_campo}' inválido: '{valor}'. "
+            "Formatos aceitos: YYYY-MM-DD, DD/MM/YYYY, ISO 8601."
+        ),
+    )
+
+
+def _parse_mes_competencia_demonstrativo(valor: Optional[str]) -> Optional[str]:
+    """Valida e normaliza ``mes_competencia`` para ``YYYY-MM``.
+    Aceita também ``YYYY/MM``, ``MM/YYYY`` e ``YYYYMM``."""
+    if valor is None:
+        return None
+    s = str(valor).strip()
+    if not s:
+        return None
+    candidatos = [s]
+    if "/" in s:
+        partes = s.split("/")
+        if len(partes) == 2:
+            a, b = partes[0].strip(), partes[1].strip()
+            if len(a) == 4 and a.isdigit() and len(b) in (1, 2) and b.isdigit():
+                candidatos.append(f"{a}-{b.zfill(2)}")
+            elif len(b) == 4 and b.isdigit() and len(a) in (1, 2) and a.isdigit():
+                candidatos.append(f"{b}-{a.zfill(2)}")
+    if len(s) == 6 and s.isdigit():
+        candidatos.append(f"{s[:4]}-{s[4:]}")
+    for c in candidatos:
+        try:
+            dt = datetime.strptime(c, "%Y-%m")
+            return dt.strftime("%Y-%m")
+        except ValueError:
+            continue
+    raise HTTPException(
+        status_code=422,
+        detail=(
+            f"Filtro 'mes_competencia' inválido: '{valor}'. "
+            "Formato esperado: YYYY-MM (ex.: 2026-05)."
+        ),
+    )
+
+
 @app.get("/api/demonstrativo-compras-recebimentos")
 def consultar_demonstrativo_compras_recebimentos(
     origem: str = "TODOS",
@@ -9973,8 +10045,8 @@ def consultar_demonstrativo_compras_recebimentos(
                 ON PRJ.CodEmp = I.CodEmp
                AND PRJ.NumPrj = I.NumPrj
             WHERE O.CodEmp = ?
-              AND O.DatEmi >= ?
-              AND O.DatEmi <= ?
+              AND CAST(O.DatEmi AS DATE) >= CAST(? AS DATE)
+              AND CAST(O.DatEmi AS DATE) <= CAST(? AS DATE)
 
             UNION ALL
 
@@ -10052,8 +10124,8 @@ def consultar_demonstrativo_compras_recebimentos(
                 ON PRJ.CodEmp = SI.CodEmp
                AND PRJ.NumPrj = SI.NumPrj
             WHERE O.CodEmp = ?
-              AND O.DatEmi >= ?
-              AND O.DatEmi <= ?
+              AND CAST(O.DatEmi AS DATE) >= CAST(? AS DATE)
+              AND CAST(O.DatEmi AS DATE) <= CAST(? AS DATE)
         ),
 
         RECEBIMENTOS AS (
@@ -10169,8 +10241,8 @@ def consultar_demonstrativo_compras_recebimentos(
                 ON PRJ.CodEmp = I.CodEmp
                AND PRJ.NumPrj = I.NumPrj
             WHERE H.CodEmp = ?
-              AND H.DatEnt >= ?
-              AND H.DatEnt <= ?
+              AND CAST(H.DatEnt AS DATE) >= CAST(? AS DATE)
+              AND CAST(H.DatEnt AS DATE) <= CAST(? AS DATE)
 
             UNION ALL
 
@@ -10261,8 +10333,8 @@ def consultar_demonstrativo_compras_recebimentos(
                 ON PRJ.CodEmp = SI.CodEmp
                AND PRJ.NumPrj = SI.NumPrj
             WHERE H.CodEmp = ?
-              AND H.DatEnt >= ?
-              AND H.DatEnt <= ?
+              AND CAST(H.DatEnt AS DATE) >= CAST(? AS DATE)
+              AND CAST(H.DatEnt AS DATE) <= CAST(? AS DATE)
         )
 
         SELECT *
@@ -10274,8 +10346,21 @@ def consultar_demonstrativo_compras_recebimentos(
         ) X;
         """
 
-        data_ini_sql = data_ini or "2026-01-01"
-        data_fim_sql = data_fim or datetime.now().strftime("%Y-%m-%d")
+        data_ini_norm = _parse_data_demonstrativo(data_ini, "data_ini")
+        data_fim_norm = _parse_data_demonstrativo(data_fim, "data_fim")
+        mes_competencia_norm = _parse_mes_competencia_demonstrativo(mes_competencia)
+
+        data_ini_sql = data_ini_norm or "2026-01-01"
+        data_fim_sql = data_fim_norm or datetime.now().strftime("%Y-%m-%d")
+
+        if data_ini_sql > data_fim_sql:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Intervalo inválido: data_ini ({data_ini_sql}) é maior "
+                    f"que data_fim ({data_fim_sql})."
+                ),
+            )
 
         params_base = [
             EMPRESA_PADRAO, data_ini_sql, data_fim_sql,
@@ -10314,7 +10399,7 @@ def consultar_demonstrativo_compras_recebimentos(
         add_equal("numero_projeto", numero_projeto)
         add_equal("codigo_centro_custo", centro_custo)
         add_equal("tipo_despesa", normalizar_tipo_despesa(tipo_despesa) if tipo_despesa else None)
-        add_equal("mes_competencia", mes_competencia)
+        add_equal("mes_competencia", mes_competencia_norm)
         add_equal("codigo_fornecedor", fornecedor)
         add_equal("transacao", transacao)
         add_equal("deposito", deposito)
@@ -10547,7 +10632,7 @@ def consultar_demonstrativo_compras_recebimentos(
                 "numero_projeto": numero_projeto,
                 "centro_custo": centro_custo,
                 "tipo_despesa": tipo_despesa,
-                "mes_competencia": mes_competencia,
+                "mes_competencia": mes_competencia_norm,
                 "fornecedor": fornecedor,
                 "condicao_pagamento": condicao_pagamento,
                 "transacao": transacao,
