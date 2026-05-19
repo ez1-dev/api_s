@@ -6,6 +6,7 @@ import pyodbc
 from jose import jwt
 from jose.exceptions import ExpiredSignatureError, JWTError
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import Optional, Any, List, Dict
 from pydantic import BaseModel, Field, AliasChoices, ConfigDict
 from openpyxl import Workbook
@@ -13707,6 +13708,371 @@ def consultar_producao_engenharia_x_producao(
     retorno = executar_paginado_sem_count(select_sql, from_sql, order_sql, params, pagina, tamanho_pagina)
     retorno["observacao"] = "Comparativo consolidado otimizado entre engenharia, produção, entrada em estoque, expedição e itens não carregados."
     return retorno
+
+
+# ============================================================
+# IMPRESSÃO DE ORDEM DE PRODUÇÃO (MCAP700.GER)
+# ============================================================
+
+def _json_value(value):
+    """Converte tipos do SQL Server (Decimal, datetime, date) para JSON-safe."""
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return value
+
+
+def _fetch_all_dict(cursor):
+    """Devolve todas as linhas do cursor como lista de dicts (cols->valores)."""
+    columns = [col[0] for col in cursor.description]
+    rows = cursor.fetchall()
+    return [
+        {columns[i]: _json_value(row[i]) for i in range(len(columns))}
+        for row in rows
+    ]
+
+
+def _fetch_one_dict(cursor):
+    """Devolve a primeira linha do cursor como dict, ou None se vazio."""
+    columns = [col[0] for col in cursor.description]
+    row = cursor.fetchone()
+    if not row:
+        return None
+    return {columns[i]: _json_value(row[i]) for i in range(len(columns))}
+
+
+@app.get("/api/producao/ordem-producao/impressao")
+def consultar_ordem_producao_impressao(
+    cod_emp: int = 1,
+    cod_ori: str = "210",
+    num_orp: int = 0,
+    listar_componentes: str = "S",
+    listar_desenho: str = "N",
+    cod_etg: Optional[int] = None,
+    cod_cre: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    """
+    Retorna os dados da Ordem de Produção no padrão do relatório MCAP700.GER.
+    Usado pelo Lovable para visualizar, imprimir e gerar PDF da OP.
+    """
+
+    if not num_orp:
+        raise HTTPException(status_code=422, detail="Informe o número da O.P.")
+
+    cod_ori = str(cod_ori).strip()
+    listar_componentes = (listar_componentes or "S").upper().strip()
+    listar_desenho = (listar_desenho or "N").upper().strip()
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+        # ============================================================
+        # 1) Cabeçalho da OP
+        # ============================================================
+
+        sql_cabecalho = """
+            SELECT
+                COP.CodEmp AS cod_emp,
+                COP.CodOri AS cod_ori,
+                COP.NumOrp AS num_orp,
+
+                RIGHT('000000000' + CAST(COP.NumOrp AS VARCHAR(9)), 9) AS num_orp_formatado,
+                COP.CodOri + RIGHT('000000000' + CAST(COP.NumOrp AS VARCHAR(9)), 9) AS codigo_barras_op,
+
+                COP.CodPro AS produto,
+                ISNULL(PRO.DesPro, '') AS descricao_produto,
+                COP.CodPro + ' - ' + ISNULL(PRO.DesPro, '') AS produto_descricao,
+
+                COP.QtdPrv AS quantidade,
+                ISNULL(PRO.UniMed, '') AS unidade_medida,
+
+                COP.NumPed AS pedido,
+                COP.DatGer AS data_geracao,
+                COP.DtpIni AS inicio_previsto,
+
+                RIGHT('0' + CAST(MONTH(COP.DatGer) AS VARCHAR(2)), 2)
+                    + '/'
+                    + CAST(YEAR(COP.DatGer) AS VARCHAR(4)) AS periodo,
+
+                COP.SitOrp AS situacao,
+                CASE CAST(COP.SitOrp AS VARCHAR(10))
+                    WHEN 'L' THEN 'Liberada'
+                    WHEN 'A' THEN 'Aberta'
+                    WHEN 'F' THEN 'Finalizada'
+                    WHEN 'C' THEN 'Cancelada'
+                    WHEN 'E' THEN 'Encerrada'
+                    ELSE CAST(COP.SitOrp AS VARCHAR(20))
+                END AS situacao_descricao,
+
+                COP.CodRot AS cod_rot,
+                ISNULL(COP.RelPrd, '') AS agrupamento,
+                CAST('REV' AS VARCHAR(10)) AS revisao,
+
+                ISNULL(COP.ObsOrp, '') AS observacao_1,
+                ISNULL(COP.ObsOr2, '') AS observacao_2
+
+            FROM E900COP COP
+            LEFT JOIN E075PRO PRO
+                ON PRO.CodEmp = COP.CodEmp
+               AND PRO.CodPro = COP.CodPro
+            WHERE COP.CodEmp = ?
+              AND COP.CodOri = ?
+              AND COP.NumOrp = ?
+        """
+
+        cursor.execute(sql_cabecalho, [cod_emp, cod_ori, num_orp])
+        cabecalho = _fetch_one_dict(cursor)
+
+        if not cabecalho:
+            raise HTTPException(
+                status_code=404,
+                detail=f"O.P. não encontrada. Empresa={cod_emp}, Origem={cod_ori}, OP={num_orp}",
+            )
+
+        # ============================================================
+        # 2) Componentes
+        # ============================================================
+
+        componentes = []
+
+        if listar_componentes == "S":
+            filtros_componentes = ""
+            params_componentes = [cod_emp, cod_ori, num_orp]
+
+            if cod_etg is not None:
+                filtros_componentes += " AND CMO.CodEtg = ?"
+                params_componentes.append(cod_etg)
+
+            sql_componentes = f"""
+                SELECT
+                    CMO.CodEmp AS cod_emp,
+                    CMO.CodOri AS cod_ori,
+                    CMO.NumOrp AS num_orp,
+                    CMO.CodEtg AS cod_etg,
+                    CMO.SeqCmp AS seq_cmp,
+
+                    RIGHT('0000' + CAST(CMO.CodEtg AS VARCHAR(4)), 4)
+                      + RIGHT('0000' + CAST(CMO.SeqCmp AS VARCHAR(4)), 4) AS codigo_barras_componente,
+
+                    CMO.CodCmp AS codigo_componente,
+                    CMO.CodDer AS derivacao_componente,
+                    ISNULL(PRO.DesPro, '') AS descricao_componente,
+
+                    CMO.QtdPrv AS quantidade_prevista,
+                    CMO.UniMed AS unidade_medida,
+                    CMO.CodDep AS deposito,
+                    CAST('' AS VARCHAR(100)) AS endereco
+
+                FROM E900CMO CMO
+                LEFT JOIN E075PRO PRO
+                    ON PRO.CodEmp = CMO.CodEmp
+                   AND PRO.CodPro = CMO.CodCmp
+                WHERE CMO.CodEmp = ?
+                  AND CMO.CodOri = ?
+                  AND CMO.NumOrp = ?
+                  {filtros_componentes}
+                ORDER BY
+                    CMO.CodEtg,
+                    CMO.SeqCmp
+            """
+
+            cursor.execute(sql_componentes, params_componentes)
+            componentes = _fetch_all_dict(cursor)
+
+        # ============================================================
+        # 3) Operações
+        # ============================================================
+
+        filtros_operacoes = ""
+        params_operacoes = [cod_emp, cod_ori, num_orp]
+
+        if cod_etg is not None:
+            filtros_operacoes += " AND OOP.CodEtg = ?"
+            params_operacoes.append(cod_etg)
+
+        if cod_cre:
+            filtros_operacoes += " AND OOP.CodCre = ?"
+            params_operacoes.append(str(cod_cre).strip())
+
+        sql_operacoes = f"""
+            SELECT
+                OOP.CodEmp AS cod_emp,
+                OOP.CodOri AS cod_ori,
+                OOP.NumOrp AS num_orp,
+
+                OOP.CodEtg AS cod_etg,
+                OOP.SeqRot AS seq_rot,
+                OOP.CodCre AS cod_cre,
+                OOP.CodOpr AS cod_opr,
+
+                ISNULL(OPR.DesOpr, '') AS descricao_operacao,
+
+                OOP.CodFor AS fornecedor,
+                ISNULL(FORN.NomFor, '') AS nome_fornecedor,
+
+                OOP.CodSer AS servico,
+                ISNULL(SER.DesSer, '') AS descricao_servico,
+
+                OOP.TmpPrp AS tmp_unit,
+                OOP.TmpTpr AS tmp_total,
+
+                ISNULL(QDO.CodDer, '') AS derivacao_op,
+                ISNULL(QDO.UniMed, '') AS unidade_medida,
+
+                RIGHT('0000' + CAST(OOP.CodEtg AS VARCHAR(4)), 4)
+                  + RIGHT('0000' + CAST(OOP.SeqRot AS VARCHAR(4)), 4)
+                  + ISNULL(QDO.CodDer, '') AS codigo_barras_operacao,
+
+                ISNULL(OOP.ObsOop, '') AS observacao_operacao
+
+            FROM E900OOP OOP
+            INNER JOIN E900COP COP
+                ON COP.CodEmp = OOP.CodEmp
+               AND COP.CodOri = OOP.CodOri
+               AND COP.NumOrp = OOP.NumOrp
+
+            LEFT JOIN E720OPR OPR
+                ON OPR.CodEmp = OOP.CodEmp
+               AND OPR.CodOpr = OOP.CodOpr
+
+            LEFT JOIN E095FOR FORN
+                ON FORN.CodFor = OOP.CodFor
+
+            LEFT JOIN E080SER SER
+                ON SER.CodEmp = OOP.CodEmp
+               AND SER.CodSer = OOP.CodSer
+
+            OUTER APPLY (
+                SELECT TOP 1
+                    Q.CodDer,
+                    Q.UniMed
+                FROM E900QDO Q
+                WHERE Q.CodEmp = OOP.CodEmp
+                  AND Q.CodOri = OOP.CodOri
+                  AND Q.NumOrp = OOP.NumOrp
+                  AND Q.CodPro = COP.CodPro
+                ORDER BY
+                    Q.CodDer
+            ) QDO
+
+            WHERE OOP.CodEmp = ?
+              AND OOP.CodOri = ?
+              AND OOP.NumOrp = ?
+              {filtros_operacoes}
+
+            ORDER BY
+                OOP.CodEtg,
+                OOP.SeqRot
+        """
+
+        cursor.execute(sql_operacoes, params_operacoes)
+        operacoes = _fetch_all_dict(cursor)
+
+        # Próxima operação
+        for index, operacao in enumerate(operacoes):
+            proxima = operacoes[index + 1] if index + 1 < len(operacoes) else None
+            operacao["proxima_operacao"] = proxima.get("cod_opr") if proxima else ""
+            operacao["proxima_operacao_descricao"] = proxima.get("descricao_operacao") if proxima else ""
+            operacao["narrativas"] = []
+
+        # ============================================================
+        # 4) Narrativas
+        # ============================================================
+
+        sql_narrativas = """
+            SELECT
+                NSR.CodEmp AS cod_emp,
+                NSR.CodOri AS cod_ori,
+                NSR.NumOrp AS num_orp,
+                NSR.CodEtg AS cod_etg,
+                NSR.SeqRot AS seq_rot,
+                NSR.SeqNsr AS seq_nsr,
+                NSR.DesNsr AS narrativa
+            FROM E900NSR NSR
+            WHERE NSR.CodEmp = ?
+              AND NSR.CodOri = ?
+              AND NSR.NumOrp = ?
+            ORDER BY
+                NSR.CodEtg,
+                NSR.SeqRot,
+                NSR.SeqNsr
+        """
+
+        cursor.execute(sql_narrativas, [cod_emp, cod_ori, num_orp])
+        narrativas = _fetch_all_dict(cursor)
+
+        narrativas_por_operacao = {}
+        for narrativa in narrativas:
+            chave = f"{narrativa.get('cod_etg')}|{narrativa.get('seq_rot')}"
+            narrativas_por_operacao.setdefault(chave, []).append(narrativa.get("narrativa") or "")
+
+        for operacao in operacoes:
+            chave = f"{operacao.get('cod_etg')}|{operacao.get('seq_rot')}"
+            operacao["narrativas"] = narrativas_por_operacao.get(chave, [])
+
+        # ============================================================
+        # 5) Observações da OP
+        # ============================================================
+
+        sql_observacoes = """
+            SELECT
+                OBS.CodEmp AS cod_emp,
+                OBS.CodOri AS cod_ori,
+                OBS.NumOrp AS num_orp,
+                OBS.TipObs AS tipo_observacao,
+                OBS.SeqObs AS sequencia,
+                OBS.DesObs AS observacao
+            FROM E900OBS OBS
+            WHERE OBS.CodEmp = ?
+              AND OBS.CodOri = ?
+              AND OBS.NumOrp = ?
+            ORDER BY
+                OBS.TipObs,
+                OBS.SeqObs
+        """
+
+        cursor.execute(sql_observacoes, [cod_emp, cod_ori, num_orp])
+        observacoes = _fetch_all_dict(cursor)
+
+        mensagem_responsabilidade = (
+            "Ao finalizar o apontamento o operador estará se responsabilizando pela quantidade "
+            "e qualidade dos produtos informados."
+        )
+
+        return {
+            "atualizado_em": datetime.now().isoformat(),
+            "parametros": {
+                "cod_emp": cod_emp,
+                "cod_ori": cod_ori,
+                "num_orp": num_orp,
+                "listar_componentes": listar_componentes,
+                "listar_desenho": listar_desenho,
+                "cod_etg": cod_etg,
+                "cod_cre": cod_cre,
+            },
+            "cabecalho": cabecalho,
+            "componentes": componentes,
+            "operacoes": operacoes,
+            "observacoes": observacoes,
+            "mensagem_responsabilidade": mensagem_responsabilidade,
+            "layout_referencia": "MCAP700.GER - GENIUS - Ordem de Produção p/ Operações",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao consultar impressão da Ordem de Produção: {str(exc)}",
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 # ============================================================
