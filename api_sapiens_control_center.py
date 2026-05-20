@@ -19,7 +19,24 @@ import csv
 import json
 import re
 import unicodedata
+import mimetypes
 from pathlib import Path
+from urllib.parse import quote
+
+# Opcionais para metadados de imagens/PDFs dos desenhos da OP.
+# Se nao estiverem instalados, o codigo segue retornando metadata vazia.
+try:
+    from PIL import Image  # Pillow
+except Exception:
+    Image = None  # type: ignore
+
+try:
+    from pypdf import PdfReader  # pypdf
+except Exception:
+    try:
+        from PyPDF2 import PdfReader  # fallback para PyPDF2 antigo
+    except Exception:
+        PdfReader = None  # type: ignore
 import requests
 from xml.sax.saxutils import escape as xml_escape
 import xml.etree.ElementTree as ET
@@ -47,10 +64,17 @@ SUPABASE_NAVEGACAO_TABLE = os.getenv("SUPABASE_NAVEGACAO_TABLE", "usu_log_navega
 
 # =========================================
 # Pasta de desenhos da OP (MCAP700)
-# Pode ser sobrescrita por env var PASTA_DESENHOS_OP ou pelo parametro
-# `pasta_desenhos` em cada chamada de impressao.
+# - Padrao: caminho UNC do file server da Senior (so funciona se a API
+#   estiver no Windows com acesso ao share, ou em Linux com o share
+#   montado em algum mountpoint).
+# - Pode ser sobrescrita por env var PASTA_DESENHOS_OP (recomendado em
+#   producao Docker/Linux, ex.: PASTA_DESENHOS_OP=/mnt/desenhos_op).
+# - Tambem pode ser sobrescrita por chamada via parametro `pasta_desenhos`.
 # =========================================
-PASTA_DESENHOS_OP_PADRAO = os.getenv("PASTA_DESENHOS_OP", "/mnt/desenhos_op")
+PASTA_DESENHOS_OP_PADRAO = os.getenv(
+    "PASTA_DESENHOS_OP",
+    r"\\EZORTEA-SRVSENI\Senior\Sapiens\Pasta de Desenho\02-JPG_OP",
+)
 
 GENIUS_ORIGENS = (
     '110', '120', '130', '135', '140', '150',
@@ -13777,61 +13801,161 @@ def _to_int_or_none(valor, nome_campo: str, default: Optional[int] = None) -> Op
         )
 
 
-def localizar_desenhos_produto(
-    cod_pro,
-    pasta_desenhos: Optional[str] = None,
-):
-    """Localiza desenhos JPG/JPEG/PNG do produto na pasta informada.
+FORMATOS_DESENHO_PERMITIDOS = {
+    ".jpg": "JPG",
+    ".jpeg": "JPG",
+    ".png": "PNG",
+    ".pdf": "PDF",
+}
 
-    Padroes procurados (nesta ordem):
+
+def _normalizar_formatos_desenho(formatos):
+    """Converte uma string como 'JPG,PNG,PDF' em set de extensoes ('.jpg','.png','.pdf').
+
+    Aceita ',' ou ';' como separador. Vazio/None -> aceita todos.
+    """
+    if not formatos:
+        return set(FORMATOS_DESENHO_PERMITIDOS.keys())
+
+    mapa = {
+        "JPG": [".jpg", ".jpeg"],
+        "JPEG": [".jpg", ".jpeg"],
+        "PNG": [".png"],
+        "PDF": [".pdf"],
+    }
+
+    permitidos = set()
+    for item in str(formatos).replace(";", ",").split(","):
+        chave = item.strip().upper()
+        for ext in mapa.get(chave, []):
+            permitidos.add(ext)
+
+    return permitidos or set(FORMATOS_DESENHO_PERMITIDOS.keys())
+
+
+def _metadata_arquivo_desenho(caminho: Path):
+    """Lê dimensoes/paginas/orientacao do desenho.
+
+    - Imagens (.jpg/.jpeg/.png) via Pillow (se instalado).
+    - PDFs via pypdf (se instalado) — usa apenas a primeira pagina.
+
+    Se a biblioteca nao estiver instalada ou o arquivo nao puder ser lido,
+    devolve metadata neutra (orientacao=DESCONHECIDA, rotacao=0).
+    """
+    ext = caminho.suffix.lower()
+    largura = None
+    altura = None
+    paginas = None
+    orientacao = "DESCONHECIDA"
+    rotacao_recomendada = 0
+
+    try:
+        if ext in [".jpg", ".jpeg", ".png"] and Image is not None:
+            with Image.open(caminho) as img:
+                largura, altura = img.size
+        elif ext == ".pdf" and PdfReader is not None:
+            reader = PdfReader(str(caminho))
+            paginas = len(reader.pages)
+            if paginas > 0:
+                box = reader.pages[0].mediabox
+                largura = float(box.width)
+                altura = float(box.height)
+    except Exception:
+        pass
+
+    if largura and altura:
+        if largura > altura:
+            orientacao = "PAISAGEM"
+            rotacao_recomendada = 90
+        else:
+            orientacao = "RETRATO"
+            rotacao_recomendada = 0
+
+    return {
+        "largura": largura,
+        "altura": altura,
+        "paginas": paginas,
+        "orientacao": orientacao,
+        "rotacao_recomendada": rotacao_recomendada,
+        "a4_layout": "RETRATO",
+    }
+
+
+def localizar_desenhos_produto(cod_pro):
+    """Localiza desenhos JPG/JPEG/PNG/PDF do produto na pasta fixa da API.
+
+    A pasta vem de ``PASTA_DESENHOS_OP_PADRAO`` (configurada por env var
+    PASTA_DESENHOS_OP ou hardcoded para o share UNC da Senior). O caller
+    NAO informa pasta — assim evita o front mandar paths invalidos.
+
+    Padroes procurados (nesta ordem de prioridade):
     - <COD_PRO>-1.<ext> ... <COD_PRO>-9.<ext>
     - <COD_PRO>.<ext>
 
-    Onde <ext> ∈ {jpg, jpeg, png}.
+    Onde <ext> ∈ {.jpg, .jpeg, .png, .pdf}. Busca case-insensitive
+    (varre o diretorio uma vez e compara em uppercase).
 
-    Retorna lista de dicts com ``ordem``, ``nome_arquivo``, ``tipo``,
-    ``pasta`` e ``url``. Se a pasta nao existir, retorna lista vazia
-    (silencioso — caller decide como reportar).
+    Cada item retornado inclui metadata de impressao (dimensoes,
+    orientacao, rotacao_recomendada) — Lovable pode usar para
+    rotacao automatica de paisagem ou ignorar.
     """
     cod_pro = str(cod_pro or "").strip()
     if not cod_pro:
         return []
 
-    pasta_base = str(pasta_desenhos or PASTA_DESENHOS_OP_PADRAO).strip()
-    if not pasta_base:
-        return []
-
     try:
-        pasta = Path(pasta_base).resolve()
+        pasta = Path(PASTA_DESENHOS_OP_PADRAO)
     except Exception:
         return []
 
     if not pasta.exists() or not pasta.is_dir():
         return []
 
-    extensoes = [".jpg", ".jpeg", ".png"]
-    desenhos: list = []
+    # Lista de nomes base na ordem de prioridade
+    nomes_base = [f"{cod_pro}-{i}" for i in range(1, 10)]
+    nomes_base.append(cod_pro)
 
-    def _add_se_existe(arquivo: Path) -> None:
-        if arquivo.exists() and arquivo.is_file():
+    # Varre a pasta uma vez (case-insensitive via .upper())
+    try:
+        arquivos = [
+            arq for arq in pasta.iterdir()
+            if arq.is_file() and arq.suffix.lower() in FORMATOS_DESENHO_PERMITIDOS
+        ]
+    except Exception:
+        return []
+
+    desenhos: list = []
+    ja_adicionados = set()
+
+    for nome_base in nomes_base:
+        nb_upper = nome_base.upper()
+        for arquivo in arquivos:
+            if arquivo.stem.upper() != nb_upper:
+                continue
+            if arquivo.name in ja_adicionados:
+                continue
+            ja_adicionados.add(arquivo.name)
+
+            ext = arquivo.suffix.lower()
+            tipo = FORMATOS_DESENHO_PERMITIDOS.get(ext, ext.replace(".", "").upper())
+            metadata = _metadata_arquivo_desenho(arquivo)
+
+            arquivo_encoded = quote(arquivo.name, safe="")
+
             desenhos.append({
                 "ordem": len(desenhos) + 1,
                 "nome_arquivo": arquivo.name,
-                "tipo": arquivo.suffix.replace(".", "").upper(),
-                "pasta": str(pasta),
+                "tipo": tipo,
+                "extensao": ext,
+                "mime_type": mimetypes.guess_type(str(arquivo))[0] or "application/octet-stream",
                 "url": (
                     "/api/producao/ordem-producao/desenho"
-                    f"?pasta={str(pasta)}"
-                    f"&arquivo={arquivo.name}"
+                    f"?arquivo={arquivo_encoded}"
                 ),
+                "imprimir_em_nova_pagina": True,
+                "iniciar_apos_op": True,
+                **metadata,
             })
-
-    for i in range(1, 10):
-        for ext in extensoes:
-            _add_se_existe(pasta / f"{cod_pro}-{i}{ext}")
-
-    for ext in extensoes:
-        _add_se_existe(pasta / f"{cod_pro}{ext}")
 
     return desenhos
 
@@ -13839,53 +13963,119 @@ def localizar_desenhos_produto(
 @app.get("/api/producao/ordem-producao/desenho")
 def obter_desenho_ordem_producao(
     arquivo: str,
-    pasta: Optional[str] = None,
     usuario=Depends(validar_token),
 ):
-    """Retorna um desenho (JPG/JPEG/PNG) da pasta informada.
+    """Retorna um desenho (JPG/JPEG/PNG/PDF) da pasta FIXA da API.
 
-    Bloqueia path traversal e formatos nao permitidos. Se a pasta nao
-    estiver acessivel ao servidor (caminho local do front, share Windows
-    nao montado etc.), responde 404.
+    Sem parametro `pasta` — sempre usa ``PASTA_DESENHOS_OP_PADRAO``.
+    Bloqueia path traversal (``os.path.basename`` no nome do arquivo)
+    e formatos nao permitidos.
     """
     nome_arquivo = os.path.basename(str(arquivo or "").strip())
     if not nome_arquivo:
         raise HTTPException(status_code=422, detail="Arquivo não informado.")
 
-    pasta_base = str(pasta or PASTA_DESENHOS_OP_PADRAO).strip()
-    if not pasta_base:
-        raise HTTPException(status_code=422, detail="Pasta de desenhos não informada.")
-
     try:
-        pasta_resolvida = Path(pasta_base).resolve()
+        pasta = Path(PASTA_DESENHOS_OP_PADRAO)
     except Exception:
         raise HTTPException(
-            status_code=422,
-            detail=f"Pasta de desenhos inválida: {pasta_base}",
+            status_code=500,
+            detail=f"Pasta de desenhos configurada eh invalida: {PASTA_DESENHOS_OP_PADRAO}",
         )
 
-    if not pasta_resolvida.exists() or not pasta_resolvida.is_dir():
+    if not pasta.exists() or not pasta.is_dir():
         raise HTTPException(
             status_code=404,
-            detail=f"Pasta de desenhos não encontrada: {str(pasta_resolvida)}",
+            detail=(
+                "Pasta de desenhos não encontrada ou inacessível pela API: "
+                f"{str(pasta)}"
+            ),
         )
 
-    caminho = (pasta_resolvida / nome_arquivo).resolve()
-
-    # Seguranca: impede ../ ou tentativa de acessar arquivo fora da pasta.
-    if not str(caminho).startswith(str(pasta_resolvida)):
-        raise HTTPException(status_code=403, detail="Caminho inválido.")
+    caminho = pasta / nome_arquivo
 
     if not caminho.exists() or not caminho.is_file():
-        raise HTTPException(status_code=404, detail="Desenho não encontrado.")
-
-    if caminho.suffix.lower() not in [".jpg", ".jpeg", ".png"]:
         raise HTTPException(
-            status_code=422,
-            detail="Formato de desenho não permitido. Use JPG, JPEG ou PNG.",
+            status_code=404,
+            detail=f"Desenho não encontrado: {nome_arquivo}",
         )
 
-    return FileResponse(str(caminho))
+    if caminho.suffix.lower() not in [".jpg", ".jpeg", ".png", ".pdf"]:
+        raise HTTPException(
+            status_code=422,
+            detail="Formato não permitido. Use JPG, JPEG, PNG ou PDF.",
+        )
+
+    media_type = mimetypes.guess_type(str(caminho))[0] or "application/octet-stream"
+
+    return FileResponse(
+        str(caminho),
+        media_type=media_type,
+        filename=caminho.name,
+    )
+
+
+@app.get("/api/producao/ordem-producao/desenhos/diagnostico")
+def diagnosticar_desenhos_op(
+    cod_pro: str,
+    usuario=Depends(validar_token),
+):
+    """Diagnostico de acesso aa pasta de desenhos da OP.
+
+    Util quando o front pergunta "por que nao vem desenho?" — devolve:
+    - pasta configurada
+    - se a pasta existe / e diretorio
+    - lista de nomes/extensoes que a API tentou casar
+    - lista do que efetivamente encontrou (rodando o helper de verdade)
+    """
+    try:
+        pasta = Path(PASTA_DESENHOS_OP_PADRAO)
+        pasta_existe = pasta.exists()
+        pasta_dir = pasta.is_dir() if pasta_existe else False
+    except Exception:
+        pasta = None
+        pasta_existe = False
+        pasta_dir = False
+
+    cod_pro_s = str(cod_pro or "").strip()
+
+    candidatos = []
+    if cod_pro_s:
+        nomes = [f"{cod_pro_s}-{i}" for i in range(1, 10)] + [cod_pro_s]
+        for nome in nomes:
+            for ext in [".jpg", ".jpeg", ".png", ".pdf",
+                        ".JPG", ".JPEG", ".PNG", ".PDF"]:
+                candidatos.append(f"{nome}{ext}")
+
+    desenhos = []
+    arquivos_na_pasta = []
+    if pasta_existe and pasta_dir:
+        try:
+            arquivos_na_pasta = sorted(
+                arq.name for arq in pasta.iterdir() if arq.is_file()
+            )[:200]  # limita pra nao explodir a resposta
+        except Exception:
+            arquivos_na_pasta = []
+        if cod_pro_s:
+            desenhos = localizar_desenhos_produto(cod_pro_s)
+
+    return {
+        "cod_pro": cod_pro_s,
+        "pasta_configurada": str(pasta) if pasta is not None else None,
+        "pasta_existe": pasta_existe,
+        "pasta_eh_diretorio": pasta_dir,
+        "total_arquivos_na_pasta": len(arquivos_na_pasta),
+        "amostra_arquivos_na_pasta": arquivos_na_pasta[:50],
+        "candidatos_testados": candidatos,
+        "desenhos_encontrados": desenhos,
+        "observacao": (
+            "Se pasta_existe=false, problema esta no acesso da API ao share "
+            "(monte o UNC em /mnt/desenhos_op em Linux/Docker e setar env "
+            "PASTA_DESENHOS_OP). Se pasta_existe=true mas desenhos_encontrados=[], "
+            "veja amostra_arquivos_na_pasta para conferir se o cod_pro casa com "
+            "algum nome no padrao CODPRO ou CODPRO-N."
+        ),
+    }
 
 
 def _consultar_dados_impressao_op(
@@ -13898,7 +14088,7 @@ def _consultar_dados_impressao_op(
     cod_cre,
     conn,
     incluir_desenhos: str = "N",
-    pasta_desenhos: Optional[str] = None,
+    quebrar_por_operacao: str = "N",
 ):
     """Coleta os dados de UMA OP no formato MCAP700.
 
@@ -14192,8 +14382,17 @@ def _consultar_dados_impressao_op(
         if str(incluir_desenhos or "N").upper().strip() == "S":
             desenhos = localizar_desenhos_produto(
                 cod_pro=cabecalho.get("produto"),
-                pasta_desenhos=pasta_desenhos,
             )
+
+        quebrar_op_flag = str(quebrar_por_operacao or "N").upper().strip() == "S"
+
+        # Layout dos componentes: se houver mais de LIMITE itens, o Lovable
+        # deve renderizar a Relacao de Componentes Necessarios em pagina
+        # separada (com cabecalho da OP repetido). API so devolve a flag —
+        # a quebra fisica e responsabilidade do front (CSS @media print).
+        LIMITE_COMPONENTES_PRIMEIRA_PAGINA = 7
+        total_componentes = len(componentes or [])
+        quebrar_componentes_flag = total_componentes > LIMITE_COMPONENTES_PRIMEIRA_PAGINA
 
         return {
             "cabecalho": cabecalho,
@@ -14203,6 +14402,16 @@ def _consultar_dados_impressao_op(
             "desenhos": desenhos,
             "mensagem_responsabilidade": mensagem_responsabilidade,
             "layout_referencia": "MCAP700.GER - GENIUS - Ordem de Produção p/ Operações",
+            "modo_impressao": {
+                "quebrar_por_operacao": quebrar_op_flag,
+                "desenhos_apos_op": True,
+                "a4": True,
+            },
+            "layout_componentes": {
+                "total_componentes": total_componentes,
+                "limite_componentes_primeira_pagina": LIMITE_COMPONENTES_PRIMEIRA_PAGINA,
+                "quebrar_componentes_em_pagina_separada": quebrar_componentes_flag,
+            },
             "parametros": {
                 "cod_emp": cod_emp,
                 "cod_ori": cod_ori,
@@ -14212,7 +14421,8 @@ def _consultar_dados_impressao_op(
                 "cod_etg": cod_etg,
                 "cod_cre": cod_cre,
                 "incluir_desenhos": (incluir_desenhos or "N").upper().strip() or "N",
-                "pasta_desenhos": pasta_desenhos,
+                "pasta_desenhos_servidor": str(Path(PASTA_DESENHOS_OP_PADRAO)),
+                "quebrar_por_operacao": "S" if quebrar_op_flag else "N",
             },
         }
     except HTTPException:
@@ -14229,7 +14439,7 @@ def consultar_ordem_producao_impressao(
     cod_etg: Optional[str] = None,
     cod_cre: Optional[str] = None,
     incluir_desenhos: Optional[str] = "N",
-    pasta_desenhos: Optional[str] = None,
+    quebrar_por_operacao: Optional[str] = "N",
     usuario=Depends(validar_token),
 ):
     """
@@ -14262,10 +14472,9 @@ def consultar_ordem_producao_impressao(
     listar_componentes = (listar_componentes or "S").upper().strip() or "S"
     listar_desenho = (listar_desenho or "N").upper().strip() or "N"
     incluir_desenhos = (incluir_desenhos or "N").upper().strip() or "N"
+    quebrar_por_operacao = (quebrar_por_operacao or "N").upper().strip() or "N"
     if cod_cre is not None:
         cod_cre = str(cod_cre).strip() or None
-    if pasta_desenhos is not None:
-        pasta_desenhos = str(pasta_desenhos).strip() or None
 
     conn = get_connection()
     try:
@@ -14279,7 +14488,7 @@ def consultar_ordem_producao_impressao(
             cod_cre=cod_cre,
             conn=conn,
             incluir_desenhos=incluir_desenhos,
-            pasta_desenhos=pasta_desenhos,
+            quebrar_por_operacao=quebrar_por_operacao,
         )
     except HTTPException:
         raise
@@ -14324,7 +14533,7 @@ def consultar_ordens_producao_impressao_lote(
     listar_componentes: Optional[str] = "S",
     listar_desenho: Optional[str] = "N",
     incluir_desenhos: Optional[str] = "N",
-    pasta_desenhos: Optional[str] = None,
+    quebrar_por_operacao: Optional[str] = "N",
     usuario=Depends(validar_token),
 ):
     """
@@ -14343,12 +14552,11 @@ def consultar_ordens_producao_impressao_lote(
         sit_orp = str(sit_orp).strip().upper() or None
     if cod_cre is not None:
         cod_cre = str(cod_cre).strip() or None
-    if pasta_desenhos is not None:
-        pasta_desenhos = str(pasta_desenhos).strip() or None
 
     listar_componentes = (listar_componentes or "S").upper().strip() or "S"
     listar_desenho = (listar_desenho or "N").upper().strip() or "N"
     incluir_desenhos = (incluir_desenhos or "N").upper().strip() or "N"
+    quebrar_por_operacao = (quebrar_por_operacao or "N").upper().strip() or "N"
 
     tem_pedido = num_ped_int is not None and num_ped_int > 0
     tem_relprd = bool(rel_prd)
@@ -14454,7 +14662,7 @@ def consultar_ordens_producao_impressao_lote(
                 cod_cre=cod_cre,
                 conn=conn,
                 incluir_desenhos=incluir_desenhos,
-                pasta_desenhos=pasta_desenhos,
+                quebrar_por_operacao=quebrar_por_operacao,
             )
 
             if dados_op:
@@ -14463,6 +14671,11 @@ def consultar_ordens_producao_impressao_lote(
         return {
             "atualizado_em": datetime.now().isoformat(),
             "quantidade_ops": len(ordens),
+            "modo_impressao": {
+                "quebrar_por_operacao": quebrar_por_operacao == "S",
+                "desenhos_apos_op": True,
+                "a4": True,
+            },
             "filtros_aplicados": {
                 "cod_emp": cod_emp_int,
                 "num_ped": num_ped_int,
@@ -14473,7 +14686,8 @@ def consultar_ordens_producao_impressao_lote(
                 "listar_componentes": listar_componentes,
                 "listar_desenho": listar_desenho,
                 "incluir_desenhos": incluir_desenhos,
-                "pasta_desenhos": pasta_desenhos,
+                "pasta_desenhos_servidor": str(Path(PASTA_DESENHOS_OP_PADRAO)),
+                "quebrar_por_operacao": quebrar_por_operacao,
             },
             "ordens": ordens,
         }
