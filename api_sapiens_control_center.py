@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends, Body, Query, Request
-from fastapi.responses import HTMLResponse, StreamingResponse, Response
+from fastapi.responses import HTMLResponse, StreamingResponse, Response, FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 import pyodbc
@@ -19,6 +19,7 @@ import csv
 import json
 import re
 import unicodedata
+from pathlib import Path
 import requests
 from xml.sax.saxutils import escape as xml_escape
 import xml.etree.ElementTree as ET
@@ -43,6 +44,13 @@ EMPRESA_PADRAO = 1
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_NAVEGACAO_TABLE = os.getenv("SUPABASE_NAVEGACAO_TABLE", "usu_log_navegacao_erp")
+
+# =========================================
+# Pasta de desenhos da OP (MCAP700)
+# Pode ser sobrescrita por env var PASTA_DESENHOS_OP ou pelo parametro
+# `pasta_desenhos` em cada chamada de impressao.
+# =========================================
+PASTA_DESENHOS_OP_PADRAO = os.getenv("PASTA_DESENHOS_OP", "/mnt/desenhos_op")
 
 GENIUS_ORIGENS = (
     '110', '120', '130', '135', '140', '150',
@@ -13742,30 +13750,165 @@ def _fetch_one_dict(cursor):
     return {columns[i]: _json_value(row[i]) for i in range(len(columns))}
 
 
-@app.get("/api/producao/ordem-producao/impressao")
-def consultar_ordem_producao_impressao(
-    cod_emp: int = 1,
-    cod_ori: str = "210",
-    num_orp: int = 0,
-    listar_componentes: str = "S",
-    listar_desenho: str = "N",
-    cod_etg: Optional[int] = None,
-    cod_cre: Optional[str] = None,
+def _to_int_or_none(valor, nome_campo: str, default: Optional[int] = None) -> Optional[int]:
+    """Converte querystring -> int de forma tolerante.
+    - None ou string vazia -> retorna ``default``
+    - "123" / " 123 " -> 123
+    - inteiro -> retorna como int
+    - qualquer outra coisa -> HTTPException(422) com mensagem clara
+    """
+    if valor is None:
+        return default
+    if isinstance(valor, bool):
+        return int(valor)
+    if isinstance(valor, int):
+        return valor
+    s = str(valor).strip()
+    if s == "":
+        return default
+    # tolera milhar com ponto: "1.234"
+    s_norm = s.replace(".", "") if s.count(".") and s.replace(".", "").isdigit() else s
+    try:
+        return int(s_norm)
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Filtro '{nome_campo}' inválido: '{valor}'. Esperado número inteiro.",
+        )
+
+
+def localizar_desenhos_produto(
+    cod_pro,
+    pasta_desenhos: Optional[str] = None,
+):
+    """Localiza desenhos JPG/JPEG/PNG do produto na pasta informada.
+
+    Padroes procurados (nesta ordem):
+    - <COD_PRO>-1.<ext> ... <COD_PRO>-9.<ext>
+    - <COD_PRO>.<ext>
+
+    Onde <ext> ∈ {jpg, jpeg, png}.
+
+    Retorna lista de dicts com ``ordem``, ``nome_arquivo``, ``tipo``,
+    ``pasta`` e ``url``. Se a pasta nao existir, retorna lista vazia
+    (silencioso — caller decide como reportar).
+    """
+    cod_pro = str(cod_pro or "").strip()
+    if not cod_pro:
+        return []
+
+    pasta_base = str(pasta_desenhos or PASTA_DESENHOS_OP_PADRAO).strip()
+    if not pasta_base:
+        return []
+
+    try:
+        pasta = Path(pasta_base).resolve()
+    except Exception:
+        return []
+
+    if not pasta.exists() or not pasta.is_dir():
+        return []
+
+    extensoes = [".jpg", ".jpeg", ".png"]
+    desenhos: list = []
+
+    def _add_se_existe(arquivo: Path) -> None:
+        if arquivo.exists() and arquivo.is_file():
+            desenhos.append({
+                "ordem": len(desenhos) + 1,
+                "nome_arquivo": arquivo.name,
+                "tipo": arquivo.suffix.replace(".", "").upper(),
+                "pasta": str(pasta),
+                "url": (
+                    "/api/producao/ordem-producao/desenho"
+                    f"?pasta={str(pasta)}"
+                    f"&arquivo={arquivo.name}"
+                ),
+            })
+
+    for i in range(1, 10):
+        for ext in extensoes:
+            _add_se_existe(pasta / f"{cod_pro}-{i}{ext}")
+
+    for ext in extensoes:
+        _add_se_existe(pasta / f"{cod_pro}{ext}")
+
+    return desenhos
+
+
+@app.get("/api/producao/ordem-producao/desenho")
+def obter_desenho_ordem_producao(
+    arquivo: str,
+    pasta: Optional[str] = None,
     usuario=Depends(validar_token),
 ):
+    """Retorna um desenho (JPG/JPEG/PNG) da pasta informada.
+
+    Bloqueia path traversal e formatos nao permitidos. Se a pasta nao
+    estiver acessivel ao servidor (caminho local do front, share Windows
+    nao montado etc.), responde 404.
     """
-    Retorna os dados da Ordem de Produção no padrão do relatório MCAP700.GER.
-    Usado pelo Lovable para visualizar, imprimir e gerar PDF da OP.
+    nome_arquivo = os.path.basename(str(arquivo or "").strip())
+    if not nome_arquivo:
+        raise HTTPException(status_code=422, detail="Arquivo não informado.")
+
+    pasta_base = str(pasta or PASTA_DESENHOS_OP_PADRAO).strip()
+    if not pasta_base:
+        raise HTTPException(status_code=422, detail="Pasta de desenhos não informada.")
+
+    try:
+        pasta_resolvida = Path(pasta_base).resolve()
+    except Exception:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Pasta de desenhos inválida: {pasta_base}",
+        )
+
+    if not pasta_resolvida.exists() or not pasta_resolvida.is_dir():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Pasta de desenhos não encontrada: {str(pasta_resolvida)}",
+        )
+
+    caminho = (pasta_resolvida / nome_arquivo).resolve()
+
+    # Seguranca: impede ../ ou tentativa de acessar arquivo fora da pasta.
+    if not str(caminho).startswith(str(pasta_resolvida)):
+        raise HTTPException(status_code=403, detail="Caminho inválido.")
+
+    if not caminho.exists() or not caminho.is_file():
+        raise HTTPException(status_code=404, detail="Desenho não encontrado.")
+
+    if caminho.suffix.lower() not in [".jpg", ".jpeg", ".png"]:
+        raise HTTPException(
+            status_code=422,
+            detail="Formato de desenho não permitido. Use JPG, JPEG ou PNG.",
+        )
+
+    return FileResponse(str(caminho))
+
+
+def _consultar_dados_impressao_op(
+    cod_emp,
+    cod_ori,
+    num_orp,
+    listar_componentes,
+    listar_desenho,
+    cod_etg,
+    cod_cre,
+    conn,
+    incluir_desenhos: str = "N",
+    pasta_desenhos: Optional[str] = None,
+):
+    """Coleta os dados de UMA OP no formato MCAP700.
+
+    Reutilizado pelo endpoint individual /impressao e pelo endpoint em lote
+    /impressao/lote — por isso recebe ``conn`` aberta e NAO gerencia
+    o ciclo de vida da conexao.
+
+    Retorna o dict da OP ou ``None`` se a OP nao existe (ou e cancelada/origem 100,
+    bloqueadas no proprio SELECT do cabecalho).
     """
-
-    if not num_orp:
-        raise HTTPException(status_code=422, detail="Informe o número da O.P.")
-
-    cod_ori = str(cod_ori).strip()
-    listar_componentes = (listar_componentes or "S").upper().strip()
-    listar_desenho = (listar_desenho or "N").upper().strip()
-
-    conn = get_connection()
     cursor = conn.cursor()
 
     try:
@@ -13821,16 +13964,16 @@ def consultar_ordem_producao_impressao(
             WHERE COP.CodEmp = ?
               AND COP.CodOri = ?
               AND COP.NumOrp = ?
+              AND COP.CodOri <> '100'
+              AND COP.SitOrp <> 'C'
         """
 
         cursor.execute(sql_cabecalho, [cod_emp, cod_ori, num_orp])
         cabecalho = _fetch_one_dict(cursor)
 
         if not cabecalho:
-            raise HTTPException(
-                status_code=404,
-                detail=f"O.P. não encontrada. Empresa={cod_emp}, Origem={cod_ori}, OP={num_orp}",
-            )
+            # OP nao encontrada, cancelada ou origem 100 -> caller decide o que fazer
+            return None
 
         # ============================================================
         # 2) Componentes
@@ -14042,8 +14185,24 @@ def consultar_ordem_producao_impressao(
             "e qualidade dos produtos informados."
         )
 
+        # ============================================================
+        # 6) Desenhos (opcional)
+        # ============================================================
+        desenhos = []
+        if str(incluir_desenhos or "N").upper().strip() == "S":
+            desenhos = localizar_desenhos_produto(
+                cod_pro=cabecalho.get("produto"),
+                pasta_desenhos=pasta_desenhos,
+            )
+
         return {
-            "atualizado_em": datetime.now().isoformat(),
+            "cabecalho": cabecalho,
+            "componentes": componentes,
+            "operacoes": operacoes,
+            "observacoes": observacoes,
+            "desenhos": desenhos,
+            "mensagem_responsabilidade": mensagem_responsabilidade,
+            "layout_referencia": "MCAP700.GER - GENIUS - Ordem de Produção p/ Operações",
             "parametros": {
                 "cod_emp": cod_emp,
                 "cod_ori": cod_ori,
@@ -14052,13 +14211,271 @@ def consultar_ordem_producao_impressao(
                 "listar_desenho": listar_desenho,
                 "cod_etg": cod_etg,
                 "cod_cre": cod_cre,
+                "incluir_desenhos": (incluir_desenhos or "N").upper().strip() or "N",
+                "pasta_desenhos": pasta_desenhos,
             },
-            "cabecalho": cabecalho,
-            "componentes": componentes,
-            "operacoes": operacoes,
-            "observacoes": observacoes,
-            "mensagem_responsabilidade": mensagem_responsabilidade,
-            "layout_referencia": "MCAP700.GER - GENIUS - Ordem de Produção p/ Operações",
+        }
+    except HTTPException:
+        raise
+
+
+@app.get("/api/producao/ordem-producao/impressao")
+def consultar_ordem_producao_impressao(
+    cod_emp: Optional[str] = "1",
+    cod_ori: Optional[str] = "210",
+    num_orp: Optional[str] = None,
+    listar_componentes: Optional[str] = "S",
+    listar_desenho: Optional[str] = "N",
+    cod_etg: Optional[str] = None,
+    cod_cre: Optional[str] = None,
+    incluir_desenhos: Optional[str] = "N",
+    pasta_desenhos: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    """
+    Retorna os dados de UMA Ordem de Produção no padrão do relatório MCAP700.GER.
+    Usado pelo Lovable para visualizar, imprimir e gerar PDF da OP.
+
+    Regras (MCAP700):
+    - Origem 100 nao eh impressa (422).
+    - OP cancelada (SitOrp = 'C') nao eh impressa (retorna 404).
+    """
+
+    # Conversao tolerante de querystring (aceita "", " ", None)
+    cod_emp = _to_int_or_none(cod_emp, "cod_emp", default=1) or 1
+    num_orp = _to_int_or_none(num_orp, "num_orp", default=None)
+    cod_etg = _to_int_or_none(cod_etg, "cod_etg", default=None)
+
+    if not num_orp:
+        raise HTTPException(status_code=422, detail="Informe o número da O.P.")
+
+    cod_ori = str(cod_ori or "").strip()
+    if not cod_ori:
+        raise HTTPException(status_code=422, detail="Informe a Origem (cod_ori).")
+
+    if cod_ori == "100":
+        raise HTTPException(
+            status_code=422,
+            detail="Origem 100 não deve ser usada na impressão de Ordem de Produção.",
+        )
+
+    listar_componentes = (listar_componentes or "S").upper().strip() or "S"
+    listar_desenho = (listar_desenho or "N").upper().strip() or "N"
+    incluir_desenhos = (incluir_desenhos or "N").upper().strip() or "N"
+    if cod_cre is not None:
+        cod_cre = str(cod_cre).strip() or None
+    if pasta_desenhos is not None:
+        pasta_desenhos = str(pasta_desenhos).strip() or None
+
+    conn = get_connection()
+    try:
+        dados = _consultar_dados_impressao_op(
+            cod_emp=cod_emp,
+            cod_ori=cod_ori,
+            num_orp=num_orp,
+            listar_componentes=listar_componentes,
+            listar_desenho=listar_desenho,
+            cod_etg=cod_etg,
+            cod_cre=cod_cre,
+            conn=conn,
+            incluir_desenhos=incluir_desenhos,
+            pasta_desenhos=pasta_desenhos,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao consultar impressão da Ordem de Produção: {str(exc)}",
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if not dados:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"O.P. não encontrada, cancelada ou em origem bloqueada. "
+                f"Empresa={cod_emp}, Origem={cod_ori}, OP={num_orp}"
+            ),
+        )
+
+    return {
+        "atualizado_em": datetime.now().isoformat(),
+        **dados,
+    }
+
+
+@app.get("/api/producao/ordem-producao/impressao/lote")
+def consultar_ordens_producao_impressao_lote(
+    cod_emp: Optional[str] = "1",
+    num_ped: Optional[str] = None,
+    rel_prd: Optional[str] = None,
+    sit_orp: Optional[str] = None,
+    cod_etg: Optional[str] = None,
+    cod_cre: Optional[str] = None,
+    listar_componentes: Optional[str] = "S",
+    listar_desenho: Optional[str] = "N",
+    incluir_desenhos: Optional[str] = "N",
+    pasta_desenhos: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    """
+    Retorna varias OPs para impressao em lote.
+    Usar Pedido OU Relatorio de Producao (alternativos).
+    Nunca retorna OP cancelada nem origem 100.
+    """
+
+    cod_emp_int = _to_int_or_none(cod_emp, "cod_emp", default=1) or 1
+    num_ped_int = _to_int_or_none(num_ped, "num_ped", default=None)
+    cod_etg_int = _to_int_or_none(cod_etg, "cod_etg", default=None)
+
+    if rel_prd is not None:
+        rel_prd = str(rel_prd).strip() or None
+    if sit_orp is not None:
+        sit_orp = str(sit_orp).strip().upper() or None
+    if cod_cre is not None:
+        cod_cre = str(cod_cre).strip() or None
+    if pasta_desenhos is not None:
+        pasta_desenhos = str(pasta_desenhos).strip() or None
+
+    listar_componentes = (listar_componentes or "S").upper().strip() or "S"
+    listar_desenho = (listar_desenho or "N").upper().strip() or "N"
+    incluir_desenhos = (incluir_desenhos or "N").upper().strip() or "N"
+
+    tem_pedido = num_ped_int is not None and num_ped_int > 0
+    tem_relprd = bool(rel_prd)
+    tem_estagio = cod_etg_int is not None
+    tem_centro = bool(cod_cre)
+
+    # Exige pelo menos um filtro especifico (alem de cod_emp) para evitar
+    # imprimir TODA a base por engano. Aceitos: Pedido, Relatorio de Producao,
+    # Estagio ou Centro de Recurso (combinados a vontade, salvo Pedido+RelPrd).
+    if not (tem_pedido or tem_relprd or tem_estagio or tem_centro):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Informe pelo menos um filtro para impressão em lote: "
+                "Pedido, Relatório de Produção, Estágio ou Centro de Recurso."
+            ),
+        )
+
+    if tem_pedido and tem_relprd:
+        raise HTTPException(
+            status_code=422,
+            detail="Use Pedido ou Relatório de Produção, não os dois ao mesmo tempo.",
+        )
+
+    if sit_orp == "C":
+        raise HTTPException(
+            status_code=422,
+            detail="OP cancelada não deve ser impressa.",
+        )
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+        where = [
+            "COP.CodEmp = ?",
+            "COP.CodOri <> '100'",
+            "COP.SitOrp <> 'C'",
+        ]
+        params: list = [cod_emp_int]
+
+        if tem_pedido:
+            where.append("COP.NumPed = ?")
+            params.append(num_ped_int)
+
+        if tem_relprd:
+            where.append("COP.RelPrd = ?")
+            params.append(rel_prd)
+
+        if sit_orp:
+            where.append("COP.SitOrp = ?")
+            params.append(sit_orp)
+
+        # Refinamento por Estagio e/ou Centro de Recurso via EXISTS na
+        # E900OOP — mantem coerencia com a grid do /opcoes e com o relatorio
+        # Senior MCAP700.
+        if cod_etg_int is not None or (cod_cre and str(cod_cre).strip()):
+            exists_clauses = [
+                "OOPF.CodEmp = COP.CodEmp",
+                "OOPF.CodOri = COP.CodOri",
+                "OOPF.NumOrp = COP.NumOrp",
+            ]
+            if cod_etg_int is not None:
+                exists_clauses.append("OOPF.CodEtg = ?")
+                params.append(int(cod_etg_int))
+            if cod_cre and str(cod_cre).strip():
+                exists_clauses.append("OOPF.CodCre = ?")
+                params.append(str(cod_cre).strip())
+            where.append(
+                "EXISTS (SELECT 1 FROM E900OOP OOPF WHERE "
+                + " AND ".join(exists_clauses)
+                + ")"
+            )
+
+        sql_ops = f"""
+            SELECT
+                COP.CodEmp,
+                COP.CodOri,
+                COP.NumOrp
+            FROM E900COP COP
+            WHERE {" AND ".join(where)}
+            ORDER BY
+                COP.CodOri,
+                COP.NumOrp
+        """
+
+        cursor.execute(sql_ops, params)
+        ops_basicas = cursor.fetchall()
+
+        ordens = []
+        for row in ops_basicas:
+            cod_emp_op = row[0]
+            cod_ori_op = (row[1] or "").strip() if isinstance(row[1], str) else row[1]
+            num_orp_op = row[2]
+
+            dados_op = _consultar_dados_impressao_op(
+                cod_emp=int(cod_emp_op) if cod_emp_op is not None else cod_emp_int,
+                cod_ori=str(cod_ori_op),
+                num_orp=int(num_orp_op),
+                listar_componentes=listar_componentes,
+                listar_desenho=listar_desenho,
+                cod_etg=cod_etg_int,
+                cod_cre=cod_cre,
+                conn=conn,
+                incluir_desenhos=incluir_desenhos,
+                pasta_desenhos=pasta_desenhos,
+            )
+
+            if dados_op:
+                ordens.append(dados_op)
+
+        return {
+            "atualizado_em": datetime.now().isoformat(),
+            "quantidade_ops": len(ordens),
+            "filtros_aplicados": {
+                "cod_emp": cod_emp_int,
+                "num_ped": num_ped_int,
+                "rel_prd": rel_prd,
+                "sit_orp": sit_orp,
+                "cod_etg": cod_etg_int,
+                "cod_cre": cod_cre,
+                "listar_componentes": listar_componentes,
+                "listar_desenho": listar_desenho,
+                "incluir_desenhos": incluir_desenhos,
+                "pasta_desenhos": pasta_desenhos,
+            },
+            "ordens": ordens,
         }
 
     except HTTPException:
@@ -14066,7 +14483,7 @@ def consultar_ordem_producao_impressao(
     except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"Erro ao consultar impressão da Ordem de Produção: {str(exc)}",
+            detail=f"Erro ao gerar impressão em lote das OPs: {str(exc)}",
         )
     finally:
         try:
@@ -14081,28 +14498,79 @@ def consultar_ordem_producao_impressao(
 
 @app.get("/api/producao/ordem-producao/opcoes")
 def listar_opcoes_impressao_ordem_producao(
-    cod_emp: Optional[int] = None,
+    cod_emp: Optional[str] = None,
     cod_ori: Optional[str] = None,
-    num_orp: Optional[int] = None,
-    cod_etg: Optional[int] = None,
+    num_orp: Optional[str] = None,
+    num_ped: Optional[str] = None,
+    rel_prd: Optional[str] = None,
+    sit_orp: Optional[str] = None,
+    cod_etg: Optional[str] = None,
     cod_cre: Optional[str] = None,
     q: Optional[str] = None,
-    limite_ops: int = 80,
+    limite_ops: Optional[str] = "80",
     usuario=Depends(validar_token),
 ):
     """
     Opções para alimentar os filtros/autocomplete da tela:
     Produção > Impressão de Ordem de Produção.
 
+    Regras (MCAP700):
+    - Nunca listar CodOri = '100'.
+    - Nunca listar OP cancelada (SitOrp = 'C').
+    - Permite buscar OPs por Pedido (E900COP.NumPed) OU
+      Relatório de Produção (E900COP.RelPrd) — alternativos,
+      não podem vir juntos.
+
     Retorna:
     - empresas
     - origens
-    - ordens de produção
-    - estágios
-    - centros de recurso
+    - pedidos
+    - relatorios_producao
+    - situacoes
+    - ordens_producao
+    - estagios
+    - centros_recurso
     """
 
-    limite_ops = max(1, min(int(limite_ops or 80), 200))
+    # Conversao tolerante de querystring (aceita "", " ", None)
+    cod_emp = _to_int_or_none(cod_emp, "cod_emp", default=None)
+    num_orp = _to_int_or_none(num_orp, "num_orp", default=None)
+    num_ped = _to_int_or_none(num_ped, "num_ped", default=None)
+    cod_etg = _to_int_or_none(cod_etg, "cod_etg", default=None)
+    limite_ops_int = _to_int_or_none(limite_ops, "limite_ops", default=80) or 80
+    limite_ops = max(1, min(limite_ops_int, 200))
+
+    if cod_ori is not None:
+        cod_ori = str(cod_ori).strip() or None
+    if cod_cre is not None:
+        cod_cre = str(cod_cre).strip() or None
+    if rel_prd is not None:
+        rel_prd = str(rel_prd).strip() or None
+    if sit_orp is not None:
+        sit_orp = str(sit_orp).strip().upper() or None
+    if q is not None:
+        q = str(q).strip() or None
+
+    # Regra fixa do MCAP700: bloqueia origem 100
+    if cod_ori == "100":
+        raise HTTPException(
+            status_code=422,
+            detail="Origem 100 não deve ser usada na impressão de Ordem de Produção.",
+        )
+
+    # OP cancelada nunca eh impressa
+    if sit_orp == "C":
+        raise HTTPException(
+            status_code=422,
+            detail="OP cancelada não deve ser exibida na Impressão de Ordem de Produção.",
+        )
+
+    # Pedido e Relatório de Produção são alternativos
+    if num_ped is not None and int(num_ped) > 0 and rel_prd:
+        raise HTTPException(
+            status_code=422,
+            detail="Use Pedido ou Relatório de Produção, não os dois ao mesmo tempo.",
+        )
 
     conn = get_connection()
     cursor = conn.cursor()
@@ -14117,6 +14585,10 @@ def listar_opcoes_impressao_ordem_producao(
                     valor = row[i]
                     if isinstance(valor, str):
                         valor = valor.strip()
+                    elif isinstance(valor, Decimal):
+                        valor = float(valor)
+                    elif isinstance(valor, (datetime, date)):
+                        valor = valor.isoformat()
                     item[col] = valor
                 dados.append(item)
             return dados
@@ -14125,32 +14597,84 @@ def listar_opcoes_impressao_ordem_producao(
             where = []
             params = []
 
+            # Regras fixas do MCAP700:
+            # - nunca listar origem 100
+            # - nunca listar OP cancelada
+            where.append(f"{alias_cop}.CodOri <> '100'")
+            where.append(f"{alias_cop}.SitOrp <> 'C'")
+
             if cod_emp is not None:
                 where.append(f"{alias_cop}.CodEmp = ?")
-                params.append(cod_emp)
+                params.append(int(cod_emp))
 
             if cod_ori:
+                origem = str(cod_ori).strip()
+                # Defesa em profundidade: barra origem 100 mesmo que algum
+                # caller interno futuro chame montar_where sem passar pela
+                # validacao do topo do endpoint.
+                if origem == "100":
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Origem 100 não deve ser usada na Impressão de Ordem de Produção.",
+                    )
                 where.append(f"{alias_cop}.CodOri = ?")
-                params.append(str(cod_ori).strip())
+                params.append(origem)
 
-            if num_orp:
+            if num_orp is not None and int(num_orp) > 0:
                 where.append(f"{alias_cop}.NumOrp = ?")
                 params.append(int(num_orp))
+
+            if num_ped is not None and int(num_ped) > 0:
+                where.append(f"{alias_cop}.NumPed = ?")
+                params.append(int(num_ped))
+
+            if rel_prd:
+                where.append(f"{alias_cop}.RelPrd = ?")
+                params.append(str(rel_prd).strip())
+
+            if sit_orp:
+                where.append(f"{alias_cop}.SitOrp = ?")
+                params.append(sit_orp)
+
+            # Refinamento por Estagio e/ou Centro de Recurso via EXISTS na
+            # E900OOP. Faz a OP aparecer somente se possuir uma operacao com
+            # esse Estagio/Centro de Recurso — espelha o comportamento do
+            # relatorio Senior MCAP700.
+            if cod_etg is not None or (cod_cre and str(cod_cre).strip()):
+                exists_clauses = [
+                    f"OOPF.CodEmp = {alias_cop}.CodEmp",
+                    f"OOPF.CodOri = {alias_cop}.CodOri",
+                    f"OOPF.NumOrp = {alias_cop}.NumOrp",
+                ]
+                if cod_etg is not None:
+                    exists_clauses.append("OOPF.CodEtg = ?")
+                    params.append(int(cod_etg))
+                if cod_cre and str(cod_cre).strip():
+                    exists_clauses.append("OOPF.CodCre = ?")
+                    params.append(str(cod_cre).strip())
+                where.append(
+                    "EXISTS (\n"
+                    "                SELECT 1\n"
+                    "                FROM E900OOP OOPF\n"
+                    "                WHERE " + "\n                  AND ".join(exists_clauses) + "\n"
+                    "            )"
+                )
 
             if usar_q and q and str(q).strip():
                 termo = f"%{str(q).strip()}%"
                 where.append(f"""
                     (
                         CAST({alias_cop}.NumOrp AS VARCHAR(20)) LIKE ?
+                        OR CAST({alias_cop}.NumPed AS VARCHAR(20)) LIKE ?
+                        OR ISNULL({alias_cop}.RelPrd, '') LIKE ?
                         OR {alias_cop}.CodOri LIKE ?
                         OR {alias_cop}.CodPro LIKE ?
                         OR ISNULL(PRO.DesPro, '') LIKE ?
-                        OR ISNULL({alias_cop}.RelPrd, '') LIKE ?
                     )
                 """)
-                params.extend([termo, termo, termo, termo, termo])
+                params.extend([termo, termo, termo, termo, termo, termo])
 
-            sql_where = " WHERE " + " AND ".join(where) if where else ""
+            sql_where = " WHERE " + " AND ".join(where)
             return sql_where, params
 
         # ============================================================
@@ -14164,6 +14688,8 @@ def listar_opcoes_impressao_ordem_producao(
                 'Empresa ' + CAST(COP.CodEmp AS VARCHAR(20)) AS descricao,
                 CAST(COP.CodEmp AS VARCHAR(20)) + ' - Empresa ' + CAST(COP.CodEmp AS VARCHAR(20)) AS label
             FROM E900COP COP
+            WHERE COP.CodOri <> '100'
+              AND COP.SitOrp <> 'C'
             ORDER BY COP.CodEmp
         """)
         empresas = rows_to_dict()
@@ -14187,6 +14713,89 @@ def listar_opcoes_impressao_ordem_producao(
         origens = rows_to_dict()
 
         # ============================================================
+        # Pedidos
+        # ============================================================
+
+        where_pedidos, params_pedidos = montar_where("COP", usar_q=False)
+
+        cursor.execute(f"""
+            SELECT
+                COP.NumPed AS codigo,
+                CAST(COP.NumPed AS VARCHAR(20)) AS value,
+                'Pedido ' + CAST(COP.NumPed AS VARCHAR(20)) AS descricao,
+                'Pedido ' + CAST(COP.NumPed AS VARCHAR(20))
+                    + ' - ' + CAST(COUNT(*) AS VARCHAR(20)) + ' OP(s)' AS label,
+                COUNT(*) AS qtd_ops
+            FROM E900COP COP
+            {where_pedidos}
+              AND ISNULL(COP.NumPed, 0) > 0
+            GROUP BY
+                COP.NumPed
+            ORDER BY
+                COP.NumPed DESC
+        """, params_pedidos)
+        pedidos = rows_to_dict()
+
+        # ============================================================
+        # Relatórios de Produção / Agrupamentos
+        # ============================================================
+
+        where_relatorios, params_relatorios = montar_where("COP", usar_q=False)
+
+        cursor.execute(f"""
+            SELECT
+                COP.RelPrd AS codigo,
+                COP.RelPrd AS value,
+                'Relatório Produção ' + COP.RelPrd AS descricao,
+                'Relatório Produção ' + COP.RelPrd
+                    + ' - ' + CAST(COUNT(*) AS VARCHAR(20)) + ' OP(s)' AS label,
+                COUNT(*) AS qtd_ops
+            FROM E900COP COP
+            {where_relatorios}
+              AND ISNULL(COP.RelPrd, '') <> ''
+            GROUP BY
+                COP.RelPrd
+            ORDER BY
+                COP.RelPrd DESC
+        """, params_relatorios)
+        relatorios_producao = rows_to_dict()
+
+        # ============================================================
+        # Situações (somente as não canceladas)
+        # ============================================================
+
+        where_situacoes, params_situacoes = montar_where("COP", usar_q=False)
+
+        cursor.execute(f"""
+            SELECT
+                COP.SitOrp AS codigo,
+                COP.SitOrp AS value,
+                CASE CAST(COP.SitOrp AS VARCHAR(10))
+                    WHEN 'L' THEN 'Liberada'
+                    WHEN 'A' THEN 'Aberta'
+                    WHEN 'F' THEN 'Finalizada'
+                    WHEN 'E' THEN 'Encerrada'
+                    ELSE CAST(COP.SitOrp AS VARCHAR(20))
+                END AS descricao,
+                COP.SitOrp + ' - ' +
+                CASE CAST(COP.SitOrp AS VARCHAR(10))
+                    WHEN 'L' THEN 'Liberada'
+                    WHEN 'A' THEN 'Aberta'
+                    WHEN 'F' THEN 'Finalizada'
+                    WHEN 'E' THEN 'Encerrada'
+                    ELSE CAST(COP.SitOrp AS VARCHAR(20))
+                END AS label,
+                COUNT(*) AS qtd_ops
+            FROM E900COP COP
+            {where_situacoes}
+            GROUP BY
+                COP.SitOrp
+            ORDER BY
+                COP.SitOrp
+        """, params_situacoes)
+        situacoes = rows_to_dict()
+
+        # ============================================================
         # Ordens de Produção
         # ============================================================
 
@@ -14197,29 +14806,55 @@ def listar_opcoes_impressao_ordem_producao(
                 COP.CodEmp AS cod_emp,
                 COP.CodOri AS cod_ori,
                 COP.NumOrp AS num_orp,
+
+                COP.NumPed AS num_ped,
+                ISNULL(COP.RelPrd, '') AS rel_prd,
+
+                -- Campos diretos para a grid do Lovable
+                COP.CodPro AS produto,
+                ISNULL(PRO.DesPro, '') AS descricao,
+                COP.QtdPrv AS qtde,
+                ISNULL(PRO.UniMed, '') AS un,
+                COP.SitOrp AS situacao,
+
+                CASE CAST(COP.SitOrp AS VARCHAR(10))
+                    WHEN 'L' THEN 'Liberada'
+                    WHEN 'A' THEN 'Aberta'
+                    WHEN 'F' THEN 'Finalizada'
+                    WHEN 'E' THEN 'Encerrada'
+                    ELSE CAST(COP.SitOrp AS VARCHAR(20))
+                END AS situacao_descricao,
+
+                -- Mantém compatibilidade com campos antigos (legado)
                 COP.CodPro AS cod_pro,
                 ISNULL(PRO.DesPro, '') AS des_pro,
                 COP.QtdPrv AS qtd_prevista,
                 ISNULL(PRO.UniMed, '') AS unidade_medida,
                 COP.SitOrp AS sit_orp,
-                CASE CAST(COP.SitOrp AS VARCHAR(10))
-                    WHEN 'L' THEN 'Liberada'
-                    WHEN 'A' THEN 'Aberta'
-                    WHEN 'F' THEN 'Finalizada'
-                    WHEN 'C' THEN 'Cancelada'
-                    WHEN 'E' THEN 'Encerrada'
-                    ELSE CAST(COP.SitOrp AS VARCHAR(20))
-                END AS situacao_descricao,
+
                 COP.DatGer AS data_geracao,
                 COP.DtpIni AS inicio_previsto,
                 ISNULL(COP.RelPrd, '') AS agrupamento,
 
                 CAST(COP.NumOrp AS VARCHAR(20)) AS value,
-                COP.CodOri + ' / ' + CAST(COP.NumOrp AS VARCHAR(20))
+
+                COP.CodOri
+                    + ' / OP ' + CAST(COP.NumOrp AS VARCHAR(20))
+                    + CASE
+                        WHEN ISNULL(COP.NumPed, 0) > 0
+                        THEN ' - Pedido ' + CAST(COP.NumPed AS VARCHAR(20))
+                        ELSE ''
+                      END
+                    + CASE
+                        WHEN ISNULL(COP.RelPrd, '') <> ''
+                        THEN ' - Rel. Prod. ' + ISNULL(COP.RelPrd, '')
+                        ELSE ''
+                      END
                     + ' - ' + COP.CodPro
-                    + CASE WHEN ISNULL(PRO.DesPro, '') <> ''
-                           THEN ' - ' + ISNULL(PRO.DesPro, '')
-                           ELSE ''
+                    + CASE
+                        WHEN ISNULL(PRO.DesPro, '') <> ''
+                        THEN ' - ' + ISNULL(PRO.DesPro, '')
+                        ELSE ''
                       END AS label
 
             FROM E900COP COP
@@ -14352,6 +14987,9 @@ def listar_opcoes_impressao_ordem_producao(
         return {
             "empresas": empresas,
             "origens": origens,
+            "pedidos": pedidos,
+            "relatorios_producao": relatorios_producao,
+            "situacoes": situacoes,
             "ordens_producao": ordens_producao,
             "estagios": estagios,
             "centros_recurso": centros_recurso,
@@ -14359,6 +14997,9 @@ def listar_opcoes_impressao_ordem_producao(
                 "cod_emp": cod_emp,
                 "cod_ori": cod_ori,
                 "num_orp": num_orp,
+                "num_ped": num_ped,
+                "rel_prd": rel_prd,
+                "sit_orp": sit_orp,
                 "cod_etg": cod_etg,
                 "cod_cre": cod_cre,
                 "q": q,
@@ -14366,6 +15007,8 @@ def listar_opcoes_impressao_ordem_producao(
             },
         }
 
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(
             status_code=500,
