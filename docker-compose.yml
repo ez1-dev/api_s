@@ -23,4 +23,6 @@ services:
       - gemini_api_key2.env
     command: python3 api_sapiens_control_center.py
     volumes:
-      - .:/app
+      - /mnt/desenhos_op:/mnt/desenhos_op:ro
+    environment:
+      - PASTA_DESENHOS_OP=/mnt/desenhos_op
