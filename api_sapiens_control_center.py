@@ -14076,6 +14076,309 @@ def consultar_ordem_producao_impressao(
 
 
 # ============================================================
+# OPÇÕES PARA FILTROS DA IMPRESSÃO DE OP (autocomplete/combo)
+# ============================================================
+
+@app.get("/api/producao/ordem-producao/opcoes")
+def listar_opcoes_impressao_ordem_producao(
+    cod_emp: Optional[int] = None,
+    cod_ori: Optional[str] = None,
+    num_orp: Optional[int] = None,
+    cod_etg: Optional[int] = None,
+    cod_cre: Optional[str] = None,
+    q: Optional[str] = None,
+    limite_ops: int = 80,
+    usuario=Depends(validar_token),
+):
+    """
+    Opções para alimentar os filtros/autocomplete da tela:
+    Produção > Impressão de Ordem de Produção.
+
+    Retorna:
+    - empresas
+    - origens
+    - ordens de produção
+    - estágios
+    - centros de recurso
+    """
+
+    limite_ops = max(1, min(int(limite_ops or 80), 200))
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+        def rows_to_dict():
+            cols = [c[0] for c in cursor.description]
+            dados = []
+            for row in cursor.fetchall():
+                item = {}
+                for i, col in enumerate(cols):
+                    valor = row[i]
+                    if isinstance(valor, str):
+                        valor = valor.strip()
+                    item[col] = valor
+                dados.append(item)
+            return dados
+
+        def montar_where(alias_cop="COP", usar_q=False):
+            where = []
+            params = []
+
+            if cod_emp is not None:
+                where.append(f"{alias_cop}.CodEmp = ?")
+                params.append(cod_emp)
+
+            if cod_ori:
+                where.append(f"{alias_cop}.CodOri = ?")
+                params.append(str(cod_ori).strip())
+
+            if num_orp:
+                where.append(f"{alias_cop}.NumOrp = ?")
+                params.append(int(num_orp))
+
+            if usar_q and q and str(q).strip():
+                termo = f"%{str(q).strip()}%"
+                where.append(f"""
+                    (
+                        CAST({alias_cop}.NumOrp AS VARCHAR(20)) LIKE ?
+                        OR {alias_cop}.CodOri LIKE ?
+                        OR {alias_cop}.CodPro LIKE ?
+                        OR ISNULL(PRO.DesPro, '') LIKE ?
+                        OR ISNULL({alias_cop}.RelPrd, '') LIKE ?
+                    )
+                """)
+                params.extend([termo, termo, termo, termo, termo])
+
+            sql_where = " WHERE " + " AND ".join(where) if where else ""
+            return sql_where, params
+
+        # ============================================================
+        # Empresas
+        # ============================================================
+
+        cursor.execute("""
+            SELECT DISTINCT
+                COP.CodEmp AS codigo,
+                CAST(COP.CodEmp AS VARCHAR(20)) AS value,
+                'Empresa ' + CAST(COP.CodEmp AS VARCHAR(20)) AS descricao,
+                CAST(COP.CodEmp AS VARCHAR(20)) + ' - Empresa ' + CAST(COP.CodEmp AS VARCHAR(20)) AS label
+            FROM E900COP COP
+            ORDER BY COP.CodEmp
+        """)
+        empresas = rows_to_dict()
+
+        # ============================================================
+        # Origens
+        # ============================================================
+
+        where_origens, params_origens = montar_where("COP", usar_q=False)
+
+        cursor.execute(f"""
+            SELECT DISTINCT
+                COP.CodOri AS codigo,
+                COP.CodOri AS value,
+                'Origem ' + COP.CodOri AS descricao,
+                COP.CodOri + ' - Origem ' + COP.CodOri AS label
+            FROM E900COP COP
+            {where_origens}
+            ORDER BY COP.CodOri
+        """, params_origens)
+        origens = rows_to_dict()
+
+        # ============================================================
+        # Ordens de Produção
+        # ============================================================
+
+        where_ops, params_ops = montar_where("COP", usar_q=True)
+
+        cursor.execute(f"""
+            SELECT TOP {limite_ops}
+                COP.CodEmp AS cod_emp,
+                COP.CodOri AS cod_ori,
+                COP.NumOrp AS num_orp,
+                COP.CodPro AS cod_pro,
+                ISNULL(PRO.DesPro, '') AS des_pro,
+                COP.QtdPrv AS qtd_prevista,
+                ISNULL(PRO.UniMed, '') AS unidade_medida,
+                COP.SitOrp AS sit_orp,
+                CASE CAST(COP.SitOrp AS VARCHAR(10))
+                    WHEN 'L' THEN 'Liberada'
+                    WHEN 'A' THEN 'Aberta'
+                    WHEN 'F' THEN 'Finalizada'
+                    WHEN 'C' THEN 'Cancelada'
+                    WHEN 'E' THEN 'Encerrada'
+                    ELSE CAST(COP.SitOrp AS VARCHAR(20))
+                END AS situacao_descricao,
+                COP.DatGer AS data_geracao,
+                COP.DtpIni AS inicio_previsto,
+                ISNULL(COP.RelPrd, '') AS agrupamento,
+
+                CAST(COP.NumOrp AS VARCHAR(20)) AS value,
+                COP.CodOri + ' / ' + CAST(COP.NumOrp AS VARCHAR(20))
+                    + ' - ' + COP.CodPro
+                    + CASE WHEN ISNULL(PRO.DesPro, '') <> ''
+                           THEN ' - ' + ISNULL(PRO.DesPro, '')
+                           ELSE ''
+                      END AS label
+
+            FROM E900COP COP
+            LEFT JOIN E075PRO PRO
+                ON PRO.CodEmp = COP.CodEmp
+               AND PRO.CodPro = COP.CodPro
+            {where_ops}
+            ORDER BY
+                COP.DatGer DESC,
+                COP.NumOrp DESC
+        """, params_ops)
+        ordens_producao = rows_to_dict()
+
+        # ============================================================
+        # Estágios
+        # ============================================================
+
+        where_estagios, params_estagios = montar_where("COP", usar_q=False)
+
+        filtros_estagios_extra = ""
+        if cod_cre:
+            filtros_estagios_extra += " AND OOP.CodCre = ?"
+            params_estagios.append(str(cod_cre).strip())
+
+        cursor.execute(f"""
+            SELECT
+                OOP.CodEtg AS codigo,
+                CAST(OOP.CodEtg AS VARCHAR(20)) AS value,
+                'Estágio ' + CAST(OOP.CodEtg AS VARCHAR(20)) AS descricao,
+                CAST(OOP.CodEtg AS VARCHAR(20)) + ' - Estágio ' + CAST(OOP.CodEtg AS VARCHAR(20)) AS label,
+                COUNT(DISTINCT CAST(OOP.CodOri AS VARCHAR(10)) + '-' + CAST(OOP.NumOrp AS VARCHAR(20))) AS qtd_ops
+            FROM E900OOP OOP
+            INNER JOIN E900COP COP
+                ON COP.CodEmp = OOP.CodEmp
+               AND COP.CodOri = OOP.CodOri
+               AND COP.NumOrp = OOP.NumOrp
+            {where_estagios}
+            {filtros_estagios_extra}
+            GROUP BY
+                OOP.CodEtg
+            ORDER BY
+                OOP.CodEtg
+        """, params_estagios)
+        estagios = rows_to_dict()
+
+        # ============================================================
+        # Centros de Recurso
+        # ============================================================
+
+        where_cre, params_cre = montar_where("COP", usar_q=False)
+
+        filtros_cre_extra = ""
+        if cod_etg is not None:
+            filtros_cre_extra += " AND OOP.CodEtg = ?"
+            params_cre.append(int(cod_etg))
+
+        # Tenta usar E725CRE se existir. Se não existir, usa descrição da operação como apoio.
+        cursor.execute("""
+            SELECT CASE
+                     WHEN OBJECT_ID('E725CRE', 'U') IS NOT NULL THEN 1
+                     WHEN OBJECT_ID('dbo.E725CRE', 'U') IS NOT NULL THEN 1
+                     ELSE 0
+                   END AS existe
+        """)
+        usa_e725cre = bool(cursor.fetchone()[0])
+
+        if usa_e725cre:
+            sql_centros = f"""
+                SELECT
+                    OOP.CodCre AS codigo,
+                    OOP.CodCre AS value,
+                    ISNULL(MAX(CRE.DesCre), ISNULL(MAX(OPR.DesOpr), '')) AS descricao,
+                    OOP.CodCre
+                        + CASE
+                            WHEN ISNULL(MAX(CRE.DesCre), ISNULL(MAX(OPR.DesOpr), '')) <> ''
+                            THEN ' - ' + ISNULL(MAX(CRE.DesCre), ISNULL(MAX(OPR.DesOpr), ''))
+                            ELSE ''
+                          END AS label,
+                    COUNT(DISTINCT CAST(OOP.CodOri AS VARCHAR(10)) + '-' + CAST(OOP.NumOrp AS VARCHAR(20))) AS qtd_ops
+                FROM E900OOP OOP
+                INNER JOIN E900COP COP
+                    ON COP.CodEmp = OOP.CodEmp
+                   AND COP.CodOri = OOP.CodOri
+                   AND COP.NumOrp = OOP.NumOrp
+                LEFT JOIN E725CRE CRE
+                    ON CRE.CodEmp = OOP.CodEmp
+                   AND CRE.CodCre = OOP.CodCre
+                LEFT JOIN E720OPR OPR
+                    ON OPR.CodEmp = OOP.CodEmp
+                   AND OPR.CodOpr = OOP.CodOpr
+                {where_cre}
+                {filtros_cre_extra}
+                GROUP BY
+                    OOP.CodCre
+                ORDER BY
+                    OOP.CodCre
+            """
+        else:
+            sql_centros = f"""
+                SELECT
+                    OOP.CodCre AS codigo,
+                    OOP.CodCre AS value,
+                    ISNULL(MAX(OPR.DesOpr), '') AS descricao,
+                    OOP.CodCre
+                        + CASE
+                            WHEN ISNULL(MAX(OPR.DesOpr), '') <> ''
+                            THEN ' - ' + ISNULL(MAX(OPR.DesOpr), '')
+                            ELSE ''
+                          END AS label,
+                    COUNT(DISTINCT CAST(OOP.CodOri AS VARCHAR(10)) + '-' + CAST(OOP.NumOrp AS VARCHAR(20))) AS qtd_ops
+                FROM E900OOP OOP
+                INNER JOIN E900COP COP
+                    ON COP.CodEmp = OOP.CodEmp
+                   AND COP.CodOri = OOP.CodOri
+                   AND COP.NumOrp = OOP.NumOrp
+                LEFT JOIN E720OPR OPR
+                    ON OPR.CodEmp = OOP.CodEmp
+                   AND OPR.CodOpr = OOP.CodOpr
+                {where_cre}
+                {filtros_cre_extra}
+                GROUP BY
+                    OOP.CodCre
+                ORDER BY
+                    OOP.CodCre
+            """
+
+        cursor.execute(sql_centros, params_cre)
+        centros_recurso = rows_to_dict()
+
+        return {
+            "empresas": empresas,
+            "origens": origens,
+            "ordens_producao": ordens_producao,
+            "estagios": estagios,
+            "centros_recurso": centros_recurso,
+            "filtros_aplicados": {
+                "cod_emp": cod_emp,
+                "cod_ori": cod_ori,
+                "num_orp": num_orp,
+                "cod_etg": cod_etg,
+                "cod_cre": cod_cre,
+                "q": q,
+                "limite_ops": limite_ops,
+            },
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao carregar opções da impressão da OP: {str(exc)}",
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ============================================================
 # DASHBOARD
 # ============================================================
 
