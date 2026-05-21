@@ -14749,13 +14749,27 @@ def obter_desenho_ordem_producao_impressao_a4_pagina(
     """
     caminho = _resolver_arquivo_desenho(arquivo)
 
+    # Checagem antecipada de Pillow — sem Pillow nao da pra fazer nada.
+    # Pega o erro cedo com mensagem clara em vez de estourar la dentro.
+    if Image is None:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "mensagem": "Pillow nao esta instalado na API. Instale Pillow>=10.0.0.",
+                "arquivo": caminho.name,
+                "pagina": pagina,
+                "pillow_disponivel": False,
+                "pymupdf_disponivel": fitz is not None,
+            },
+        )
+
     try:
         img_original = _carregar_desenho_como_imagem(caminho, pagina=pagina)
         img_cortada = _recortar_margem_branca(img_original)
         img_a4 = _encaixar_em_a4_retrato(img_cortada)
 
         saida = io.BytesIO()
-        img_a4.save(saida, format="JPEG", quality=95, optimize=True)
+        img_a4.save(saida, format="JPEG", quality=92, optimize=True)
         saida.seek(0)
 
         return StreamingResponse(
@@ -14774,10 +14788,89 @@ def obter_desenho_ordem_producao_impressao_a4_pagina(
     except HTTPException:
         raise
     except Exception as exc:
+        # Erro estruturado: o front consegue extrair "erro" e ler as flags
+        # de disponibilidade sem precisar chamar /diagnostico de novo.
         raise HTTPException(
             status_code=500,
-            detail=f"Erro ao normalizar desenho para A4: {str(exc)}",
+            detail={
+                "mensagem": "Erro ao normalizar desenho para A4.",
+                "arquivo": caminho.name,
+                "pagina": pagina,
+                "erro": str(exc),
+                "pillow_disponivel": Image is not None,
+                "pymupdf_disponivel": fitz is not None,
+            },
         )
+
+
+@app.get("/api/producao/ordem-producao/desenho/impressao-a4/diagnostico")
+def diagnosticar_desenho_impressao_a4(
+    arquivo: str,
+    usuario=Depends(validar_token),
+):
+    """Diagnostico individual de UM desenho para o pipeline /impressao-a4.
+
+    Use este endpoint quando /pagina ou /manifest falharem para descobrir
+    a causa exata:
+    - pillow_disponivel=False -> falta instalar Pillow.
+    - pymupdf_disponivel=False e arquivo .pdf -> falta instalar pymupdf.
+    - existe=False -> arquivo nao esta na pasta de desenhos.
+    - extensao desconhecida -> formato nao permitido.
+
+    NAO levanta excecao: sempre devolve 200 com { ok: bool, ... }.
+    """
+    try:
+        caminho = _resolver_arquivo_desenho(arquivo)
+        existe = caminho.exists() and caminho.is_file()
+        tamanho_bytes = None
+        modificado_em = None
+        if existe:
+            try:
+                stat = caminho.stat()
+                tamanho_bytes = int(stat.st_size)
+                modificado_em = int(stat.st_mtime)
+            except Exception:
+                pass
+
+        return {
+            "ok": True,
+            "arquivo": caminho.name,
+            "caminho": str(caminho),
+            "existe": existe,
+            "extensao": caminho.suffix.lower(),
+            "tamanho_bytes": tamanho_bytes,
+            "modificado_em": modificado_em,
+            "pillow_disponivel": Image is not None,
+            "pymupdf_disponivel": fitz is not None,
+            "pypdf_disponivel": PdfReader is not None,
+            "dpi_normalizacao": DESENHO_A4_DPI,
+            "a4_largura_px": A4_WIDTH_PX,
+            "a4_altura_px": A4_HEIGHT_PX,
+            "pasta_configurada": str(Path(PASTA_DESENHOS_OP_PADRAO)),
+        }
+    except HTTPException as exc:
+        # Erros conhecidos do resolver (404/422) viram diagnostico, nao excecao.
+        detalhe = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+        return {
+            "ok": False,
+            "arquivo_solicitado": arquivo,
+            "status_resolver": exc.status_code,
+            "erro": detalhe,
+            "pillow_disponivel": Image is not None,
+            "pymupdf_disponivel": fitz is not None,
+            "pypdf_disponivel": PdfReader is not None,
+            "pasta_configurada": str(Path(PASTA_DESENHOS_OP_PADRAO)),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "arquivo_solicitado": arquivo,
+            "erro": str(exc),
+            "pillow_disponivel": Image is not None,
+            "pymupdf_disponivel": fitz is not None,
+            "pypdf_disponivel": PdfReader is not None,
+            "pasta_configurada": str(Path(PASTA_DESENHOS_OP_PADRAO)),
+        }
 
 
 @app.get("/api/producao/ordem-producao/desenho/impressao-a4/manifest")
@@ -36589,4 +36682,4 @@ def criar_relatorio_de_template(template_id: str, usuario=Depends(validar_token)
 
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run(app, host='0.0.0.0', port=8001)
+    uvicorn.run(app, host='0.0.0.0', port=8070)
