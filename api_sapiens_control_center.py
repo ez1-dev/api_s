@@ -26,18 +26,28 @@ from urllib.parse import quote
 # Opcionais para metadados de imagens/PDFs dos desenhos da OP.
 # Se nao estiverem instalados, o codigo segue retornando metadata vazia.
 try:
-    from PIL import Image, ImageOps  # Pillow
+    from PIL import Image, ImageOps, ImageChops  # Pillow
 except Exception:
     Image = None  # type: ignore
     ImageOps = None  # type: ignore
+    ImageChops = None  # type: ignore
 
 try:
-    from pypdf import PdfReader  # pypdf
+    from pypdf import PdfReader, PdfWriter, Transformation  # pypdf
 except Exception:
     try:
-        from PyPDF2 import PdfReader  # fallback para PyPDF2 antigo
+        from PyPDF2 import PdfReader, PdfWriter, Transformation  # fallback para PyPDF2 antigo
     except Exception:
         PdfReader = None  # type: ignore
+        PdfWriter = None  # type: ignore
+        Transformation = None  # type: ignore
+
+# PyMuPDF (fitz) — usado para rasterizar PDFs em imagens A4 normalizadas.
+# Sem ele, o endpoint /impressao-a4/pagina nao consegue tratar PDFs.
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    fitz = None  # type: ignore
 import requests
 from xml.sax.saxutils import escape as xml_escape
 import xml.etree.ElementTree as ET
@@ -13890,6 +13900,33 @@ def _metadata_arquivo_desenho(caminho: Path):
     }
 
 
+def formatar_tempo_decimal_horas(valor):
+    """Converte horas decimais (ex: 0.3) em string legivel (ex: "18 min" ou "1 h 30 min").
+
+    Aceita None/"" e qualquer valor convertível em float. Retorna "" para entradas invalidas.
+    """
+    try:
+        horas_dec = float(valor or 0)
+    except Exception:
+        return ""
+
+    if horas_dec <= 0:
+        return "0 min"
+
+    minutos_total = int(round(horas_dec * 60))
+
+    if minutos_total < 60:
+        return f"{minutos_total} min"
+
+    horas = minutos_total // 60
+    minutos = minutos_total % 60
+
+    if minutos == 0:
+        return f"{horas} h"
+
+    return f"{horas} h {minutos} min"
+
+
 def localizar_desenhos_produto(cod_pro):
     """Localiza desenhos JPG/JPEG/PNG/PDF do produto na pasta fixa da API.
 
@@ -13984,10 +14021,30 @@ def localizar_desenhos_produto(cod_pro):
                     "/api/producao/ordem-producao/desenho"
                     f"?arquivo={arquivo_encoded}"
                 ),
+                # url_impressao: fallback simples (pagina 1 normalizada).
+                # Front prefere usar url_manifest_a4 para descobrir o numero
+                # real de paginas (PDF pode ter 2+ paginas).
                 "url_impressao": (
+                    "/api/producao/ordem-producao/desenho/impressao-a4/pagina"
+                    f"?arquivo={arquivo_encoded}&pagina=1&v={versao_cache}"
+                ),
+                "url_manifest_a4": (
+                    "/api/producao/ordem-producao/desenho/impressao-a4/manifest"
+                    f"?arquivo={arquivo_encoded}&v={versao_cache}"
+                ),
+                # Mantidos como legados (retrocompat) — front nao precisa usar.
+                "url_impressao_a4_inteiro": (
+                    "/api/producao/ordem-producao/desenho/impressao-a4"
+                    f"?arquivo={arquivo_encoded}&v={versao_cache}"
+                ),
+                "url_impressao_legado": (
                     "/api/producao/ordem-producao/desenho/impressao"
                     f"?arquivo={arquivo_encoded}&auto_rotate=S&v={versao_cache}"
                 ),
+                "usar_paginas_a4_normalizadas": True,
+                "layout_impressao": "A4_RETRATO_NORMALIZADO",
+                "rotacao_automatica": True,
+                "normalizacao_a4": True,
                 "imprimir_em_nova_pagina": True,
                 "iniciar_apos_op": True,
                 **metadata,
@@ -14122,17 +14179,65 @@ def obter_desenho_ordem_producao_impressao(
     caminho = _resolver_arquivo_desenho(arquivo)
     ext = caminho.suffix.lower()
 
-    # PDF: sem manipulacao — devolve o original.
+    # PDF: rotaciona paginas em paisagem (largura > altura) para retrato
+    # quando auto_rotate=S, devolvendo um PDF em A4 retrato pronto para
+    # imprimir. Se pypdf/PdfWriter nao estiver instalado, devolve o
+    # original como fallback.
     if ext == ".pdf":
-        return FileResponse(
-            str(caminho),
-            media_type="application/pdf",
-            filename=caminho.name,
-            headers={
-                "Cache-Control": "no-store",
-                "X-Auto-Rotate": "PDF-ORIGINAL",
-            },
-        )
+        auto_rotate_pdf = str(auto_rotate or "S").upper().strip() == "S"
+        if not auto_rotate_pdf or PdfReader is None or PdfWriter is None:
+            return FileResponse(
+                str(caminho),
+                media_type="application/pdf",
+                filename=caminho.name,
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Auto-Rotate": "PDF-ORIGINAL",
+                },
+            )
+
+        try:
+            reader = PdfReader(str(caminho))
+            writer = PdfWriter()
+            paginas_rotacionadas = 0
+            for page in reader.pages:
+                try:
+                    box = page.mediabox
+                    largura = float(box.width)
+                    altura = float(box.height)
+                    if largura > altura:
+                        page.rotate(90)
+                        paginas_rotacionadas += 1
+                except Exception:
+                    pass
+                writer.add_page(page)
+
+            saida = io.BytesIO()
+            writer.write(saida)
+            saida.seek(0)
+            return StreamingResponse(
+                saida,
+                media_type="application/pdf",
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Original-File": caminho.name,
+                    "X-Auto-Rotate": "S" if paginas_rotacionadas > 0 else "N",
+                    "X-Pages-Rotated": str(paginas_rotacionadas),
+                    "X-Total-Pages": str(len(reader.pages)),
+                    "X-A4-Layout": "RETRATO",
+                },
+            )
+        except Exception:
+            return FileResponse(
+                str(caminho),
+                media_type="application/pdf",
+                filename=caminho.name,
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Auto-Rotate": "PDF-ORIGINAL",
+                    "X-Rotate-Skip": "erro-pypdf",
+                },
+            )
 
     # Sem Pillow no servidor -> fallback: devolve o arquivo original.
     if Image is None:
@@ -14199,6 +14304,538 @@ def obter_desenho_ordem_producao_impressao(
             status_code=500,
             detail=f"Erro ao preparar desenho para impressão: {str(exc)}",
         )
+
+
+# ============================================================================
+# Normalizacao definitiva A4 retrato (substitui /desenho/impressao no front).
+#
+# - JPG/PNG: abre, corrige EXIF, rotaciona se paisagem, redimensiona
+#   proporcionalmente dentro da area util e centraliza numa folha A4 branca.
+# - PDF: percorre pagina a pagina, rotaciona paisagens, escala e centraliza
+#   sobre uma pagina A4 retrato em branco. Frente/verso saem como duas
+#   paginas A4 retrato distintas.
+# ============================================================================
+
+# A4 em pontos PDF (1pt = 1/72 polegada) — usado pelo pypdf
+A4_WIDTH_PT = 595.2756
+A4_HEIGHT_PT = 841.8898
+A4_MARGIN_PT = 18  # ~0.25 polegada de margem segura
+
+# A4 em pixels — usado para imagens (Pillow / fitz).
+# 200 DPI eh um compromisso entre nitidez e tamanho do JPEG enviado pro front.
+DESENHO_A4_DPI = 200
+A4_WIDTH_PX = int(8.27 * DESENHO_A4_DPI)   # 1654 px @ 200 DPI
+A4_HEIGHT_PX = int(11.69 * DESENHO_A4_DPI)  # 2338 px @ 200 DPI
+A4_MARGIN_PX = int(0.25 * DESENHO_A4_DPI)   # ~50 px de margem segura
+
+# Recorte de margem branca antes de encaixar em A4.
+# - WHITE_TOLERANCE: pixels com luminancia < deste valor sao considerados
+#   "diferentes de branco" e entram na bounding box do conteudo util.
+# - CROP_PADDING_PX: respiro adicionado em volta da bbox para nao colar o
+#   desenho na borda da folha A4 final.
+WHITE_TOLERANCE = 14
+CROP_PADDING_PX = 20
+
+
+def _normalizar_imagem_para_a4(caminho: Path):
+    """Gera uma imagem A4 retrato (JPEG) com o desenho centralizado e escalado.
+
+    Se a imagem original estiver em paisagem (largura > altura), eh rotacionada
+    90deg antes de ser encaixada. EXIF eh corrigido para que orientacoes
+    vindas de camera/celular nao saiam tortas.
+    """
+    if Image is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Pillow nao esta instalado. Instale pillow para normalizar imagens.",
+        )
+
+    try:
+        with Image.open(caminho) as img:
+            if ImageOps is not None:
+                img = ImageOps.exif_transpose(img)
+
+            img = img.convert("RGB")
+
+            largura, altura = img.size
+            rotacionou = False
+            if largura > altura:
+                img = img.rotate(90, expand=True)
+                rotacionou = True
+
+            area_largura = A4_WIDTH_PX - (A4_MARGIN_PX * 2)
+            area_altura = A4_HEIGHT_PX - (A4_MARGIN_PX * 2)
+
+            escala = min(
+                area_largura / img.width,
+                area_altura / img.height,
+            )
+            # Nunca ampliar acima do tamanho original (evita perda de qualidade
+            # em desenhos pequenos virem borrados ao serem esticados ate A4).
+            if escala > 1.0:
+                escala = 1.0
+
+            nova_largura = max(1, int(img.width * escala))
+            nova_altura = max(1, int(img.height * escala))
+
+            img_redimensionada = img.resize(
+                (nova_largura, nova_altura),
+                Image.LANCZOS,
+            )
+
+            folha = Image.new("RGB", (A4_WIDTH_PX, A4_HEIGHT_PX), "white")
+            pos_x = (A4_WIDTH_PX - nova_largura) // 2
+            pos_y = (A4_HEIGHT_PX - nova_altura) // 2
+            folha.paste(img_redimensionada, (pos_x, pos_y))
+
+            saida = io.BytesIO()
+            folha.save(saida, format="JPEG", quality=95, optimize=True)
+            saida.seek(0)
+
+        return StreamingResponse(
+            saida,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Original-File": caminho.name,
+                "X-A4-Normalized": "S",
+                "X-A4-Orientation": "PORTRAIT",
+                "X-A4-Rotated": "S" if rotacionou else "N",
+                "X-Original-Width": str(largura),
+                "X-Original-Height": str(altura),
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao normalizar imagem para A4: {str(exc)}",
+        )
+
+
+def _normalizar_pdf_para_a4(caminho: Path):
+    """Gera um PDF A4 retrato com cada pagina do PDF original encaixada.
+
+    Para cada pagina:
+    - Detecta se eh paisagem (largura > altura).
+    - Rotaciona 90deg se necessario.
+    - Escala proporcionalmente para caber dentro da area util.
+    - Centraliza sobre uma pagina A4 retrato em branco.
+
+    O resultado final eh um PDF com a mesma quantidade de paginas do original,
+    todas em A4 retrato.
+    """
+    if PdfReader is None or PdfWriter is None or Transformation is None:
+        raise HTTPException(
+            status_code=500,
+            detail="pypdf nao esta instalado. Instale pypdf para normalizar PDFs.",
+        )
+
+    try:
+        reader = PdfReader(str(caminho))
+        writer = PdfWriter()
+
+        area_w = A4_WIDTH_PT - (A4_MARGIN_PT * 2)
+        area_h = A4_HEIGHT_PT - (A4_MARGIN_PT * 2)
+
+        paginas_rotacionadas = 0
+
+        for pagina_original in reader.pages:
+            src_w = float(pagina_original.mediabox.width)
+            src_h = float(pagina_original.mediabox.height)
+            if src_w <= 0 or src_h <= 0:
+                # Pagina degenerada — copia sem transformacao
+                writer.add_page(pagina_original)
+                continue
+
+            deve_rotacionar = src_w > src_h
+
+            if deve_rotacionar:
+                content_w = src_h
+                content_h = src_w
+                paginas_rotacionadas += 1
+            else:
+                content_w = src_w
+                content_h = src_h
+
+            escala = min(area_w / content_w, area_h / content_h)
+            # Nao ampliar conteudo pequeno acima do tamanho real
+            if escala > 1.0:
+                escala = 1.0
+
+            final_w = content_w * escala
+            final_h = content_h * escala
+            offset_x = (A4_WIDTH_PT - final_w) / 2.0
+            offset_y = (A4_HEIGHT_PT - final_h) / 2.0
+
+            # Cria pagina A4 retrato em branco
+            pagina_a4 = writer.add_blank_page(
+                width=A4_WIDTH_PT,
+                height=A4_HEIGHT_PT,
+            )
+
+            transform = Transformation()
+            if deve_rotacionar:
+                # 1) rotaciona 90deg (conteudo vai para x negativo)
+                # 2) translata por src_h para trazer de volta ao 1o quadrante
+                # 3) escala
+                # 4) translata para posicionar centralizado na A4
+                transform = (
+                    transform
+                    .rotate(90)
+                    .translate(tx=src_h, ty=0)
+                    .scale(escala)
+                    .translate(tx=offset_x, ty=offset_y)
+                )
+            else:
+                transform = (
+                    transform
+                    .scale(escala)
+                    .translate(tx=offset_x, ty=offset_y)
+                )
+
+            pagina_original.add_transformation(transform)
+            pagina_a4.merge_page(pagina_original)
+
+        saida = io.BytesIO()
+        writer.write(saida)
+        saida.seek(0)
+
+        return StreamingResponse(
+            saida,
+            media_type="application/pdf",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Original-File": caminho.name,
+                "X-A4-Normalized": "S",
+                "X-A4-Orientation": "PORTRAIT",
+                "X-Pages-Rotated": str(paginas_rotacionadas),
+                "X-Total-Pages": str(len(reader.pages)),
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao normalizar PDF para A4: {str(exc)}",
+        )
+
+
+@app.get("/api/producao/ordem-producao/desenho/impressao-a4")
+def obter_desenho_ordem_producao_impressao_a4(
+    arquivo: str,
+    usuario=Depends(validar_token),
+):
+    """Devolve o desenho JA NORMALIZADO em A4 retrato, pronto para impressao.
+
+    Diferente de /desenho/impressao (que so rotaciona JPG/PNG e devolvia PDF
+    quase original), este endpoint sempre entrega:
+    - JPG/PNG: um JPEG A4 retrato com o desenho centralizado e escalado.
+    - PDF: um PDF onde toda pagina eh A4 retrato com o conteudo original
+      centralizado, rotacionando paisagens automaticamente.
+
+    O Lovable deve usar exclusivamente este endpoint para impressao —
+    nao aplicar transform/rotate no CSS, nao redimensionar manualmente
+    no front, nao imprimir o arquivo original.
+    """
+    caminho = _resolver_arquivo_desenho(arquivo)
+    ext = caminho.suffix.lower()
+
+    if ext in (".jpg", ".jpeg", ".png"):
+        return _normalizar_imagem_para_a4(caminho)
+
+    if ext == ".pdf":
+        return _normalizar_pdf_para_a4(caminho)
+
+    raise HTTPException(
+        status_code=422,
+        detail="Formato nao permitido. Use JPG, JPEG, PNG ou PDF.",
+    )
+
+
+# ============================================================================
+# Normalizacao A4 v2 — pipeline imagem-unica (JPG/PNG/PDF).
+#
+# Diferente de /desenho/impressao-a4 (que devolve JPEG p/ imagem e PDF p/ PDF),
+# este pipeline rasteriza tudo (inclusive PDFs) em JPEG A4 retrato, com
+# recorte automatico de margem branca interna. Resolve dois problemas:
+#
+# 1) Desenhos que vinham pequenos no centro com bastante area branca.
+# 2) PDFs cujas paginas em paisagem nao encaixavam corretamente.
+#
+# O front passa a renderizar SEMPRE como <img> dentro de .op-drawing-page
+# 196mm x 283mm — sem PDF embed, sem CSS rotate, sem object/iframe.
+# ============================================================================
+
+
+def _recortar_margem_branca(img):
+    """Remove margens brancas/quase-brancas externas do desenho.
+
+    Resolve o caso em que o desenho vem cercado de area branca dentro do
+    arquivo (PDF com pouco conteudo no centro, JPG escaneado com bordas
+    grandes), o que fazia o resultado final ficar pequeno mesmo com escala
+    proporcional.
+    """
+    if Image is None or ImageChops is None:
+        return img
+
+    rgb = img.convert("RGB")
+
+    fundo = Image.new("RGB", rgb.size, (255, 255, 255))
+    diff = ImageChops.difference(rgb, fundo).convert("L")
+
+    # Mascara de pixels "nao brancos" (luminancia da diferenca > tolerancia)
+    mask = diff.point(lambda p: 255 if p > WHITE_TOLERANCE else 0)
+
+    bbox = mask.getbbox()
+    if not bbox:
+        # Imagem totalmente branca — devolve original p/ nao quebrar
+        return rgb
+
+    left, top, right, bottom = bbox
+    left = max(0, left - CROP_PADDING_PX)
+    top = max(0, top - CROP_PADDING_PX)
+    right = min(rgb.width, right + CROP_PADDING_PX)
+    bottom = min(rgb.height, bottom + CROP_PADDING_PX)
+
+    return rgb.crop((left, top, right, bottom))
+
+
+def _encaixar_em_a4_retrato(img):
+    """Encaixa uma imagem (ja recortada) em uma folha A4 retrato branca.
+
+    - Rotaciona 90deg se a imagem ainda estiver em paisagem.
+    - Escala proporcionalmente para caber na area util (descontada a margem).
+    - Centraliza e pinta sobre fundo branco A4.
+    """
+    if Image is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Pillow nao esta instalado. Instale Pillow para normalizar desenhos.",
+        )
+
+    img = img.convert("RGB")
+
+    if img.width > img.height:
+        img = img.rotate(90, expand=True)
+
+    area_w = A4_WIDTH_PX - (A4_MARGIN_PX * 2)
+    area_h = A4_HEIGHT_PX - (A4_MARGIN_PX * 2)
+
+    escala = min(area_w / img.width, area_h / img.height)
+    nova_w = max(1, int(img.width * escala))
+    nova_h = max(1, int(img.height * escala))
+
+    img_redim = img.resize((nova_w, nova_h), Image.LANCZOS)
+
+    folha = Image.new("RGB", (A4_WIDTH_PX, A4_HEIGHT_PX), "white")
+    pos_x = (A4_WIDTH_PX - nova_w) // 2
+    pos_y = (A4_HEIGHT_PX - nova_h) // 2
+    folha.paste(img_redim, (pos_x, pos_y))
+
+    return folha
+
+
+def _contar_paginas_desenho(caminho: Path) -> int:
+    """Retorna o total de paginas do desenho.
+
+    - JPG/PNG: sempre 1.
+    - PDF: usa fitz quando disponivel, senao pypdf.
+    - Outros: levanta 422.
+    """
+    ext = caminho.suffix.lower()
+
+    if ext in (".jpg", ".jpeg", ".png"):
+        return 1
+
+    if ext == ".pdf":
+        if fitz is not None:
+            doc = fitz.open(str(caminho))
+            try:
+                return len(doc)
+            finally:
+                doc.close()
+        if PdfReader is not None:
+            try:
+                return len(PdfReader(str(caminho)).pages)
+            except Exception:
+                return 1
+        # Sem nenhuma biblioteca de PDF -> trata como 1 pagina e o /pagina
+        # devolvera erro 500 explicando o que falta instalar.
+        return 1
+
+    raise HTTPException(
+        status_code=422,
+        detail="Formato nao permitido. Use JPG, JPEG, PNG ou PDF.",
+    )
+
+
+def _carregar_desenho_como_imagem(caminho: Path, pagina: int = 1):
+    """Carrega uma pagina do desenho como Pillow.Image RGB.
+
+    - JPG/PNG: lê direto (com correcao EXIF). Apenas pagina=1 e valida.
+    - PDF: rasteriza via PyMuPDF (fitz) em DESENHO_A4_DPI.
+    """
+    if Image is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Pillow nao esta instalado. Instale Pillow para normalizar desenhos.",
+        )
+
+    ext = caminho.suffix.lower()
+
+    if ext in (".jpg", ".jpeg", ".png"):
+        if pagina != 1:
+            raise HTTPException(
+                status_code=404,
+                detail="Imagem possui somente uma pagina.",
+            )
+        with Image.open(caminho) as img:
+            if ImageOps is not None:
+                img = ImageOps.exif_transpose(img)
+            return img.convert("RGB")
+
+    if ext == ".pdf":
+        if fitz is None:
+            raise HTTPException(
+                status_code=500,
+                detail="PyMuPDF (fitz) nao esta instalado. Instale pymupdf para rasterizar PDFs.",
+            )
+
+        doc = fitz.open(str(caminho))
+        try:
+            total = len(doc)
+            if pagina < 1 or pagina > total:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Pagina {pagina} nao existe no PDF. Total: {total}.",
+                )
+
+            page = doc[pagina - 1]
+            zoom = DESENHO_A4_DPI / 72.0
+            matrix = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            img_bytes = pix.tobytes("png")
+            with Image.open(io.BytesIO(img_bytes)) as img:
+                return img.convert("RGB")
+        finally:
+            doc.close()
+
+    raise HTTPException(
+        status_code=422,
+        detail="Formato nao permitido. Use JPG, JPEG, PNG ou PDF.",
+    )
+
+
+@app.get("/api/producao/ordem-producao/desenho/impressao-a4/pagina")
+def obter_desenho_ordem_producao_impressao_a4_pagina(
+    arquivo: str,
+    pagina: int = 1,
+    usuario=Depends(validar_token),
+):
+    """Devolve UMA pagina do desenho ja como JPEG A4 retrato pronta para impressao.
+
+    Pipeline:
+      1) Carrega a pagina como imagem (rasteriza se for PDF).
+      2) Recorta margens brancas externas (resolve o caso "desenho pequeno no
+         centro da folha").
+      3) Rotaciona se a area util sair em paisagem.
+      4) Escala proporcionalmente e centraliza em uma folha A4 retrato branca.
+      5) Serializa em JPEG e devolve via StreamingResponse.
+
+    O front deve renderizar a resposta como <img> dentro de uma folha A4 fixa.
+    """
+    caminho = _resolver_arquivo_desenho(arquivo)
+
+    try:
+        img_original = _carregar_desenho_como_imagem(caminho, pagina=pagina)
+        img_cortada = _recortar_margem_branca(img_original)
+        img_a4 = _encaixar_em_a4_retrato(img_cortada)
+
+        saida = io.BytesIO()
+        img_a4.save(saida, format="JPEG", quality=95, optimize=True)
+        saida.seek(0)
+
+        return StreamingResponse(
+            saida,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Original-File": caminho.name,
+                "X-A4-Normalized": "S",
+                "X-A4-Page": str(pagina),
+                "X-A4-Width": str(A4_WIDTH_PX),
+                "X-A4-Height": str(A4_HEIGHT_PX),
+                "X-A4-DPI": str(DESENHO_A4_DPI),
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao normalizar desenho para A4: {str(exc)}",
+        )
+
+
+@app.get("/api/producao/ordem-producao/desenho/impressao-a4/manifest")
+def obter_manifest_desenho_ordem_producao_impressao_a4(
+    arquivo: str,
+    usuario=Depends(validar_token),
+):
+    """Lista as paginas normalizadas A4 disponiveis para um desenho.
+
+    - JPG/PNG: 1 pagina.
+    - PDF: total de paginas do arquivo (cada pagina vira uma folha A4).
+
+    O front usa este endpoint para descobrir quantos <img> precisa renderizar
+    e qual URL chamar para cada folha.
+    """
+    caminho = _resolver_arquivo_desenho(arquivo)
+    ext = caminho.suffix.lower()
+    arquivo_encoded = quote(caminho.name, safe="")
+
+    if ext in (".jpg", ".jpeg", ".png"):
+        tipo = "IMAGEM"
+    elif ext == ".pdf":
+        tipo = "PDF"
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="Formato nao permitido. Use JPG, JPEG, PNG ou PDF.",
+        )
+
+    total_paginas = _contar_paginas_desenho(caminho)
+
+    try:
+        stat = caminho.stat()
+        versao_cache = int(stat.st_mtime)
+    except Exception:
+        versao_cache = 0
+
+    paginas = []
+    for pag in range(1, total_paginas + 1):
+        paginas.append({
+            "pagina": pag,
+            "mime_type": "image/jpeg",
+            "url": (
+                "/api/producao/ordem-producao/desenho/impressao-a4/pagina"
+                f"?arquivo={arquivo_encoded}&pagina={pag}&v={versao_cache}"
+            ),
+        })
+
+    return {
+        "arquivo": caminho.name,
+        "tipo": tipo,
+        "total_paginas": total_paginas,
+        "layout": "A4_RETRATO_NORMALIZADO",
+        "dpi": DESENHO_A4_DPI,
+        "largura_px": A4_WIDTH_PX,
+        "altura_px": A4_HEIGHT_PX,
+        "paginas": paginas,
+    }
 
 
 @app.get("/api/producao/ordem-producao/desenhos/diagnostico")
@@ -14422,6 +15059,7 @@ def _consultar_dados_impressao_op(
                 COP.CodOri + RIGHT('000000000' + CAST(COP.NumOrp AS VARCHAR(9)), 9) AS codigo_barras_op,
 
                 COP.CodPro AS produto,
+                ISNULL(PRO.DesPro, '') AS descricao,
                 ISNULL(PRO.DesPro, '') AS descricao_produto,
                 COP.CodPro + ' - ' + ISNULL(PRO.DesPro, '') AS produto_descricao,
 
@@ -14448,7 +15086,8 @@ def _consultar_dados_impressao_op(
 
                 COP.CodRot AS cod_rot,
                 ISNULL(COP.RelPrd, '') AS agrupamento,
-                CAST('REV' AS VARCHAR(10)) AS revisao,
+                ISNULL(REVOP.revisao, '') AS revisao,
+                ISNULL(DEROP.derivacao, '') AS derivacao,
 
                 ISNULL(COP.ObsOrp, '') AS observacao_1,
                 ISNULL(COP.ObsOr2, '') AS observacao_2
@@ -14457,6 +15096,31 @@ def _consultar_dados_impressao_op(
             LEFT JOIN E075PRO PRO
                 ON PRO.CodEmp = COP.CodEmp
                AND PRO.CodPro = COP.CodPro
+
+            -- Revisao do desenho associada a OP (tabela customizada Senior)
+            OUTER APPLY (
+                SELECT TOP 1
+                    CONVERT(VARCHAR(20), COALESCE(UC.usu_revdes, '')) AS revisao
+                FROM usu_t900cop UC
+                WHERE UC.usu_codemp = COP.CodEmp
+                  AND UC.usu_codori = COP.CodOri
+                  AND UC.usu_numorp = COP.NumOrp
+                  AND COALESCE(UC.usu_revdes, '') <> ''
+                ORDER BY UC.usu_revdes DESC
+            ) REVOP
+
+            -- Derivacao da OP (E900QDO -> CodDer do produto principal)
+            OUTER APPLY (
+                SELECT TOP 1
+                    ISNULL(Q.CodDer, '') AS derivacao
+                FROM E900QDO Q
+                WHERE Q.CodEmp = COP.CodEmp
+                  AND Q.CodOri = COP.CodOri
+                  AND Q.NumOrp = COP.NumOrp
+                  AND Q.CodPro = COP.CodPro
+                ORDER BY Q.CodDer
+            ) DEROP
+
             WHERE COP.CodEmp = ?
               AND COP.CodOri = ?
               AND COP.NumOrp = ?
@@ -14660,6 +15324,9 @@ def _consultar_dados_impressao_op(
             # Remove o nome interno usado so para evitar conflito com a chave antiga
             operacao.pop("proxima_operacao_descricao_sql", None)
             operacao["narrativas"] = []
+            # Tempos formatados em min/h para o Lovable nao precisar formatar no front
+            operacao["tmp_unit_formatado"] = formatar_tempo_decimal_horas(operacao.get("tmp_unit"))
+            operacao["tmp_total_formatado"] = formatar_tempo_decimal_horas(operacao.get("tmp_total"))
 
         # ============================================================
         # 4) Narrativas
