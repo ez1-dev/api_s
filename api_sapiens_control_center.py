@@ -26,17 +26,28 @@ from urllib.parse import quote
 # Opcionais para metadados de imagens/PDFs dos desenhos da OP.
 # Se nao estiverem instalados, o codigo segue retornando metadata vazia.
 try:
-    from PIL import Image  # Pillow
+    from PIL import Image, ImageOps, ImageChops  # Pillow
 except Exception:
     Image = None  # type: ignore
+    ImageOps = None  # type: ignore
+    ImageChops = None  # type: ignore
 
 try:
-    from pypdf import PdfReader  # pypdf
+    from pypdf import PdfReader, PdfWriter, Transformation  # pypdf
 except Exception:
     try:
-        from PyPDF2 import PdfReader  # fallback para PyPDF2 antigo
+        from PyPDF2 import PdfReader, PdfWriter, Transformation  # fallback para PyPDF2 antigo
     except Exception:
         PdfReader = None  # type: ignore
+        PdfWriter = None  # type: ignore
+        Transformation = None  # type: ignore
+
+# PyMuPDF (fitz) — usado para rasterizar PDFs em imagens A4 normalizadas.
+# Sem ele, o endpoint /impressao-a4/pagina nao consegue tratar PDFs.
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    fitz = None  # type: ignore
 import requests
 from xml.sax.saxutils import escape as xml_escape
 import xml.etree.ElementTree as ET
@@ -13852,6 +13863,11 @@ def _metadata_arquivo_desenho(caminho: Path):
     try:
         if ext in [".jpg", ".jpeg", ".png"] and Image is not None:
             with Image.open(caminho) as img:
+                # exif_transpose corrige fotos que tem orientacao via EXIF
+                # (camera/celular) — assim largura/altura refletem o que
+                # de fato sera renderizado.
+                if ImageOps is not None:
+                    img = ImageOps.exif_transpose(img)
                 largura, altura = img.size
         elif ext == ".pdf" and PdfReader is not None:
             reader = PdfReader(str(caminho))
@@ -13871,14 +13887,44 @@ def _metadata_arquivo_desenho(caminho: Path):
             orientacao = "RETRATO"
             rotacao_recomendada = 0
 
+    rotacionar_para_retrato = rotacao_recomendada == 90
+
     return {
         "largura": largura,
         "altura": altura,
         "paginas": paginas,
         "orientacao": orientacao,
         "rotacao_recomendada": rotacao_recomendada,
+        "rotacionar_para_retrato": rotacionar_para_retrato,
         "a4_layout": "RETRATO",
     }
+
+
+def formatar_tempo_decimal_horas(valor):
+    """Converte horas decimais (ex: 0.3) em string legivel (ex: "18 min" ou "1 h 30 min").
+
+    Aceita None/"" e qualquer valor convertível em float. Retorna "" para entradas invalidas.
+    """
+    try:
+        horas_dec = float(valor or 0)
+    except Exception:
+        return ""
+
+    if horas_dec <= 0:
+        return "0 min"
+
+    minutos_total = int(round(horas_dec * 60))
+
+    if minutos_total < 60:
+        return f"{minutos_total} min"
+
+    horas = minutos_total // 60
+    minutos = minutos_total % 60
+
+    if minutos == 0:
+        return f"{horas} h"
+
+    return f"{horas} h {minutos} min"
 
 
 def localizar_desenhos_produto(cod_pro):
@@ -13940,7 +13986,27 @@ def localizar_desenhos_produto(cod_pro):
             tipo = FORMATOS_DESENHO_PERMITIDOS.get(ext, ext.replace(".", "").upper())
             metadata = _metadata_arquivo_desenho(arquivo)
 
+            # stat() pode falhar se o share cair entre o iterdir e este ponto.
+            # Caimos para None/0 em vez de quebrar — Lovable trata como "sem cache_key".
+            try:
+                stat = arquivo.stat()
+                tamanho_bytes = int(stat.st_size)
+                modificado_em = int(stat.st_mtime)
+            except Exception:
+                tamanho_bytes = None
+                modificado_em = None
+
+            # Sufixo :autorotate-v2 -> invalida cache local do front quando
+            # mudamos a logica de rotacao (forca re-download da versao nova).
+            cache_key = (
+                f"{arquivo.name}:{tamanho_bytes or 0}:{modificado_em or 0}:autorotate-v2"
+                if tamanho_bytes is not None and modificado_em is not None
+                else f"{arquivo.name}:autorotate-v2"
+            )
+
             arquivo_encoded = quote(arquivo.name, safe="")
+            # &v={mtime} forca o browser a nao reaproveitar imagem antiga.
+            versao_cache = modificado_em if modificado_em is not None else 0
 
             desenhos.append({
                 "ordem": len(desenhos) + 1,
@@ -13948,10 +14014,37 @@ def localizar_desenhos_produto(cod_pro):
                 "tipo": tipo,
                 "extensao": ext,
                 "mime_type": mimetypes.guess_type(str(arquivo))[0] or "application/octet-stream",
+                "tamanho_bytes": tamanho_bytes,
+                "modificado_em": modificado_em,
+                "cache_key": cache_key,
                 "url": (
                     "/api/producao/ordem-producao/desenho"
                     f"?arquivo={arquivo_encoded}"
                 ),
+                # url_impressao: fallback simples (pagina 1 normalizada).
+                # Front prefere usar url_manifest_a4 para descobrir o numero
+                # real de paginas (PDF pode ter 2+ paginas).
+                "url_impressao": (
+                    "/api/producao/ordem-producao/desenho/impressao-a4/pagina"
+                    f"?arquivo={arquivo_encoded}&pagina=1&v={versao_cache}"
+                ),
+                "url_manifest_a4": (
+                    "/api/producao/ordem-producao/desenho/impressao-a4/manifest"
+                    f"?arquivo={arquivo_encoded}&v={versao_cache}"
+                ),
+                # Mantidos como legados (retrocompat) — front nao precisa usar.
+                "url_impressao_a4_inteiro": (
+                    "/api/producao/ordem-producao/desenho/impressao-a4"
+                    f"?arquivo={arquivo_encoded}&v={versao_cache}"
+                ),
+                "url_impressao_legado": (
+                    "/api/producao/ordem-producao/desenho/impressao"
+                    f"?arquivo={arquivo_encoded}&auto_rotate=S&v={versao_cache}"
+                ),
+                "usar_paginas_a4_normalizadas": True,
+                "layout_impressao": "A4_RETRATO_NORMALIZADO",
+                "rotacao_automatica": True,
+                "normalizacao_a4": True,
                 "imprimir_em_nova_pagina": True,
                 "iniciar_apos_op": True,
                 **metadata,
@@ -14008,25 +14101,856 @@ def obter_desenho_ordem_producao(
 
     media_type = mimetypes.guess_type(str(caminho))[0] or "application/octet-stream"
 
+    # Metadados para cache no browser e cache local do Lovable.
+    # Cache-Control: 1 dia (desenhos quase nunca mudam; se atualizar, mtime
+    # muda e a cache_key no /opcoes invalida automaticamente no front).
+    headers = {
+        "Cache-Control": "public, max-age=86400",
+        "X-File-Name": caminho.name,
+    }
+    try:
+        st = caminho.stat()
+        headers["X-File-Size"] = str(st.st_size)
+        headers["X-File-MTime"] = str(int(st.st_mtime))
+    except Exception:
+        pass
+
     return FileResponse(
         str(caminho),
         media_type=media_type,
         filename=caminho.name,
+        headers=headers,
     )
+
+
+def _resolver_arquivo_desenho(arquivo: str) -> Path:
+    """Resolve e valida o caminho de um desenho na pasta FIXA da API.
+
+    Reaproveitado por /desenho/impressao. Bloqueia path traversal
+    (os.path.basename), pasta inacessivel, arquivo inexistente e
+    formato nao permitido — sempre com HTTPException apropriada.
+    """
+    nome_arquivo = os.path.basename(str(arquivo or "").strip())
+    if not nome_arquivo:
+        raise HTTPException(status_code=422, detail="Arquivo não informado.")
+
+    pasta = Path(PASTA_DESENHOS_OP_PADRAO)
+    if not pasta.exists() or not pasta.is_dir():
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Pasta de desenhos não encontrada ou inacessível pela API: "
+                f"{str(pasta)}"
+            ),
+        )
+
+    caminho = pasta / nome_arquivo
+    if not caminho.exists() or not caminho.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Desenho não encontrado: {nome_arquivo}",
+        )
+
+    if caminho.suffix.lower() not in [".jpg", ".jpeg", ".png", ".pdf"]:
+        raise HTTPException(
+            status_code=422,
+            detail="Formato não permitido. Use JPG, JPEG, PNG ou PDF.",
+        )
+
+    return caminho
+
+
+@app.get("/api/producao/ordem-producao/desenho/impressao")
+def obter_desenho_ordem_producao_impressao(
+    arquivo: str,
+    auto_rotate: str = "S",
+    usuario=Depends(validar_token),
+):
+    """Serve o desenho JA PREPARADO para impressao A4.
+
+    Para JPG/JPEG/PNG em paisagem (largura > altura) e auto_rotate=S, a
+    imagem e fisicamente rotacionada 90deg via Pillow (rotate expand=True)
+    — assim o Lovable nao precisa de `transform: rotate(90deg)` no CSS,
+    que so gira visualmente mas mantem a caixa em paisagem na impressao.
+
+    PDFs sao servidos como estao (rotacao de PDF e tratada no front).
+    Se Pillow nao estiver instalado, cai no arquivo original sem rotacao.
+    """
+    caminho = _resolver_arquivo_desenho(arquivo)
+    ext = caminho.suffix.lower()
+
+    # PDF: rotaciona paginas em paisagem (largura > altura) para retrato
+    # quando auto_rotate=S, devolvendo um PDF em A4 retrato pronto para
+    # imprimir. Se pypdf/PdfWriter nao estiver instalado, devolve o
+    # original como fallback.
+    if ext == ".pdf":
+        auto_rotate_pdf = str(auto_rotate or "S").upper().strip() == "S"
+        if not auto_rotate_pdf or PdfReader is None or PdfWriter is None:
+            return FileResponse(
+                str(caminho),
+                media_type="application/pdf",
+                filename=caminho.name,
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Auto-Rotate": "PDF-ORIGINAL",
+                },
+            )
+
+        try:
+            reader = PdfReader(str(caminho))
+            writer = PdfWriter()
+            paginas_rotacionadas = 0
+            for page in reader.pages:
+                try:
+                    box = page.mediabox
+                    largura = float(box.width)
+                    altura = float(box.height)
+                    if largura > altura:
+                        page.rotate(90)
+                        paginas_rotacionadas += 1
+                except Exception:
+                    pass
+                writer.add_page(page)
+
+            saida = io.BytesIO()
+            writer.write(saida)
+            saida.seek(0)
+            return StreamingResponse(
+                saida,
+                media_type="application/pdf",
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Original-File": caminho.name,
+                    "X-Auto-Rotate": "S" if paginas_rotacionadas > 0 else "N",
+                    "X-Pages-Rotated": str(paginas_rotacionadas),
+                    "X-Total-Pages": str(len(reader.pages)),
+                    "X-A4-Layout": "RETRATO",
+                },
+            )
+        except Exception:
+            return FileResponse(
+                str(caminho),
+                media_type="application/pdf",
+                filename=caminho.name,
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Auto-Rotate": "PDF-ORIGINAL",
+                    "X-Rotate-Skip": "erro-pypdf",
+                },
+            )
+
+    # Sem Pillow no servidor -> fallback: devolve o arquivo original.
+    if Image is None:
+        media_type = mimetypes.guess_type(str(caminho))[0] or "application/octet-stream"
+        return FileResponse(
+            str(caminho),
+            media_type=media_type,
+            filename=caminho.name,
+            headers={
+                "Cache-Control": "no-store",
+                "X-Auto-Rotate": "N",
+                "X-Rotate-Skip": "pillow-indisponivel",
+            },
+        )
+
+    try:
+        with Image.open(caminho) as img:
+            if ImageOps is not None:
+                img = ImageOps.exif_transpose(img)
+
+            largura, altura = img.size
+            deve_rotacionar = (
+                str(auto_rotate or "S").upper().strip() == "S"
+                and largura > altura
+            )
+
+            if deve_rotacionar:
+                img = img.rotate(90, expand=True)
+
+            largura_final, altura_final = img.size
+
+            saida = io.BytesIO()
+            if ext == ".png":
+                media_type = "image/png"
+                img.save(saida, format="PNG", optimize=True)
+            else:
+                media_type = "image/jpeg"
+                if img.mode in ("RGBA", "P", "LA"):
+                    img = img.convert("RGB")
+                img.save(saida, format="JPEG", quality=95, optimize=True)
+            saida.seek(0)
+
+        return StreamingResponse(
+            saida,
+            media_type=media_type,
+            headers={
+                # no-store: a versao rotacionada nunca deve ser servida de
+                # cache antigo do browser. Reuso entre operacoes/OPs fica
+                # no cache em memoria do Lovable (Map por cache_key).
+                "Cache-Control": "no-store",
+                "X-Original-File": caminho.name,
+                "X-Auto-Rotate": "S" if deve_rotacionar else "N",
+                "X-Original-Width": str(largura),
+                "X-Original-Height": str(altura),
+                "X-Final-Width": str(largura_final),
+                "X-Final-Height": str(altura_final),
+            },
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao preparar desenho para impressão: {str(exc)}",
+        )
+
+
+# ============================================================================
+# Normalizacao definitiva A4 retrato (substitui /desenho/impressao no front).
+#
+# - JPG/PNG: abre, corrige EXIF, rotaciona se paisagem, redimensiona
+#   proporcionalmente dentro da area util e centraliza numa folha A4 branca.
+# - PDF: percorre pagina a pagina, rotaciona paisagens, escala e centraliza
+#   sobre uma pagina A4 retrato em branco. Frente/verso saem como duas
+#   paginas A4 retrato distintas.
+# ============================================================================
+
+# A4 em pontos PDF (1pt = 1/72 polegada) — usado pelo pypdf
+A4_WIDTH_PT = 595.2756
+A4_HEIGHT_PT = 841.8898
+A4_MARGIN_PT = 18  # ~0.25 polegada de margem segura
+
+# A4 em pixels — usado para imagens (Pillow / fitz).
+# 200 DPI eh um compromisso entre nitidez e tamanho do JPEG enviado pro front.
+DESENHO_A4_DPI = 200
+A4_WIDTH_PX = int(8.27 * DESENHO_A4_DPI)   # 1654 px @ 200 DPI
+A4_HEIGHT_PX = int(11.69 * DESENHO_A4_DPI)  # 2338 px @ 200 DPI
+A4_MARGIN_PX = int(0.25 * DESENHO_A4_DPI)   # ~50 px de margem segura
+
+# Recorte de margem branca antes de encaixar em A4.
+# - WHITE_TOLERANCE: pixels com luminancia < deste valor sao considerados
+#   "diferentes de branco" e entram na bounding box do conteudo util.
+# - CROP_PADDING_PX: respiro adicionado em volta da bbox para nao colar o
+#   desenho na borda da folha A4 final.
+WHITE_TOLERANCE = 14
+CROP_PADDING_PX = 20
+
+
+def _normalizar_imagem_para_a4(caminho: Path):
+    """Gera uma imagem A4 retrato (JPEG) com o desenho centralizado e escalado.
+
+    Se a imagem original estiver em paisagem (largura > altura), eh rotacionada
+    90deg antes de ser encaixada. EXIF eh corrigido para que orientacoes
+    vindas de camera/celular nao saiam tortas.
+    """
+    if Image is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Pillow nao esta instalado. Instale pillow para normalizar imagens.",
+        )
+
+    try:
+        with Image.open(caminho) as img:
+            if ImageOps is not None:
+                img = ImageOps.exif_transpose(img)
+
+            img = img.convert("RGB")
+
+            largura, altura = img.size
+            rotacionou = False
+            if largura > altura:
+                img = img.rotate(90, expand=True)
+                rotacionou = True
+
+            area_largura = A4_WIDTH_PX - (A4_MARGIN_PX * 2)
+            area_altura = A4_HEIGHT_PX - (A4_MARGIN_PX * 2)
+
+            escala = min(
+                area_largura / img.width,
+                area_altura / img.height,
+            )
+            # Nunca ampliar acima do tamanho original (evita perda de qualidade
+            # em desenhos pequenos virem borrados ao serem esticados ate A4).
+            if escala > 1.0:
+                escala = 1.0
+
+            nova_largura = max(1, int(img.width * escala))
+            nova_altura = max(1, int(img.height * escala))
+
+            img_redimensionada = img.resize(
+                (nova_largura, nova_altura),
+                Image.LANCZOS,
+            )
+
+            folha = Image.new("RGB", (A4_WIDTH_PX, A4_HEIGHT_PX), "white")
+            pos_x = (A4_WIDTH_PX - nova_largura) // 2
+            pos_y = (A4_HEIGHT_PX - nova_altura) // 2
+            folha.paste(img_redimensionada, (pos_x, pos_y))
+
+            saida = io.BytesIO()
+            folha.save(saida, format="JPEG", quality=95, optimize=True)
+            saida.seek(0)
+
+        return StreamingResponse(
+            saida,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Original-File": caminho.name,
+                "X-A4-Normalized": "S",
+                "X-A4-Orientation": "PORTRAIT",
+                "X-A4-Rotated": "S" if rotacionou else "N",
+                "X-Original-Width": str(largura),
+                "X-Original-Height": str(altura),
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao normalizar imagem para A4: {str(exc)}",
+        )
+
+
+def _normalizar_pdf_para_a4(caminho: Path):
+    """Gera um PDF A4 retrato com cada pagina do PDF original encaixada.
+
+    Para cada pagina:
+    - Detecta se eh paisagem (largura > altura).
+    - Rotaciona 90deg se necessario.
+    - Escala proporcionalmente para caber dentro da area util.
+    - Centraliza sobre uma pagina A4 retrato em branco.
+
+    O resultado final eh um PDF com a mesma quantidade de paginas do original,
+    todas em A4 retrato.
+    """
+    if PdfReader is None or PdfWriter is None or Transformation is None:
+        raise HTTPException(
+            status_code=500,
+            detail="pypdf nao esta instalado. Instale pypdf para normalizar PDFs.",
+        )
+
+    try:
+        reader = PdfReader(str(caminho))
+        writer = PdfWriter()
+
+        area_w = A4_WIDTH_PT - (A4_MARGIN_PT * 2)
+        area_h = A4_HEIGHT_PT - (A4_MARGIN_PT * 2)
+
+        paginas_rotacionadas = 0
+
+        for pagina_original in reader.pages:
+            src_w = float(pagina_original.mediabox.width)
+            src_h = float(pagina_original.mediabox.height)
+            if src_w <= 0 or src_h <= 0:
+                # Pagina degenerada — copia sem transformacao
+                writer.add_page(pagina_original)
+                continue
+
+            deve_rotacionar = src_w > src_h
+
+            if deve_rotacionar:
+                content_w = src_h
+                content_h = src_w
+                paginas_rotacionadas += 1
+            else:
+                content_w = src_w
+                content_h = src_h
+
+            escala = min(area_w / content_w, area_h / content_h)
+            # Nao ampliar conteudo pequeno acima do tamanho real
+            if escala > 1.0:
+                escala = 1.0
+
+            final_w = content_w * escala
+            final_h = content_h * escala
+            offset_x = (A4_WIDTH_PT - final_w) / 2.0
+            offset_y = (A4_HEIGHT_PT - final_h) / 2.0
+
+            # Cria pagina A4 retrato em branco
+            pagina_a4 = writer.add_blank_page(
+                width=A4_WIDTH_PT,
+                height=A4_HEIGHT_PT,
+            )
+
+            transform = Transformation()
+            if deve_rotacionar:
+                # 1) rotaciona 90deg (conteudo vai para x negativo)
+                # 2) translata por src_h para trazer de volta ao 1o quadrante
+                # 3) escala
+                # 4) translata para posicionar centralizado na A4
+                transform = (
+                    transform
+                    .rotate(90)
+                    .translate(tx=src_h, ty=0)
+                    .scale(escala)
+                    .translate(tx=offset_x, ty=offset_y)
+                )
+            else:
+                transform = (
+                    transform
+                    .scale(escala)
+                    .translate(tx=offset_x, ty=offset_y)
+                )
+
+            pagina_original.add_transformation(transform)
+            pagina_a4.merge_page(pagina_original)
+
+        saida = io.BytesIO()
+        writer.write(saida)
+        saida.seek(0)
+
+        return StreamingResponse(
+            saida,
+            media_type="application/pdf",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Original-File": caminho.name,
+                "X-A4-Normalized": "S",
+                "X-A4-Orientation": "PORTRAIT",
+                "X-Pages-Rotated": str(paginas_rotacionadas),
+                "X-Total-Pages": str(len(reader.pages)),
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao normalizar PDF para A4: {str(exc)}",
+        )
+
+
+@app.get("/api/producao/ordem-producao/desenho/impressao-a4")
+def obter_desenho_ordem_producao_impressao_a4(
+    arquivo: str,
+    usuario=Depends(validar_token),
+):
+    """Devolve o desenho JA NORMALIZADO em A4 retrato, pronto para impressao.
+
+    Diferente de /desenho/impressao (que so rotaciona JPG/PNG e devolvia PDF
+    quase original), este endpoint sempre entrega:
+    - JPG/PNG: um JPEG A4 retrato com o desenho centralizado e escalado.
+    - PDF: um PDF onde toda pagina eh A4 retrato com o conteudo original
+      centralizado, rotacionando paisagens automaticamente.
+
+    O Lovable deve usar exclusivamente este endpoint para impressao —
+    nao aplicar transform/rotate no CSS, nao redimensionar manualmente
+    no front, nao imprimir o arquivo original.
+    """
+    caminho = _resolver_arquivo_desenho(arquivo)
+    ext = caminho.suffix.lower()
+
+    if ext in (".jpg", ".jpeg", ".png"):
+        return _normalizar_imagem_para_a4(caminho)
+
+    if ext == ".pdf":
+        return _normalizar_pdf_para_a4(caminho)
+
+    raise HTTPException(
+        status_code=422,
+        detail="Formato nao permitido. Use JPG, JPEG, PNG ou PDF.",
+    )
+
+
+# ============================================================================
+# Normalizacao A4 v2 — pipeline imagem-unica (JPG/PNG/PDF).
+#
+# Diferente de /desenho/impressao-a4 (que devolve JPEG p/ imagem e PDF p/ PDF),
+# este pipeline rasteriza tudo (inclusive PDFs) em JPEG A4 retrato, com
+# recorte automatico de margem branca interna. Resolve dois problemas:
+#
+# 1) Desenhos que vinham pequenos no centro com bastante area branca.
+# 2) PDFs cujas paginas em paisagem nao encaixavam corretamente.
+#
+# O front passa a renderizar SEMPRE como <img> dentro de .op-drawing-page
+# 196mm x 283mm — sem PDF embed, sem CSS rotate, sem object/iframe.
+# ============================================================================
+
+
+def _recortar_margem_branca(img):
+    """Remove margens brancas/quase-brancas externas do desenho.
+
+    Resolve o caso em que o desenho vem cercado de area branca dentro do
+    arquivo (PDF com pouco conteudo no centro, JPG escaneado com bordas
+    grandes), o que fazia o resultado final ficar pequeno mesmo com escala
+    proporcional.
+    """
+    if Image is None or ImageChops is None:
+        return img
+
+    rgb = img.convert("RGB")
+
+    fundo = Image.new("RGB", rgb.size, (255, 255, 255))
+    diff = ImageChops.difference(rgb, fundo).convert("L")
+
+    # Mascara de pixels "nao brancos" (luminancia da diferenca > tolerancia)
+    mask = diff.point(lambda p: 255 if p > WHITE_TOLERANCE else 0)
+
+    bbox = mask.getbbox()
+    if not bbox:
+        # Imagem totalmente branca — devolve original p/ nao quebrar
+        return rgb
+
+    left, top, right, bottom = bbox
+    left = max(0, left - CROP_PADDING_PX)
+    top = max(0, top - CROP_PADDING_PX)
+    right = min(rgb.width, right + CROP_PADDING_PX)
+    bottom = min(rgb.height, bottom + CROP_PADDING_PX)
+
+    return rgb.crop((left, top, right, bottom))
+
+
+def _encaixar_em_a4_retrato(img):
+    """Encaixa uma imagem (ja recortada) em uma folha A4 retrato branca.
+
+    - Rotaciona 90deg se a imagem ainda estiver em paisagem.
+    - Escala proporcionalmente para caber na area util (descontada a margem).
+    - Centraliza e pinta sobre fundo branco A4.
+    """
+    if Image is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Pillow nao esta instalado. Instale Pillow para normalizar desenhos.",
+        )
+
+    img = img.convert("RGB")
+
+    if img.width > img.height:
+        img = img.rotate(90, expand=True)
+
+    area_w = A4_WIDTH_PX - (A4_MARGIN_PX * 2)
+    area_h = A4_HEIGHT_PX - (A4_MARGIN_PX * 2)
+
+    escala = min(area_w / img.width, area_h / img.height)
+    nova_w = max(1, int(img.width * escala))
+    nova_h = max(1, int(img.height * escala))
+
+    img_redim = img.resize((nova_w, nova_h), Image.LANCZOS)
+
+    folha = Image.new("RGB", (A4_WIDTH_PX, A4_HEIGHT_PX), "white")
+    pos_x = (A4_WIDTH_PX - nova_w) // 2
+    pos_y = (A4_HEIGHT_PX - nova_h) // 2
+    folha.paste(img_redim, (pos_x, pos_y))
+
+    return folha
+
+
+def _contar_paginas_desenho(caminho: Path) -> int:
+    """Retorna o total de paginas do desenho.
+
+    - JPG/PNG: sempre 1.
+    - PDF: usa fitz quando disponivel, senao pypdf.
+    - Outros: levanta 422.
+    """
+    ext = caminho.suffix.lower()
+
+    if ext in (".jpg", ".jpeg", ".png"):
+        return 1
+
+    if ext == ".pdf":
+        if fitz is not None:
+            doc = fitz.open(str(caminho))
+            try:
+                return len(doc)
+            finally:
+                doc.close()
+        if PdfReader is not None:
+            try:
+                return len(PdfReader(str(caminho)).pages)
+            except Exception:
+                return 1
+        # Sem nenhuma biblioteca de PDF -> trata como 1 pagina e o /pagina
+        # devolvera erro 500 explicando o que falta instalar.
+        return 1
+
+    raise HTTPException(
+        status_code=422,
+        detail="Formato nao permitido. Use JPG, JPEG, PNG ou PDF.",
+    )
+
+
+def _carregar_desenho_como_imagem(caminho: Path, pagina: int = 1):
+    """Carrega uma pagina do desenho como Pillow.Image RGB.
+
+    - JPG/PNG: lê direto (com correcao EXIF). Apenas pagina=1 e valida.
+    - PDF: rasteriza via PyMuPDF (fitz) em DESENHO_A4_DPI.
+    """
+    if Image is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Pillow nao esta instalado. Instale Pillow para normalizar desenhos.",
+        )
+
+    ext = caminho.suffix.lower()
+
+    if ext in (".jpg", ".jpeg", ".png"):
+        if pagina != 1:
+            raise HTTPException(
+                status_code=404,
+                detail="Imagem possui somente uma pagina.",
+            )
+        with Image.open(caminho) as img:
+            if ImageOps is not None:
+                img = ImageOps.exif_transpose(img)
+            return img.convert("RGB")
+
+    if ext == ".pdf":
+        if fitz is None:
+            raise HTTPException(
+                status_code=500,
+                detail="PyMuPDF (fitz) nao esta instalado. Instale pymupdf para rasterizar PDFs.",
+            )
+
+        doc = fitz.open(str(caminho))
+        try:
+            total = len(doc)
+            if pagina < 1 or pagina > total:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Pagina {pagina} nao existe no PDF. Total: {total}.",
+                )
+
+            page = doc[pagina - 1]
+            zoom = DESENHO_A4_DPI / 72.0
+            matrix = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            img_bytes = pix.tobytes("png")
+            with Image.open(io.BytesIO(img_bytes)) as img:
+                return img.convert("RGB")
+        finally:
+            doc.close()
+
+    raise HTTPException(
+        status_code=422,
+        detail="Formato nao permitido. Use JPG, JPEG, PNG ou PDF.",
+    )
+
+
+@app.get("/api/producao/ordem-producao/desenho/impressao-a4/pagina")
+def obter_desenho_ordem_producao_impressao_a4_pagina(
+    arquivo: str,
+    pagina: int = 1,
+    usuario=Depends(validar_token),
+):
+    """Devolve UMA pagina do desenho ja como JPEG A4 retrato pronta para impressao.
+
+    Pipeline:
+      1) Carrega a pagina como imagem (rasteriza se for PDF).
+      2) Recorta margens brancas externas (resolve o caso "desenho pequeno no
+         centro da folha").
+      3) Rotaciona se a area util sair em paisagem.
+      4) Escala proporcionalmente e centraliza em uma folha A4 retrato branca.
+      5) Serializa em JPEG e devolve via StreamingResponse.
+
+    O front deve renderizar a resposta como <img> dentro de uma folha A4 fixa.
+    """
+    caminho = _resolver_arquivo_desenho(arquivo)
+
+    # Checagem antecipada de Pillow — sem Pillow nao da pra fazer nada.
+    # Pega o erro cedo com mensagem clara em vez de estourar la dentro.
+    if Image is None:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "mensagem": "Pillow nao esta instalado na API. Instale Pillow>=10.0.0.",
+                "arquivo": caminho.name,
+                "pagina": pagina,
+                "pillow_disponivel": False,
+                "pymupdf_disponivel": fitz is not None,
+            },
+        )
+
+    try:
+        img_original = _carregar_desenho_como_imagem(caminho, pagina=pagina)
+        img_cortada = _recortar_margem_branca(img_original)
+        img_a4 = _encaixar_em_a4_retrato(img_cortada)
+
+        saida = io.BytesIO()
+        img_a4.save(saida, format="JPEG", quality=92, optimize=True)
+        saida.seek(0)
+
+        return StreamingResponse(
+            saida,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Original-File": caminho.name,
+                "X-A4-Normalized": "S",
+                "X-A4-Page": str(pagina),
+                "X-A4-Width": str(A4_WIDTH_PX),
+                "X-A4-Height": str(A4_HEIGHT_PX),
+                "X-A4-DPI": str(DESENHO_A4_DPI),
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Erro estruturado: o front consegue extrair "erro" e ler as flags
+        # de disponibilidade sem precisar chamar /diagnostico de novo.
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "mensagem": "Erro ao normalizar desenho para A4.",
+                "arquivo": caminho.name,
+                "pagina": pagina,
+                "erro": str(exc),
+                "pillow_disponivel": Image is not None,
+                "pymupdf_disponivel": fitz is not None,
+            },
+        )
+
+
+@app.get("/api/producao/ordem-producao/desenho/impressao-a4/diagnostico")
+def diagnosticar_desenho_impressao_a4(
+    arquivo: str,
+    usuario=Depends(validar_token),
+):
+    """Diagnostico individual de UM desenho para o pipeline /impressao-a4.
+
+    Use este endpoint quando /pagina ou /manifest falharem para descobrir
+    a causa exata:
+    - pillow_disponivel=False -> falta instalar Pillow.
+    - pymupdf_disponivel=False e arquivo .pdf -> falta instalar pymupdf.
+    - existe=False -> arquivo nao esta na pasta de desenhos.
+    - extensao desconhecida -> formato nao permitido.
+
+    NAO levanta excecao: sempre devolve 200 com { ok: bool, ... }.
+    """
+    try:
+        caminho = _resolver_arquivo_desenho(arquivo)
+        existe = caminho.exists() and caminho.is_file()
+        tamanho_bytes = None
+        modificado_em = None
+        if existe:
+            try:
+                stat = caminho.stat()
+                tamanho_bytes = int(stat.st_size)
+                modificado_em = int(stat.st_mtime)
+            except Exception:
+                pass
+
+        return {
+            "ok": True,
+            "arquivo": caminho.name,
+            "caminho": str(caminho),
+            "existe": existe,
+            "extensao": caminho.suffix.lower(),
+            "tamanho_bytes": tamanho_bytes,
+            "modificado_em": modificado_em,
+            "pillow_disponivel": Image is not None,
+            "pymupdf_disponivel": fitz is not None,
+            "pypdf_disponivel": PdfReader is not None,
+            "dpi_normalizacao": DESENHO_A4_DPI,
+            "a4_largura_px": A4_WIDTH_PX,
+            "a4_altura_px": A4_HEIGHT_PX,
+            "pasta_configurada": str(Path(PASTA_DESENHOS_OP_PADRAO)),
+        }
+    except HTTPException as exc:
+        # Erros conhecidos do resolver (404/422) viram diagnostico, nao excecao.
+        detalhe = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+        return {
+            "ok": False,
+            "arquivo_solicitado": arquivo,
+            "status_resolver": exc.status_code,
+            "erro": detalhe,
+            "pillow_disponivel": Image is not None,
+            "pymupdf_disponivel": fitz is not None,
+            "pypdf_disponivel": PdfReader is not None,
+            "pasta_configurada": str(Path(PASTA_DESENHOS_OP_PADRAO)),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "arquivo_solicitado": arquivo,
+            "erro": str(exc),
+            "pillow_disponivel": Image is not None,
+            "pymupdf_disponivel": fitz is not None,
+            "pypdf_disponivel": PdfReader is not None,
+            "pasta_configurada": str(Path(PASTA_DESENHOS_OP_PADRAO)),
+        }
+
+
+@app.get("/api/producao/ordem-producao/desenho/impressao-a4/manifest")
+def obter_manifest_desenho_ordem_producao_impressao_a4(
+    arquivo: str,
+    usuario=Depends(validar_token),
+):
+    """Lista as paginas normalizadas A4 disponiveis para um desenho.
+
+    - JPG/PNG: 1 pagina.
+    - PDF: total de paginas do arquivo (cada pagina vira uma folha A4).
+
+    O front usa este endpoint para descobrir quantos <img> precisa renderizar
+    e qual URL chamar para cada folha.
+    """
+    caminho = _resolver_arquivo_desenho(arquivo)
+    ext = caminho.suffix.lower()
+    arquivo_encoded = quote(caminho.name, safe="")
+
+    if ext in (".jpg", ".jpeg", ".png"):
+        tipo = "IMAGEM"
+    elif ext == ".pdf":
+        tipo = "PDF"
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="Formato nao permitido. Use JPG, JPEG, PNG ou PDF.",
+        )
+
+    total_paginas = _contar_paginas_desenho(caminho)
+
+    try:
+        stat = caminho.stat()
+        versao_cache = int(stat.st_mtime)
+    except Exception:
+        versao_cache = 0
+
+    paginas = []
+    for pag in range(1, total_paginas + 1):
+        paginas.append({
+            "pagina": pag,
+            "mime_type": "image/jpeg",
+            "url": (
+                "/api/producao/ordem-producao/desenho/impressao-a4/pagina"
+                f"?arquivo={arquivo_encoded}&pagina={pag}&v={versao_cache}"
+            ),
+        })
+
+    return {
+        "arquivo": caminho.name,
+        "tipo": tipo,
+        "total_paginas": total_paginas,
+        "layout": "A4_RETRATO_NORMALIZADO",
+        "dpi": DESENHO_A4_DPI,
+        "largura_px": A4_WIDTH_PX,
+        "altura_px": A4_HEIGHT_PX,
+        "paginas": paginas,
+    }
 
 
 @app.get("/api/producao/ordem-producao/desenhos/diagnostico")
 def diagnosticar_desenhos_op(
-    cod_pro: str,
+    cod_emp: Optional[str] = "1",
+    cod_ori: Optional[str] = None,
+    num_orp: Optional[str] = None,
+    cod_pro: Optional[str] = None,
     usuario=Depends(validar_token),
 ):
     """Diagnostico de acesso aa pasta de desenhos da OP.
 
-    Util quando o front pergunta "por que nao vem desenho?" — devolve:
-    - pasta configurada
-    - se a pasta existe / e diretorio
-    - lista de nomes/extensoes que a API tentou casar
-    - lista do que efetivamente encontrou (rodando o helper de verdade)
+    Pode ser chamado de 2 formas:
+    - Direto pelo produto:  ?cod_pro=110001466
+    - Pela OP (resolve CodPro via E900COP): ?cod_emp=1&cod_ori=250&num_orp=1112
+
+    Devolve:
+    - pasta configurada (UNC ou mount Linux)
+    - se a pasta existe / eh diretorio
+    - lista de nomes/extensoes que a API tentaria casar
+    - amostra dos arquivos efetivamente na pasta
+    - lista do que o helper localizar_desenhos_produto retorna
     """
     try:
         pasta = Path(PASTA_DESENHOS_OP_PADRAO)
@@ -14037,7 +14961,43 @@ def diagnosticar_desenhos_op(
         pasta_existe = False
         pasta_dir = False
 
-    cod_pro_s = str(cod_pro or "").strip()
+    # Normaliza inputs
+    cod_emp_int = _to_int_or_none(cod_emp, "cod_emp", default=1) or 1
+    num_orp_int = _to_int_or_none(num_orp, "num_orp", default=None)
+    cod_ori_s = (str(cod_ori).strip() if cod_ori is not None else "") or None
+    cod_pro_s = (str(cod_pro).strip() if cod_pro is not None else "")
+
+    # Se nao veio cod_pro mas veio (cod_ori + num_orp), busca o CodPro da OP
+    cod_pro_resolvido_via_op = False
+    erro_resolucao_op = None
+    if not cod_pro_s and cod_ori_s and num_orp_int:
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    """
+                    SELECT CodPro
+                    FROM E900COP
+                    WHERE CodEmp = ?
+                      AND CodOri = ?
+                      AND NumOrp = ?
+                      AND CodOri <> '100'
+                      AND SitOrp <> 'C'
+                    """,
+                    [cod_emp_int, cod_ori_s, num_orp_int],
+                )
+                row = cursor.fetchone()
+                if row and row[0]:
+                    cod_pro_s = str(row[0]).strip()
+                    cod_pro_resolvido_via_op = True
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception as exc:
+            erro_resolucao_op = str(exc)
 
     candidatos = []
     if cod_pro_s:
@@ -14053,14 +15013,19 @@ def diagnosticar_desenhos_op(
         try:
             arquivos_na_pasta = sorted(
                 arq.name for arq in pasta.iterdir() if arq.is_file()
-            )[:200]  # limita pra nao explodir a resposta
+            )[:200]
         except Exception:
             arquivos_na_pasta = []
         if cod_pro_s:
             desenhos = localizar_desenhos_produto(cod_pro_s)
 
     return {
-        "cod_pro": cod_pro_s,
+        "cod_emp": cod_emp_int,
+        "cod_ori": cod_ori_s,
+        "num_orp": num_orp_int,
+        "cod_pro": cod_pro_s or None,
+        "cod_pro_resolvido_via_op": cod_pro_resolvido_via_op,
+        "erro_resolucao_op": erro_resolucao_op,
         "pasta_configurada": str(pasta) if pasta is not None else None,
         "pasta_existe": pasta_existe,
         "pasta_eh_diretorio": pasta_dir,
@@ -14073,8 +15038,78 @@ def diagnosticar_desenhos_op(
             "(monte o UNC em /mnt/desenhos_op em Linux/Docker e setar env "
             "PASTA_DESENHOS_OP). Se pasta_existe=true mas desenhos_encontrados=[], "
             "veja amostra_arquivos_na_pasta para conferir se o cod_pro casa com "
-            "algum nome no padrao CODPRO ou CODPRO-N."
+            "algum nome no padrao CODPRO ou CODPRO-N. Se cod_pro_resolvido_via_op=false "
+            "e voce passou cod_ori+num_orp, a OP nao existe ou esta cancelada/origem 100."
         ),
+    }
+
+
+@app.get("/api/producao/ordem-producao/observacoes")
+def consultar_observacoes_ordem_producao(
+    cod_emp: Optional[str] = "1",
+    cod_ori: Optional[str] = None,
+    num_orp: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    """Lista as observacoes (E900OBS) de uma OP.
+
+    Endpoint de consulta sob demanda — usado pelo Lovable para abrir
+    um modal/drawer com as observacoes da OP, sem polui-las dentro da
+    impressao do MCAP700.
+    """
+    cod_emp_int = _to_int_or_none(cod_emp, "cod_emp", default=1) or 1
+    num_orp_int = _to_int_or_none(num_orp, "num_orp", default=None)
+    cod_ori_s = (str(cod_ori).strip() if cod_ori is not None else "") or None
+
+    if not cod_ori_s or not num_orp_int:
+        raise HTTPException(
+            status_code=422,
+            detail="Informe origem (cod_ori) e número da OP (num_orp).",
+        )
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT
+                OBS.CodEmp AS cod_emp,
+                OBS.CodOri AS cod_ori,
+                OBS.NumOrp AS num_orp,
+                OBS.TipObs AS tipo_observacao,
+                OBS.SeqObs AS sequencia,
+                OBS.DesObs AS observacao
+            FROM E900OBS OBS
+            WHERE OBS.CodEmp = ?
+              AND OBS.CodOri = ?
+              AND OBS.NumOrp = ?
+            ORDER BY
+                OBS.TipObs,
+                OBS.SeqObs
+            """,
+            [cod_emp_int, cod_ori_s, num_orp_int],
+        )
+        observacoes = _fetch_all_dict(cursor)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao consultar observações da OP: {str(exc)}",
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return {
+        "cod_emp": cod_emp_int,
+        "cod_ori": cod_ori_s,
+        "num_orp": num_orp_int,
+        "qtd_observacoes": len(observacoes),
+        "tem_observacao": "S" if len(observacoes) > 0 else "N",
+        "observacoes": observacoes,
     }
 
 
@@ -14089,6 +15124,7 @@ def _consultar_dados_impressao_op(
     conn,
     incluir_desenhos: str = "N",
     quebrar_por_operacao: str = "N",
+    imprimir_observacoes: str = "N",
 ):
     """Coleta os dados de UMA OP no formato MCAP700.
 
@@ -14116,6 +15152,7 @@ def _consultar_dados_impressao_op(
                 COP.CodOri + RIGHT('000000000' + CAST(COP.NumOrp AS VARCHAR(9)), 9) AS codigo_barras_op,
 
                 COP.CodPro AS produto,
+                ISNULL(PRO.DesPro, '') AS descricao,
                 ISNULL(PRO.DesPro, '') AS descricao_produto,
                 COP.CodPro + ' - ' + ISNULL(PRO.DesPro, '') AS produto_descricao,
 
@@ -14142,7 +15179,8 @@ def _consultar_dados_impressao_op(
 
                 COP.CodRot AS cod_rot,
                 ISNULL(COP.RelPrd, '') AS agrupamento,
-                CAST('REV' AS VARCHAR(10)) AS revisao,
+                ISNULL(REVOP.revisao, '') AS revisao,
+                ISNULL(DEROP.derivacao, '') AS derivacao,
 
                 ISNULL(COP.ObsOrp, '') AS observacao_1,
                 ISNULL(COP.ObsOr2, '') AS observacao_2
@@ -14151,6 +15189,31 @@ def _consultar_dados_impressao_op(
             LEFT JOIN E075PRO PRO
                 ON PRO.CodEmp = COP.CodEmp
                AND PRO.CodPro = COP.CodPro
+
+            -- Revisao do desenho associada a OP (tabela customizada Senior)
+            OUTER APPLY (
+                SELECT TOP 1
+                    CONVERT(VARCHAR(20), COALESCE(UC.usu_revdes, '')) AS revisao
+                FROM usu_t900cop UC
+                WHERE UC.usu_codemp = COP.CodEmp
+                  AND UC.usu_codori = COP.CodOri
+                  AND UC.usu_numorp = COP.NumOrp
+                  AND COALESCE(UC.usu_revdes, '') <> ''
+                ORDER BY UC.usu_revdes DESC
+            ) REVOP
+
+            -- Derivacao da OP (E900QDO -> CodDer do produto principal)
+            OUTER APPLY (
+                SELECT TOP 1
+                    ISNULL(Q.CodDer, '') AS derivacao
+                FROM E900QDO Q
+                WHERE Q.CodEmp = COP.CodEmp
+                  AND Q.CodOri = COP.CodOri
+                  AND Q.NumOrp = COP.NumOrp
+                  AND Q.CodPro = COP.CodPro
+                ORDER BY Q.CodDer
+            ) DEROP
+
             WHERE COP.CodEmp = ?
               AND COP.CodOri = ?
               AND COP.NumOrp = ?
@@ -14259,7 +15322,18 @@ def _consultar_dados_impressao_op(
                   + RIGHT('0000' + CAST(OOP.SeqRot AS VARCHAR(4)), 4)
                   + ISNULL(QDO.CodDer, '') AS codigo_barras_operacao,
 
-                ISNULL(OOP.ObsOop, '') AS observacao_operacao
+                ISNULL(OOP.ObsOop, '') AS observacao_operacao,
+
+                -- Proxima operacao na OP COMPLETA (ignora filtro de cod_cre/cod_etg).
+                -- Quando o usuario filtra por centro de recurso, a grid pode mostrar
+                -- so 1 operacao, mas a "proxima" deve continuar sendo a real do roteiro.
+                ISNULL(CAST(PROX.CodOpr AS VARCHAR(20)), '') AS proxima_operacao_codigo,
+                ISNULL(OPR_PROX.DesOpr, '') AS proxima_operacao_descricao_sql,
+                CASE
+                    WHEN PROX.CodOpr IS NOT NULL
+                    THEN CAST(PROX.CodOpr AS VARCHAR(20)) + ' - ' + ISNULL(OPR_PROX.DesOpr, '')
+                    ELSE ''
+                END AS proxima_operacao_label
 
             FROM E900OOP OOP
             INNER JOIN E900COP COP
@@ -14291,6 +15365,31 @@ def _consultar_dados_impressao_op(
                     Q.CodDer
             ) QDO
 
+            OUTER APPLY (
+                SELECT TOP 1
+                    NX.CodOpr,
+                    NX.CodEtg,
+                    NX.SeqRot
+                FROM E900OOP NX
+                WHERE NX.CodEmp = OOP.CodEmp
+                  AND NX.CodOri = OOP.CodOri
+                  AND NX.NumOrp = OOP.NumOrp
+                  AND (
+                        NX.CodEtg > OOP.CodEtg
+                        OR (
+                            NX.CodEtg = OOP.CodEtg
+                            AND NX.SeqRot > OOP.SeqRot
+                        )
+                  )
+                ORDER BY
+                    NX.CodEtg,
+                    NX.SeqRot
+            ) PROX
+
+            LEFT JOIN E720OPR OPR_PROX
+                ON OPR_PROX.CodEmp = OOP.CodEmp
+               AND OPR_PROX.CodOpr = PROX.CodOpr
+
             WHERE OOP.CodEmp = ?
               AND OOP.CodOri = ?
               AND OOP.NumOrp = ?
@@ -14304,12 +15403,23 @@ def _consultar_dados_impressao_op(
         cursor.execute(sql_operacoes, params_operacoes)
         operacoes = _fetch_all_dict(cursor)
 
-        # Próxima operação
-        for index, operacao in enumerate(operacoes):
-            proxima = operacoes[index + 1] if index + 1 < len(operacoes) else None
-            operacao["proxima_operacao"] = proxima.get("cod_opr") if proxima else ""
-            operacao["proxima_operacao_descricao"] = proxima.get("descricao_operacao") if proxima else ""
+        # A proxima operacao agora vem direto do SQL (OUTER APPLY na OP completa),
+        # entao o codigo Python so normaliza os nomes finais usados pelo Lovable
+        # e inicializa o array de narrativas que sera populado depois.
+        for operacao in operacoes:
+            proxima_cod = operacao.get("proxima_operacao_codigo") or ""
+            proxima_desc = operacao.get("proxima_operacao_descricao_sql") or ""
+            operacao["proxima_operacao"] = proxima_cod
+            operacao["proxima_operacao_codigo"] = proxima_cod
+            operacao["proxima_operacao_descricao"] = proxima_desc
+            # proxima_operacao_label ja veio do SQL ("CODIGO - DESCRICAO" ou "")
+            operacao["proxima_operacao_label"] = operacao.get("proxima_operacao_label") or ""
+            # Remove o nome interno usado so para evitar conflito com a chave antiga
+            operacao.pop("proxima_operacao_descricao_sql", None)
             operacao["narrativas"] = []
+            # Tempos formatados em min/h para o Lovable nao precisar formatar no front
+            operacao["tmp_unit_formatado"] = formatar_tempo_decimal_horas(operacao.get("tmp_unit"))
+            operacao["tmp_total_formatado"] = formatar_tempo_decimal_horas(operacao.get("tmp_total"))
 
         # ============================================================
         # 4) Narrativas
@@ -14385,6 +15495,7 @@ def _consultar_dados_impressao_op(
             )
 
         quebrar_op_flag = str(quebrar_por_operacao or "N").upper().strip() == "S"
+        imprimir_obs_flag = str(imprimir_observacoes or "N").upper().strip() == "S"
 
         # Layout dos componentes: se houver mais de LIMITE itens, o Lovable
         # deve renderizar a Relacao de Componentes Necessarios em pagina
@@ -14393,6 +15504,8 @@ def _consultar_dados_impressao_op(
         LIMITE_COMPONENTES_PRIMEIRA_PAGINA = 7
         total_componentes = len(componentes or [])
         quebrar_componentes_flag = total_componentes > LIMITE_COMPONENTES_PRIMEIRA_PAGINA
+
+        total_observacoes = len(observacoes or [])
 
         return {
             "cabecalho": cabecalho,
@@ -14405,12 +15518,19 @@ def _consultar_dados_impressao_op(
             "modo_impressao": {
                 "quebrar_por_operacao": quebrar_op_flag,
                 "desenhos_apos_op": True,
+                "desenhos_um_por_pagina": True,
+                "imprimir_observacoes": imprimir_obs_flag,
                 "a4": True,
             },
             "layout_componentes": {
                 "total_componentes": total_componentes,
                 "limite_componentes_primeira_pagina": LIMITE_COMPONENTES_PRIMEIRA_PAGINA,
                 "quebrar_componentes_em_pagina_separada": quebrar_componentes_flag,
+                "posicao_componentes_quando_quebrar": "APOS_OPERACOES",
+            },
+            "layout_observacoes": {
+                "total_observacoes": total_observacoes,
+                "tem_observacao": total_observacoes > 0,
             },
             "parametros": {
                 "cod_emp": cod_emp,
@@ -14423,6 +15543,7 @@ def _consultar_dados_impressao_op(
                 "incluir_desenhos": (incluir_desenhos or "N").upper().strip() or "N",
                 "pasta_desenhos_servidor": str(Path(PASTA_DESENHOS_OP_PADRAO)),
                 "quebrar_por_operacao": "S" if quebrar_op_flag else "N",
+                "imprimir_observacoes": "S" if imprimir_obs_flag else "N",
             },
         }
     except HTTPException:
@@ -14440,6 +15561,7 @@ def consultar_ordem_producao_impressao(
     cod_cre: Optional[str] = None,
     incluir_desenhos: Optional[str] = "N",
     quebrar_por_operacao: Optional[str] = "N",
+    imprimir_observacoes: Optional[str] = "N",
     usuario=Depends(validar_token),
 ):
     """
@@ -14473,6 +15595,7 @@ def consultar_ordem_producao_impressao(
     listar_desenho = (listar_desenho or "N").upper().strip() or "N"
     incluir_desenhos = (incluir_desenhos or "N").upper().strip() or "N"
     quebrar_por_operacao = (quebrar_por_operacao or "N").upper().strip() or "N"
+    imprimir_observacoes = (imprimir_observacoes or "N").upper().strip() or "N"
     if cod_cre is not None:
         cod_cre = str(cod_cre).strip() or None
 
@@ -14489,6 +15612,7 @@ def consultar_ordem_producao_impressao(
             conn=conn,
             incluir_desenhos=incluir_desenhos,
             quebrar_por_operacao=quebrar_por_operacao,
+            imprimir_observacoes=imprimir_observacoes,
         )
     except HTTPException:
         raise
@@ -14527,6 +15651,7 @@ def consultar_ordens_producao_impressao_lote(
     cod_emp: Optional[str] = "1",
     num_ped: Optional[str] = None,
     rel_prd: Optional[str] = None,
+    cod_pro: Optional[str] = None,
     sit_orp: Optional[str] = None,
     cod_etg: Optional[str] = None,
     cod_cre: Optional[str] = None,
@@ -14534,6 +15659,7 @@ def consultar_ordens_producao_impressao_lote(
     listar_desenho: Optional[str] = "N",
     incluir_desenhos: Optional[str] = "N",
     quebrar_por_operacao: Optional[str] = "N",
+    imprimir_observacoes: Optional[str] = "N",
     usuario=Depends(validar_token),
 ):
     """
@@ -14548,6 +15674,8 @@ def consultar_ordens_producao_impressao_lote(
 
     if rel_prd is not None:
         rel_prd = str(rel_prd).strip() or None
+    if cod_pro is not None:
+        cod_pro = str(cod_pro).strip() or None
     if sit_orp is not None:
         sit_orp = str(sit_orp).strip().upper() or None
     if cod_cre is not None:
@@ -14557,21 +15685,24 @@ def consultar_ordens_producao_impressao_lote(
     listar_desenho = (listar_desenho or "N").upper().strip() or "N"
     incluir_desenhos = (incluir_desenhos or "N").upper().strip() or "N"
     quebrar_por_operacao = (quebrar_por_operacao or "N").upper().strip() or "N"
+    imprimir_observacoes = (imprimir_observacoes or "N").upper().strip() or "N"
 
     tem_pedido = num_ped_int is not None and num_ped_int > 0
     tem_relprd = bool(rel_prd)
+    tem_produto = bool(cod_pro)
     tem_estagio = cod_etg_int is not None
     tem_centro = bool(cod_cre)
 
     # Exige pelo menos um filtro especifico (alem de cod_emp) para evitar
     # imprimir TODA a base por engano. Aceitos: Pedido, Relatorio de Producao,
-    # Estagio ou Centro de Recurso (combinados a vontade, salvo Pedido+RelPrd).
-    if not (tem_pedido or tem_relprd or tem_estagio or tem_centro):
+    # Produto, Estagio ou Centro de Recurso (combinados a vontade, salvo
+    # Pedido + RelPrd que continuam mutuamente exclusivos).
+    if not (tem_pedido or tem_relprd or tem_produto or tem_estagio or tem_centro):
         raise HTTPException(
             status_code=422,
             detail=(
                 "Informe pelo menos um filtro para impressão em lote: "
-                "Pedido, Relatório de Produção, Estágio ou Centro de Recurso."
+                "Pedido, Relatório de Produção, Produto, Estágio ou Centro de Recurso."
             ),
         )
 
@@ -14605,6 +15736,10 @@ def consultar_ordens_producao_impressao_lote(
         if tem_relprd:
             where.append("COP.RelPrd = ?")
             params.append(rel_prd)
+
+        if tem_produto:
+            where.append("COP.CodPro = ?")
+            params.append(cod_pro)
 
         if sit_orp:
             where.append("COP.SitOrp = ?")
@@ -14663,6 +15798,7 @@ def consultar_ordens_producao_impressao_lote(
                 conn=conn,
                 incluir_desenhos=incluir_desenhos,
                 quebrar_por_operacao=quebrar_por_operacao,
+                imprimir_observacoes=imprimir_observacoes,
             )
 
             if dados_op:
@@ -14674,12 +15810,15 @@ def consultar_ordens_producao_impressao_lote(
             "modo_impressao": {
                 "quebrar_por_operacao": quebrar_por_operacao == "S",
                 "desenhos_apos_op": True,
+                "desenhos_um_por_pagina": True,
+                "imprimir_observacoes": imprimir_observacoes == "S",
                 "a4": True,
             },
             "filtros_aplicados": {
                 "cod_emp": cod_emp_int,
                 "num_ped": num_ped_int,
                 "rel_prd": rel_prd,
+                "cod_pro": cod_pro,
                 "sit_orp": sit_orp,
                 "cod_etg": cod_etg_int,
                 "cod_cre": cod_cre,
@@ -14688,6 +15827,7 @@ def consultar_ordens_producao_impressao_lote(
                 "incluir_desenhos": incluir_desenhos,
                 "pasta_desenhos_servidor": str(Path(PASTA_DESENHOS_OP_PADRAO)),
                 "quebrar_por_operacao": quebrar_por_operacao,
+                "imprimir_observacoes": imprimir_observacoes,
             },
             "ordens": ordens,
         }
@@ -14707,6 +15847,166 @@ def consultar_ordens_producao_impressao_lote(
 
 
 # ============================================================
+# IMPRESSÃO POR SELEÇÃO MANUAL (checkbox na grid)
+# ============================================================
+
+class _OPSelecionadaPayload(BaseModel):
+    """Item do payload de /impressao/selecionadas — uma OP marcada na grid."""
+    cod_emp: int = Field(default=1)
+    cod_ori: str
+    num_orp: int
+
+
+class _ImpressaoSelecionadasPayload(BaseModel):
+    """Payload de /impressao/selecionadas — lista de OPs + opcoes globais.
+
+    Cada OP do array eh resolvida individualmente via _consultar_dados_impressao_op.
+    OPs com CodOri='100' ou SitOrp='C' (cancelada) sao descartadas silenciosamente
+    (a regra MCAP700 ja eh aplicada no SELECT do cabecalho dentro do helper).
+    """
+    ops: List[_OPSelecionadaPayload] = Field(default_factory=list)
+    listar_componentes: str = "S"
+    listar_desenho: str = "N"
+    incluir_desenhos: str = "N"
+    quebrar_por_operacao: str = "N"
+    imprimir_observacoes: str = "N"
+    cod_etg: Optional[int] = None
+    cod_cre: Optional[str] = None
+
+
+@app.post("/api/producao/ordem-producao/impressao/selecionadas")
+def consultar_ordens_producao_impressao_selecionadas(
+    payload: _ImpressaoSelecionadasPayload,
+    usuario=Depends(validar_token),
+):
+    """
+    Retorna varias OPs para impressao, escolhidas manualmente pelo usuario
+    via checkbox na grid. Diferente de /impressao/lote (que filtra por
+    Pedido/Rel.Prod/Estagio/CRE), aqui o front envia a lista exata de OPs.
+
+    OPs invalidas (CodOri=100, canceladas, inexistentes) sao silenciosamente
+    descartadas — o `quantidade_ops` no retorno reflete o que efetivamente
+    foi gerado.
+    """
+    if not payload.ops:
+        raise HTTPException(
+            status_code=422,
+            detail="Selecione ao menos uma OP para visualizar.",
+        )
+
+    if len(payload.ops) > 100:
+        raise HTTPException(
+            status_code=422,
+            detail="Limite máximo de 100 OPs por visualização.",
+        )
+
+    listar_componentes = (payload.listar_componentes or "S").upper().strip() or "S"
+    listar_desenho = (payload.listar_desenho or "N").upper().strip() or "N"
+    incluir_desenhos = (payload.incluir_desenhos or "N").upper().strip() or "N"
+    quebrar_por_operacao = (payload.quebrar_por_operacao or "N").upper().strip() or "N"
+    imprimir_observacoes = (payload.imprimir_observacoes or "N").upper().strip() or "N"
+    cod_cre = (payload.cod_cre or "").strip() or None if payload.cod_cre else None
+    cod_etg = payload.cod_etg
+
+    conn = get_connection()
+
+    try:
+        ordens = []
+        descartadas = []
+
+        for op in payload.ops:
+            cod_ori = str(op.cod_ori or "").strip()
+            if not cod_ori or not op.num_orp:
+                descartadas.append({
+                    "cod_emp": op.cod_emp,
+                    "cod_ori": op.cod_ori,
+                    "num_orp": op.num_orp,
+                    "motivo": "Origem ou número da OP vazio",
+                })
+                continue
+            if cod_ori == "100":
+                descartadas.append({
+                    "cod_emp": op.cod_emp,
+                    "cod_ori": cod_ori,
+                    "num_orp": op.num_orp,
+                    "motivo": "Origem 100 não é impressa",
+                })
+                continue
+
+            try:
+                dados_op = _consultar_dados_impressao_op(
+                    cod_emp=int(op.cod_emp),
+                    cod_ori=cod_ori,
+                    num_orp=int(op.num_orp),
+                    listar_componentes=listar_componentes,
+                    listar_desenho=listar_desenho,
+                    cod_etg=cod_etg,
+                    cod_cre=cod_cre,
+                    conn=conn,
+                    incluir_desenhos=incluir_desenhos,
+                    quebrar_por_operacao=quebrar_por_operacao,
+                    imprimir_observacoes=imprimir_observacoes,
+                )
+            except Exception as exc:
+                descartadas.append({
+                    "cod_emp": op.cod_emp,
+                    "cod_ori": cod_ori,
+                    "num_orp": op.num_orp,
+                    "motivo": f"Erro ao consultar: {str(exc)}",
+                })
+                continue
+
+            if dados_op:
+                ordens.append(dados_op)
+            else:
+                descartadas.append({
+                    "cod_emp": op.cod_emp,
+                    "cod_ori": cod_ori,
+                    "num_orp": op.num_orp,
+                    "motivo": "OP não encontrada ou cancelada",
+                })
+
+        return {
+            "atualizado_em": datetime.now().isoformat(),
+            "quantidade_ops_solicitadas": len(payload.ops),
+            "quantidade_ops": len(ordens),
+            "quantidade_descartadas": len(descartadas),
+            "descartadas": descartadas,
+            "modo_impressao": {
+                "quebrar_por_operacao": quebrar_por_operacao == "S",
+                "desenhos_apos_op": True,
+                "desenhos_um_por_pagina": True,
+                "imprimir_observacoes": imprimir_observacoes == "S",
+                "a4": True,
+            },
+            "parametros": {
+                "listar_componentes": listar_componentes,
+                "listar_desenho": listar_desenho,
+                "incluir_desenhos": incluir_desenhos,
+                "quebrar_por_operacao": quebrar_por_operacao,
+                "imprimir_observacoes": imprimir_observacoes,
+                "cod_etg": cod_etg,
+                "cod_cre": cod_cre,
+                "pasta_desenhos_servidor": str(Path(PASTA_DESENHOS_OP_PADRAO)),
+            },
+            "ordens": ordens,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao carregar OPs selecionadas para impressão: {str(exc)}",
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ============================================================
 # OPÇÕES PARA FILTROS DA IMPRESSÃO DE OP (autocomplete/combo)
 # ============================================================
 
@@ -14717,6 +16017,7 @@ def listar_opcoes_impressao_ordem_producao(
     num_orp: Optional[str] = None,
     num_ped: Optional[str] = None,
     rel_prd: Optional[str] = None,
+    cod_pro: Optional[str] = None,
     sit_orp: Optional[str] = None,
     cod_etg: Optional[str] = None,
     cod_cre: Optional[str] = None,
@@ -14760,6 +16061,8 @@ def listar_opcoes_impressao_ordem_producao(
         cod_cre = str(cod_cre).strip() or None
     if rel_prd is not None:
         rel_prd = str(rel_prd).strip() or None
+    if cod_pro is not None:
+        cod_pro = str(cod_pro).strip() or None
     if sit_orp is not None:
         sit_orp = str(sit_orp).strip().upper() or None
     if q is not None:
@@ -14845,6 +16148,10 @@ def listar_opcoes_impressao_ordem_producao(
             if rel_prd:
                 where.append(f"{alias_cop}.RelPrd = ?")
                 params.append(str(rel_prd).strip())
+
+            if cod_pro and str(cod_pro).strip():
+                where.append(f"{alias_cop}.CodPro = ?")
+                params.append(str(cod_pro).strip())
 
             if sit_orp:
                 where.append(f"{alias_cop}.SitOrp = ?")
@@ -14975,6 +16282,36 @@ def listar_opcoes_impressao_ordem_producao(
         relatorios_producao = rows_to_dict()
 
         # ============================================================
+        # Produtos (lista de CodPro distintos nas OPs filtradas)
+        # ============================================================
+
+        where_produtos, params_produtos = montar_where("COP", usar_q=False)
+
+        cursor.execute(f"""
+            SELECT TOP 200
+                COP.CodPro AS codigo,
+                COP.CodPro AS value,
+                ISNULL(MAX(PRO.DesPro), '') AS descricao,
+                COP.CodPro
+                    + CASE
+                        WHEN ISNULL(MAX(PRO.DesPro), '') <> ''
+                        THEN ' - ' + ISNULL(MAX(PRO.DesPro), '')
+                        ELSE ''
+                      END AS label,
+                COUNT(*) AS qtd_ops
+            FROM E900COP COP
+            LEFT JOIN E075PRO PRO
+                ON PRO.CodEmp = COP.CodEmp
+               AND PRO.CodPro = COP.CodPro
+            {where_produtos}
+            GROUP BY
+                COP.CodPro
+            ORDER BY
+                COP.CodPro
+        """, params_produtos)
+        produtos = rows_to_dict()
+
+        # ============================================================
         # Situações (somente as não canceladas)
         # ============================================================
 
@@ -15046,6 +16383,13 @@ def listar_opcoes_impressao_ordem_producao(
                 ISNULL(PRO.UniMed, '') AS unidade_medida,
                 COP.SitOrp AS sit_orp,
 
+                -- Indicador de observações (botão "Ver observações" na grid)
+                ISNULL(OBSINFO.qtd_observacoes, 0) AS qtd_observacoes,
+                CASE
+                    WHEN ISNULL(OBSINFO.qtd_observacoes, 0) > 0 THEN 'S'
+                    ELSE 'N'
+                END AS tem_observacao,
+
                 COP.DatGer AS data_geracao,
                 COP.DtpIni AS inicio_previsto,
                 ISNULL(COP.RelPrd, '') AS agrupamento,
@@ -15075,6 +16419,13 @@ def listar_opcoes_impressao_ordem_producao(
             LEFT JOIN E075PRO PRO
                 ON PRO.CodEmp = COP.CodEmp
                AND PRO.CodPro = COP.CodPro
+            OUTER APPLY (
+                SELECT COUNT(*) AS qtd_observacoes
+                FROM E900OBS OBS
+                WHERE OBS.CodEmp = COP.CodEmp
+                  AND OBS.CodOri = COP.CodOri
+                  AND OBS.NumOrp = COP.NumOrp
+            ) OBSINFO
             {where_ops}
             ORDER BY
                 COP.DatGer DESC,
@@ -15203,6 +16554,7 @@ def listar_opcoes_impressao_ordem_producao(
             "origens": origens,
             "pedidos": pedidos,
             "relatorios_producao": relatorios_producao,
+            "produtos": produtos,
             "situacoes": situacoes,
             "ordens_producao": ordens_producao,
             "estagios": estagios,
@@ -15213,6 +16565,7 @@ def listar_opcoes_impressao_ordem_producao(
                 "num_orp": num_orp,
                 "num_ped": num_ped,
                 "rel_prd": rel_prd,
+                "cod_pro": cod_pro,
                 "sit_orp": sit_orp,
                 "cod_etg": cod_etg,
                 "cod_cre": cod_cre,
@@ -33638,6 +34991,1695 @@ def exportar_conciliacao_comercial_contabil(
     )
 
 
+# ============================================================
+# MÓDULO: DESENVOLVIMENTO DE RELATÓRIOS (Report Builder)
+# ------------------------------------------------------------
+# Metadados (definicoes/versoes/execucoes) no Supabase/PostgreSQL.
+# Execucao das consultas no SQL Server (ERP Senior).
+# Sandbox: somente SELECT/WITH, sem DML/DDL, sem multiplos comandos.
+# ============================================================
+
+RELATORIO_MODULOS = [
+    "Compras", "Recebimento", "Estoque", "Produção", "Custos",
+    "Financeiro", "Fiscal", "Comercial", "Contabilidade", "RH",
+    "Projetos", "Qualidade", "Customizado",
+]
+
+RELATORIO_FONTES_DADOS = [
+    {"codigo": "ERP_SENIOR", "nome": "ERP Senior (SQL Server)", "executavel": True},
+    {"codigo": "SUPABASE_BI", "nome": "Supabase BI (Postgres)", "executavel": False},
+]
+
+RELATORIO_TIPOS_PARAMETRO = [
+    "TEXTO", "NUMERO", "INTEIRO", "DATA", "DATA_HORA", "BOOLEANO",
+    "LISTA_FIXA", "LISTA_SQL", "EMPRESA", "FILIAL", "FORNECEDOR",
+    "CLIENTE", "PRODUTO", "CENTRO_CUSTO", "DEPOSITO", "TRANSACAO", "USUARIO",
+]
+
+# Palavras-chave / objetos bloqueados na sandbox de SQL.
+_SQL_REL_BLOQUEADO = (
+    "insert", "update", "delete", "drop", "alter", "truncate",
+    "exec", "execute", "merge", "create", "grant", "revoke",
+    "backup", "restore", "shutdown", "dbcc", "openrowset",
+    "openquery", "opendatasource", "openxml", "bulk", "into",
+    "sp_", "xp_",
+)
+
+REPORTBUILDER_TABELA_DEF = "report_definitions"
+REPORTBUILDER_TABELA_VER = "report_versions"
+REPORTBUILDER_TABELA_EXEC = "report_executions"
+REPORTBUILDER_TABELA_FAV = "report_favorites"
+REPORTBUILDER_TABELA_TPL = "report_templates"
+
+# reportlab eh opcional — usado so na exportacao PDF.
+try:
+    from reportlab.lib.pagesizes import A4, landscape  # noqa
+    from reportlab.lib import colors as _rl_colors  # noqa
+    from reportlab.lib.units import mm as _rl_mm  # noqa
+    from reportlab.platypus import (  # noqa
+        SimpleDocTemplate, Table as _RLTable, TableStyle as _RLTableStyle,
+        Paragraph as _RLParagraph, Spacer as _RLSpacer,
+    )
+    from reportlab.lib.styles import getSampleStyleSheet as _rl_styles  # noqa
+    _REPORTLAB_OK = True
+except Exception:
+    _REPORTLAB_OK = False
+
+
+# ------------------------------------------------------------
+# Sandbox / parsing de SQL
+# ------------------------------------------------------------
+
+def _rel_sanitizar_para_analise(sql: str) -> str:
+    """Remove comentarios e literais de string para analise de seguranca.
+    NAO usar o resultado para executar — apenas para validar/detectar."""
+    s = sql or ""
+    s = re.sub(r"/\*.*?\*/", " ", s, flags=re.DOTALL)   # comentarios bloco
+    s = re.sub(r"--[^\n]*", " ", s)                       # comentarios linha
+    s = re.sub(r"'(?:[^']|'')*'", "''", s)                # literais string
+    return s
+
+
+def _rel_validar_sql(sql_base: str) -> dict:
+    """Valida a SQL do relatorio. Retorna dict {valido, erro, comando}."""
+    sql = (sql_base or "").strip()
+    if not sql:
+        return {"valido": False, "erro": "SQL não informada.", "comando": None}
+
+    limpo = _rel_sanitizar_para_analise(sql).strip()
+    if not limpo:
+        return {"valido": False, "erro": "SQL contém apenas comentários.", "comando": None}
+
+    low = limpo.lower().lstrip()
+    if not (low.startswith("select") or low.startswith("with")):
+        return {
+            "valido": False,
+            "erro": "Somente consultas SELECT ou WITH são permitidas.",
+            "comando": None,
+        }
+
+    # Multiplos comandos: ';' no meio (apos remover ';' final)
+    corpo = limpo.rstrip().rstrip(";").rstrip()
+    if ";" in corpo:
+        return {
+            "valido": False,
+            "erro": "Múltiplos comandos não são permitidos. Use apenas uma consulta.",
+            "comando": None,
+        }
+
+    low_full = limpo.lower()
+    for kw in _SQL_REL_BLOQUEADO:
+        if kw.endswith("_"):
+            if re.search(rf"\b{kw}\w+", low_full):
+                return {
+                    "valido": False,
+                    "erro": f"Objeto não permitido na consulta: {kw}* (procedures de sistema).",
+                    "comando": None,
+                }
+        else:
+            if re.search(rf"\b{kw}\b", low_full):
+                return {
+                    "valido": False,
+                    "erro": f"Palavra-chave não permitida: {kw.upper()}. Apenas consultas de leitura.",
+                    "comando": None,
+                }
+
+    return {"valido": True, "erro": None, "comando": "SELECT"}
+
+
+def _rel_detectar_parametros(sql_base: str) -> list:
+    """Detecta parametros nomeados (:nome) na SQL, em ordem de aparicao,
+    ignorando ocorrencias dentro de comentarios/strings."""
+    limpo = _rel_sanitizar_para_analise(sql_base or "")
+    nomes = re.findall(r":([a-zA-Z_]\w*)", limpo)
+    vistos: list = []
+    for n in nomes:
+        if n not in vistos:
+            vistos.append(n)
+    return vistos
+
+
+def _rel_traduzir_named_params(sql_base: str, valores: dict):
+    """Traduz :nome -> ? (posicional do pyodbc), respeitando strings e
+    comentarios. Retorna (sql_traduzida, lista_params, lista_faltando)."""
+    sql = sql_base or ""
+    valores = valores or {}
+    out: list = []
+    params: list = []
+    faltando: list = []
+    i = 0
+    n = len(sql)
+    in_str = False
+    in_line_comment = False
+    in_block_comment = False
+
+    while i < n:
+        c = sql[i]
+        nxt = sql[i + 1] if i + 1 < n else ""
+
+        if in_line_comment:
+            out.append(c)
+            if c == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+
+        if in_block_comment:
+            out.append(c)
+            if c == "*" and nxt == "/":
+                out.append(nxt)
+                i += 2
+                in_block_comment = False
+                continue
+            i += 1
+            continue
+
+        if in_str:
+            out.append(c)
+            if c == "'":
+                if nxt == "'":
+                    out.append(nxt)
+                    i += 2
+                    continue
+                in_str = False
+            i += 1
+            continue
+
+        if c == "-" and nxt == "-":
+            in_line_comment = True
+            out.append(c)
+            i += 1
+            continue
+        if c == "/" and nxt == "*":
+            in_block_comment = True
+            out.append(c)
+            i += 1
+            continue
+        if c == "'":
+            in_str = True
+            out.append(c)
+            i += 1
+            continue
+
+        if c == ":" and nxt and re.match(r"[a-zA-Z_]", nxt):
+            j = i + 1
+            while j < n and re.match(r"\w", sql[j]):
+                j += 1
+            nome = sql[i + 1:j]
+            out.append("?")
+            if nome in valores:
+                params.append(valores[nome])
+            else:
+                params.append(None)
+                if nome not in faltando:
+                    faltando.append(nome)
+            i = j
+            continue
+
+        out.append(c)
+        i += 1
+
+    return "".join(out), params, faltando
+
+
+def _rel_inferir_tipo(valor) -> str:
+    """Infere o tipo de uma coluna a partir de um valor de amostra."""
+    if isinstance(valor, bool):
+        return "BOOLEANO"
+    if isinstance(valor, (int,)):
+        return "INTEIRO"
+    if isinstance(valor, (float, Decimal)):
+        return "NUMERO"
+    if isinstance(valor, (datetime, date)):
+        return "DATA"
+    return "TEXTO"
+
+
+def _rel_montar_colunas_config_padrao(colunas: list, linhas: Optional[list] = None) -> list:
+    """Monta um colunas_config padrao a partir das colunas detectadas.
+    Se ``linhas`` for fornecida, infere o tipo de cada coluna pela amostra."""
+    config = []
+    for index, coluna in enumerate(colunas or []):
+        tipo = "texto"
+        if linhas:
+            for linha in linhas:
+                v = linha.get(coluna)
+                if v is not None:
+                    tipo = _rel_inferir_tipo(v).lower()
+                    break
+        # tipo inferido vem em maiusculo ("INTEIRO"); normaliza p/ vocabulario do front
+        tipo = {"inteiro": "numero", "booleano": "texto"}.get(tipo, tipo)
+        numerico = tipo in ("numero", "moeda", "percentual")
+        config.append({
+            "campo": coluna,
+            "titulo": str(coluna).replace("_", " ").title(),
+            "visivel": True,
+            "ordem": index + 1,
+            "tipo": tipo,
+            "alinhamento": "direita" if numerico else "esquerda",
+            "formato": "",
+            "largura": 120,
+            "totalizar": False,
+            "agrupar": False,
+        })
+    return config
+
+
+def _rel_aplicar_colunas_config(linhas: list, colunas_config: list) -> list:
+    """Filtra/reordena as linhas conforme colunas_config (visivel + ordem).
+    Sem config -> devolve as linhas como estao."""
+    if not colunas_config:
+        return linhas
+    visiveis = [
+        c for c in sorted(colunas_config, key=lambda x: x.get("ordem", 999))
+        if c.get("visivel", True) and c.get("campo")
+    ]
+    campos = [c["campo"] for c in visiveis]
+    if not campos:
+        return linhas
+    return [{campo: linha.get(campo) for campo in campos} for linha in (linhas or [])]
+
+
+def _rel_calcular_totalizadores(linhas: list, colunas_config: list) -> dict:
+    """Soma as colunas marcadas com totalizar=True. Retorna {campo: total_float}."""
+    totais: dict = {}
+    if not linhas or not colunas_config:
+        return totais
+    for col in colunas_config:
+        if not col.get("totalizar"):
+            continue
+        campo = col.get("campo")
+        if not campo:
+            continue
+        total = Decimal("0")
+        achou = False
+        for linha in linhas:
+            valor = linha.get(campo)
+            if valor in (None, ""):
+                continue
+            try:
+                total += Decimal(str(valor).replace(",", "."))
+                achou = True
+            except Exception:
+                pass
+        if achou:
+            totais[campo] = float(total)
+    return totais
+
+
+def _rel_agregar_grafico(linhas: list, grafico_cfg: dict) -> Optional[dict]:
+    """Agrega as linhas para alimentar um grafico gerencial.
+
+    grafico_cfg: {tipo, campo_categoria, campo_valor, campo_serie?, titulo?}
+    Faz GROUP BY (categoria[, serie]) somando campo_valor. Retorna None se a
+    config estiver incompleta ou nao houver dados."""
+    if not grafico_cfg or not linhas:
+        return None
+    campo_cat = grafico_cfg.get("campo_categoria")
+    campo_val = grafico_cfg.get("campo_valor")
+    if not campo_cat or not campo_val:
+        return None
+    campo_serie = grafico_cfg.get("campo_serie") or None
+
+    agreg: dict = {}
+    for linha in linhas:
+        categoria = linha.get(campo_cat)
+        serie = linha.get(campo_serie) if campo_serie else None
+        bruto = linha.get(campo_val)
+        try:
+            num = float(Decimal(str(bruto).replace(",", "."))) if bruto not in (None, "") else 0.0
+        except Exception:
+            num = 0.0
+        chave = (
+            "" if categoria is None else str(categoria),
+            None if serie is None else str(serie),
+        )
+        agreg[chave] = agreg.get(chave, 0.0) + num
+
+    dados = [
+        {"categoria": k[0], "serie": k[1], "valor": round(v, 2)}
+        for k, v in agreg.items()
+    ]
+    dados.sort(key=lambda x: x["valor"], reverse=True)
+    return {
+        "tipo": grafico_cfg.get("tipo") or "barras",
+        "titulo": grafico_cfg.get("titulo") or "",
+        "campo_categoria": campo_cat,
+        "campo_valor": campo_val,
+        "campo_serie": campo_serie,
+        "dados": dados,
+    }
+
+
+def _rel_executar_sql(sql_base: str, valores: dict, limite: int) -> dict:
+    """Executa a SQL do relatorio no SQL Server com SET ROWCOUNT.
+    Retorna {colunas, linhas, qtd_linhas, tempo_ms}."""
+    val = _rel_validar_sql(sql_base)
+    if not val["valido"]:
+        raise HTTPException(status_code=422, detail=val["erro"])
+
+    sql_q, params, _faltando = _rel_traduzir_named_params(sql_base, valores or {})
+    limite = max(1, min(int(limite or 100), 50000))
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    inicio = datetime.now()
+    try:
+        # SET ROWCOUNT limita o numero de linhas de QUALQUER shape de SELECT
+        # (com ORDER BY, UNION, CTE) — diferente de injetar TOP, que quebra
+        # quando ha ORDER BY no nivel externo.
+        batch = f"SET ROWCOUNT {limite};\n{sql_q}"
+        cursor.execute(batch, params)
+
+        # Avanca ate o primeiro result set com colunas (SET nao gera um).
+        colunas: list = []
+        linhas: list = []
+        if cursor.description:
+            colunas = [c[0] for c in cursor.description]
+            for row in cursor.fetchall():
+                linhas.append({
+                    colunas[idx]: _json_value(row[idx])
+                    for idx in range(len(colunas))
+                })
+        tempo_ms = int((datetime.now() - inicio).total_seconds() * 1000)
+        return {
+            "colunas": colunas,
+            "linhas": linhas,
+            "qtd_linhas": len(linhas),
+            "tempo_ms": tempo_ms,
+        }
+    finally:
+        try:
+            cursor.execute("SET ROWCOUNT 0;")
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _rel_resolver_valores(sql_base: str, parametros_config: list,
+                          valores_informados: dict) -> dict:
+    """Monta o dict final {nome: valor} para todos os parametros detectados
+    na SQL, aplicando valor_padrao, validando obrigatorios e coergindo tipo.
+    Levanta HTTPException(422) se faltar parametro obrigatorio."""
+    detectados = _rel_detectar_parametros(sql_base)
+    cfg_por_nome = {}
+    for c in (parametros_config or []):
+        if isinstance(c, dict) and c.get("nome"):
+            cfg_por_nome[str(c["nome"])] = c
+
+    valores_informados = valores_informados or {}
+    final: dict = {}
+    faltando: list = []
+
+    for nome in detectados:
+        cfg = cfg_por_nome.get(nome, {})
+        tipo = str(cfg.get("tipo") or "TEXTO").upper()
+        obrigatorio = bool(cfg.get("obrigatorio"))
+
+        if nome in valores_informados and valores_informados[nome] not in (None, ""):
+            valor = valores_informados[nome]
+        else:
+            valor = cfg.get("valor_padrao")
+
+        if valor in (None, ""):
+            if obrigatorio:
+                faltando.append(cfg.get("label") or nome)
+            final[nome] = None
+            continue
+
+        # Coercao minima de tipo
+        try:
+            if tipo in ("NUMERO",):
+                valor = float(str(valor).replace(",", "."))
+            elif tipo in ("INTEIRO", "EMPRESA", "FILIAL"):
+                valor = int(float(str(valor).replace(",", ".")))
+            elif tipo == "BOOLEANO":
+                valor = str(valor).strip().upper() in ("S", "SIM", "TRUE", "1", "Y")
+            else:
+                valor = valor  # texto/data passam como string
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Parâmetro '{cfg.get('label') or nome}' inválido para o tipo {tipo}.",
+            )
+        final[nome] = valor
+
+    if faltando:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Parâmetros obrigatórios sem valor: {', '.join(faltando)}",
+        )
+    return final
+
+
+# ------------------------------------------------------------
+# Supabase REST helpers (CRUD dos metadados)
+# ------------------------------------------------------------
+
+def _rel_sb_get(table: str, query: str = "") -> list:
+    _supabase_required()
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    if query:
+        url += "?" + query
+    resp = requests.get(url, headers=_supabase_headers("return=representation"), timeout=30)
+    if resp.status_code not in (200, 206):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase GET {table} HTTP {resp.status_code}: {(resp.text or '')[:300]}",
+        )
+    try:
+        return resp.json()
+    except Exception:
+        return []
+
+
+def _rel_sb_insert(table: str, row: dict) -> dict:
+    _supabase_required()
+    resp = requests.post(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        json=row,
+        headers=_supabase_headers("return=representation"),
+        timeout=30,
+    )
+    if resp.status_code not in (200, 201):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase INSERT {table} HTTP {resp.status_code}: {(resp.text or '')[:300]}",
+        )
+    data = resp.json()
+    return data[0] if isinstance(data, list) and data else (data or {})
+
+
+def _rel_sb_update(table: str, registro_id: str, row: dict) -> dict:
+    _supabase_required()
+    resp = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/{table}?id=eq.{registro_id}",
+        json=row,
+        headers=_supabase_headers("return=representation"),
+        timeout=30,
+    )
+    if resp.status_code not in (200, 204):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase UPDATE {table} HTTP {resp.status_code}: {(resp.text or '')[:300]}",
+        )
+    try:
+        data = resp.json()
+        return data[0] if isinstance(data, list) and data else (data or {})
+    except Exception:
+        return {}
+
+
+def _rel_sb_delete(table: str, registro_id: str) -> None:
+    _supabase_required()
+    resp = requests.delete(
+        f"{SUPABASE_URL}/rest/v1/{table}?id=eq.{registro_id}",
+        headers=_supabase_headers("return=minimal"),
+        timeout=30,
+    )
+    if resp.status_code not in (200, 204):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase DELETE {table} HTTP {resp.status_code}: {(resp.text or '')[:300]}",
+        )
+
+
+def _rel_carregar_definicao(relatorio_id: str) -> dict:
+    """Carrega uma definicao de relatorio do Supabase ou 404."""
+    dados = _rel_sb_get(
+        REPORTBUILDER_TABELA_DEF,
+        f"id=eq.{relatorio_id}&select=*&limit=1",
+    )
+    if not dados:
+        raise HTTPException(status_code=404, detail="Relatório não encontrado.")
+    return dados[0]
+
+
+def _rel_proxima_versao(relatorio_id: str) -> int:
+    dados = _rel_sb_get(
+        REPORTBUILDER_TABELA_VER,
+        f"report_id=eq.{relatorio_id}&select=versao&order=versao.desc&limit=1",
+    )
+    if dados and dados[0].get("versao") is not None:
+        try:
+            return int(dados[0]["versao"]) + 1
+        except (ValueError, TypeError):
+            return 1
+    return 1
+
+
+def _rel_snapshot_versao(definicao: dict, usuario: str) -> None:
+    """Grava uma versao (snapshot) da definicao em report_versions."""
+    rid = definicao.get("id")
+    if not rid:
+        return
+    _rel_sb_insert(REPORTBUILDER_TABELA_VER, {
+        "report_id": rid,
+        "versao": _rel_proxima_versao(rid),
+        "sql_base": definicao.get("sql_base") or "",
+        "layout_config": definicao.get("layout_config") or {},
+        "parametros_config": definicao.get("parametros_config") or [],
+        "colunas_config": definicao.get("colunas_config") or [],
+        "criado_por": str(usuario or ""),
+    })
+
+
+def _rel_registrar_execucao(relatorio_id, parametros: dict, qtd_linhas: int,
+                            tempo_ms: int, status: str, erro: Optional[str],
+                            usuario: str, tipo_execucao: str = "EXECUCAO",
+                            formato_exportacao: Optional[str] = None,
+                            arquivo_nome: Optional[str] = None) -> None:
+    """Best-effort: grava o log de execucao em report_executions.
+
+    tipo_execucao: EXECUCAO | PREVIEW | EXPORTACAO
+    formato_exportacao: EXCEL | CSV | PDF (so para EXPORTACAO)
+    Os campos tipo_execucao/formato_exportacao/arquivo_nome dependem do
+    ALTER TABLE da Segunda Onda. Como o insert eh best-effort (try/except),
+    se as colunas ainda nao existirem o log apenas nao eh gravado.
+    """
+    try:
+        _rel_sb_insert(REPORTBUILDER_TABELA_EXEC, {
+            "report_id": relatorio_id,
+            "parametros": parametros or {},
+            "qtd_linhas": qtd_linhas,
+            "tempo_ms": tempo_ms,
+            "status": status,
+            "erro": (erro or "")[:2000] if erro else None,
+            "executado_por": str(usuario or ""),
+            "tipo_execucao": tipo_execucao,
+            "formato_exportacao": formato_exportacao,
+            "arquivo_nome": arquivo_nome,
+        })
+    except Exception as exc:
+        print(f"[relatorios] falha ao registrar execução: {exc}")
+
+
+# ------------------------------------------------------------
+# Modelos Pydantic
+# ------------------------------------------------------------
+
+# sql_base aceita tambem o nome alternativo "sql" (tolerancia de contrato com
+# o front). Como eh Optional, FastAPI nao devolve 422 "Field required" — o
+# endpoint valida e responde com mensagem amigavel se vier vazio.
+_REL_SQL_FIELD = Field(
+    default=None,
+    validation_alias=AliasChoices("sql_base", "sql"),
+)
+
+
+class _RelValidarSqlPayload(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    sql_base: Optional[str] = _REL_SQL_FIELD
+
+
+class _RelPreviewPayload(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    sql_base: Optional[str] = _REL_SQL_FIELD
+    parametros: dict = Field(default_factory=dict)
+    parametros_config: list = Field(default_factory=list)
+    colunas_config: list = Field(default_factory=list)
+    layout_config: dict = Field(default_factory=dict)
+    limite: int = 100
+
+
+class _RelDefinicaoPayload(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    nome: str
+    descricao: Optional[str] = None
+    modulo: str
+    categoria: Optional[str] = None
+    fonte_dados: str = "ERP_SENIOR"
+    sql_base: Optional[str] = _REL_SQL_FIELD
+    status: str = "RASCUNHO"
+    codigo: Optional[str] = None
+    layout_config: dict = Field(default_factory=dict)
+    parametros_config: list = Field(default_factory=list)
+    colunas_config: list = Field(default_factory=list)
+    permissao_config: dict = Field(default_factory=dict)
+
+
+class _RelDefinicaoUpdatePayload(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    nome: Optional[str] = None
+    descricao: Optional[str] = None
+    modulo: Optional[str] = None
+    categoria: Optional[str] = None
+    fonte_dados: Optional[str] = None
+    sql_base: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("sql_base", "sql"),
+    )
+    status: Optional[str] = None
+    codigo: Optional[str] = None
+    layout_config: Optional[dict] = None
+    parametros_config: Optional[list] = None
+    colunas_config: Optional[list] = None
+    permissao_config: Optional[dict] = None
+
+
+class _RelExecutarPayload(BaseModel):
+    parametros: dict = Field(default_factory=dict)
+    pagina: int = 1
+    tamanho_pagina: int = 100
+
+
+class _RelExportarPayload(BaseModel):
+    parametros: dict = Field(default_factory=dict)
+    limite: int = 10000
+
+
+# ------------------------------------------------------------
+# Endpoints — rotas FIXAS antes das parametricas ({relatorio_id})
+# ------------------------------------------------------------
+
+@app.get("/api/relatorios/modulos")
+def listar_modulos_relatorios(usuario=Depends(validar_token)):
+    """Lista os modulos e tipos de parametro disponiveis no construtor."""
+    return {
+        "modulos": RELATORIO_MODULOS,
+        "tipos_parametro": RELATORIO_TIPOS_PARAMETRO,
+        "fontes_dados": RELATORIO_FONTES_DADOS,
+    }
+
+
+@app.get("/api/relatorios/fontes-dados")
+def listar_fontes_dados_relatorios(usuario=Depends(validar_token)):
+    """Lista as fontes de dados suportadas."""
+    return {"fontes_dados": RELATORIO_FONTES_DADOS}
+
+
+@app.post("/api/relatorios/validar-sql")
+def validar_sql_relatorio(
+    payload: _RelValidarSqlPayload,
+    usuario=Depends(validar_token),
+):
+    """Valida a SQL (sandbox) e devolve os parametros detectados.
+    NAO executa a consulta."""
+    resultado = _rel_validar_sql(payload.sql_base)
+    parametros = _rel_detectar_parametros(payload.sql_base) if resultado["valido"] else []
+    return {
+        "valido": resultado["valido"],
+        "erro": resultado["erro"],
+        "comando": resultado["comando"],
+        "parametros_detectados": parametros,
+        "parametros_sugeridos": [
+            {
+                "nome": p,
+                "label": p.replace("_", " ").title(),
+                "tipo": "TEXTO",
+                "obrigatorio": False,
+                "valor_padrao": None,
+                "ordem": idx,
+            }
+            for idx, p in enumerate(parametros)
+        ],
+    }
+
+
+@app.post("/api/relatorios/preview")
+def preview_relatorio(
+    payload: _RelPreviewPayload,
+    usuario=Depends(validar_token),
+):
+    """Executa a SQL em modo previa (limite de ate 100 linhas).
+    Aceita SQL ainda nao salva — usado pelo editor."""
+    limite = max(1, min(int(payload.limite or 100), 100))
+
+    valores = _rel_resolver_valores(
+        payload.sql_base, payload.parametros_config, payload.parametros,
+    )
+
+    inicio = datetime.now()
+    try:
+        resultado = _rel_executar_sql(payload.sql_base, valores, limite)
+    except HTTPException as exc:
+        return {
+            "sucesso": False,
+            "erro": exc.detail,
+            "tempo_ms": int((datetime.now() - inicio).total_seconds() * 1000),
+            "linhas": [],
+            "colunas": [],
+            "qtd_linhas": 0,
+        }
+    except Exception as exc:
+        return {
+            "sucesso": False,
+            "erro": f"Erro ao executar consulta: {str(exc)}",
+            "tempo_ms": int((datetime.now() - inicio).total_seconds() * 1000),
+            "linhas": [],
+            "colunas": [],
+            "qtd_linhas": 0,
+        }
+
+    linhas_raw = resultado["linhas"]
+
+    # colunas_config: usa a config enviada pelo editor; se vazia, monta padrao
+    # (com tipo inferido pela amostra de dados).
+    colunas_config = payload.colunas_config or _rel_montar_colunas_config_padrao(
+        resultado["colunas"], linhas_raw,
+    )
+
+    # Aplica visibilidade/ordem das colunas e calcula totalizadores.
+    linhas_exibidas = _rel_aplicar_colunas_config(linhas_raw, colunas_config)
+    totalizadores = _rel_calcular_totalizadores(linhas_raw, colunas_config)
+
+    # colunas_detalhe = metadados simples das colunas detectadas pela query
+    colunas_detalhe = []
+    for col in resultado["colunas"]:
+        tipo = "TEXTO"
+        for linha in linhas_raw:
+            v = linha.get(col)
+            if v is not None:
+                tipo = _rel_inferir_tipo(v)
+                break
+        colunas_detalhe.append({
+            "campo": col,
+            "titulo": col,
+            "tipo": tipo,
+            "visivel": True,
+        })
+
+    # Gráfico gerencial (se o layout tiver config de grafico)
+    grafico = _rel_agregar_grafico(
+        linhas_raw, (payload.layout_config or {}).get("grafico"),
+    )
+
+    return {
+        "sucesso": True,
+        "erro": None,
+        "tempo_ms": resultado["tempo_ms"],
+        "qtd_linhas": resultado["qtd_linhas"],
+        "limite_aplicado": limite,
+        "limite_preview_atingido": resultado["qtd_linhas"] >= limite,
+        "colunas": colunas_detalhe,
+        "colunas_config": colunas_config,
+        "linhas": linhas_exibidas,
+        "totalizadores": totalizadores,
+        "grafico": grafico,
+        "parametros_aplicados": valores,
+    }
+
+
+@app.get("/api/relatorios")
+def listar_relatorios(
+    modulo: Optional[str] = None,
+    status: Optional[str] = None,
+    busca: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    """Lista as definicoes de relatorio cadastradas no Supabase."""
+    filtros = ["select=*", "order=atualizado_em.desc"]
+    if modulo and str(modulo).strip():
+        filtros.append(f"modulo=eq.{quote(str(modulo).strip(), safe='')}")
+    if status and str(status).strip():
+        filtros.append(f"status=eq.{quote(str(status).strip().upper(), safe='')}")
+    if busca and str(busca).strip():
+        termo = quote(f"*{str(busca).strip()}*", safe='')
+        filtros.append(f"nome=ilike.{termo}")
+
+    dados = _rel_sb_get(REPORTBUILDER_TABELA_DEF, "&".join(filtros))
+    return {
+        "total": len(dados),
+        "relatorios": dados,
+    }
+
+
+@app.post("/api/relatorios")
+def criar_relatorio(
+    payload: _RelDefinicaoPayload,
+    usuario=Depends(validar_token),
+):
+    """Cria uma nova definicao de relatorio. Valida a SQL antes de salvar."""
+    val = _rel_validar_sql(payload.sql_base)
+    if not val["valido"]:
+        raise HTTPException(status_code=422, detail=f"SQL inválida: {val['erro']}")
+
+    if payload.modulo not in RELATORIO_MODULOS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Módulo inválido. Use um de: {', '.join(RELATORIO_MODULOS)}",
+        )
+
+    # parametros_config: se vazio, auto-detecta da SQL
+    parametros_config = payload.parametros_config or []
+    if not parametros_config:
+        parametros_config = [
+            {
+                "nome": p,
+                "label": p.replace("_", " ").title(),
+                "tipo": "TEXTO",
+                "obrigatorio": False,
+                "valor_padrao": None,
+                "ordem": idx,
+            }
+            for idx, p in enumerate(_rel_detectar_parametros(payload.sql_base))
+        ]
+
+    codigo = payload.codigo or f"REL-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    agora = datetime.now().isoformat()
+    usr = str(usuario or "")
+
+    row = {
+        "codigo": codigo,
+        "nome": payload.nome,
+        "descricao": payload.descricao,
+        "modulo": payload.modulo,
+        "categoria": payload.categoria,
+        "fonte_dados": payload.fonte_dados or "ERP_SENIOR",
+        "sql_base": payload.sql_base,
+        "status": (payload.status or "RASCUNHO").upper(),
+        "layout_config": payload.layout_config or {},
+        "parametros_config": parametros_config,
+        "colunas_config": payload.colunas_config or [],
+        "permissao_config": payload.permissao_config or {},
+        "criado_por": usr,
+        "atualizado_por": usr,
+        "criado_em": agora,
+        "atualizado_em": agora,
+    }
+    criado = _rel_sb_insert(REPORTBUILDER_TABELA_DEF, row)
+    _rel_snapshot_versao(criado, usr)
+    return {"mensagem": "Relatório criado.", "relatorio": criado}
+
+
+# ------------------------------------------------------------
+# Terceira Onda A — publicados, favoritos, templates
+# ------------------------------------------------------------
+
+def _rel_favoritos_do_usuario(usuario: str) -> set:
+    """Retorna o set de report_id favoritados pelo usuario (best-effort)."""
+    try:
+        usr = quote(str(usuario or ""), safe="")
+        dados = _rel_sb_get(
+            REPORTBUILDER_TABELA_FAV,
+            f"usuario=eq.{usr}&select=report_id",
+        )
+        return {d.get("report_id") for d in dados if d.get("report_id")}
+    except Exception:
+        return set()
+
+
+@app.get("/api/relatorios/publicados")
+def listar_relatorios_publicados(
+    modulo: Optional[str] = None,
+    busca: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    """Lista relatórios PUBLICADOS para o usuário final.
+    Não expõe o SQL (campo sql_base é removido da resposta)."""
+    filtros = ["select=*", "status=eq.PUBLICADO", "order=nome.asc"]
+    if modulo and str(modulo).strip():
+        filtros.append(f"modulo=eq.{quote(str(modulo).strip(), safe='')}")
+    if busca and str(busca).strip():
+        filtros.append(f"nome=ilike.{quote(f'*{str(busca).strip()}*', safe='')}")
+
+    dados = _rel_sb_get(REPORTBUILDER_TABELA_DEF, "&".join(filtros))
+    favoritos = _rel_favoritos_do_usuario(usuario)
+
+    publicados = []
+    for d in dados:
+        d.pop("sql_base", None)  # usuario final nao ve SQL
+        d["favorito"] = d.get("id") in favoritos
+        publicados.append(d)
+
+    return {"total": len(publicados), "relatorios": publicados}
+
+
+@app.get("/api/relatorios/favoritos")
+def listar_relatorios_favoritos(usuario=Depends(validar_token)):
+    """Lista os relatórios favoritados pelo usuário (sem expor SQL)."""
+    usr = quote(str(usuario or ""), safe="")
+    dados = _rel_sb_get(
+        REPORTBUILDER_TABELA_FAV,
+        f"usuario=eq.{usr}&select=id,report_id,criado_em,{REPORTBUILDER_TABELA_DEF}(*)"
+        "&order=criado_em.desc",
+    )
+    relatorios = []
+    for fav in dados:
+        definicao = fav.get(REPORTBUILDER_TABELA_DEF) or {}
+        if not definicao:
+            continue
+        definicao.pop("sql_base", None)
+        definicao["favorito"] = True
+        definicao["favoritado_em"] = fav.get("criado_em")
+        relatorios.append(definicao)
+    return {"total": len(relatorios), "relatorios": relatorios}
+
+
+@app.get("/api/relatorios/templates")
+def listar_templates_relatorios(
+    modulo: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    """Lista os modelos de relatório disponíveis (biblioteca por módulo)."""
+    filtros = ["select=*", "ativo=eq.true", "order=modulo.asc,nome.asc"]
+    if modulo and str(modulo).strip():
+        filtros.append(f"modulo=eq.{quote(str(modulo).strip(), safe='')}")
+    dados = _rel_sb_get(REPORTBUILDER_TABELA_TPL, "&".join(filtros))
+    # agrupa por modulo para facilitar o front
+    por_modulo: dict = {}
+    for t in dados:
+        por_modulo.setdefault(t.get("modulo") or "Outros", []).append(t)
+    return {"total": len(dados), "templates": dados, "por_modulo": por_modulo}
+
+
+@app.get("/api/relatorios/{relatorio_id}")
+def obter_relatorio(relatorio_id: str, usuario=Depends(validar_token)):
+    """Detalhe de uma definicao de relatorio."""
+    definicao = _rel_carregar_definicao(relatorio_id)
+    definicao["parametros_detectados"] = _rel_detectar_parametros(
+        definicao.get("sql_base") or ""
+    )
+    return definicao
+
+
+@app.put("/api/relatorios/{relatorio_id}")
+def atualizar_relatorio(
+    relatorio_id: str,
+    payload: _RelDefinicaoUpdatePayload,
+    usuario=Depends(validar_token),
+):
+    """Atualiza uma definicao. Gera um snapshot em report_versions."""
+    definicao = _rel_carregar_definicao(relatorio_id)
+
+    mudancas = payload.model_dump(exclude_unset=True)
+    if not mudancas:
+        raise HTTPException(status_code=422, detail="Nenhum campo informado para atualizar.")
+
+    if "sql_base" in mudancas:
+        val = _rel_validar_sql(mudancas["sql_base"])
+        if not val["valido"]:
+            raise HTTPException(status_code=422, detail=f"SQL inválida: {val['erro']}")
+
+    if "modulo" in mudancas and mudancas["modulo"] not in RELATORIO_MODULOS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Módulo inválido. Use um de: {', '.join(RELATORIO_MODULOS)}",
+        )
+
+    if "status" in mudancas and mudancas["status"]:
+        mudancas["status"] = str(mudancas["status"]).upper()
+
+    mudancas["atualizado_por"] = str(usuario or "")
+    mudancas["atualizado_em"] = datetime.now().isoformat()
+
+    atualizado = _rel_sb_update(REPORTBUILDER_TABELA_DEF, relatorio_id, mudancas)
+    # snapshot da versao a partir do estado final (merge do antigo + mudancas)
+    estado_final = {**definicao, **mudancas}
+    _rel_snapshot_versao(estado_final, str(usuario or ""))
+    return {"mensagem": "Relatório atualizado.", "relatorio": atualizado or estado_final}
+
+
+@app.delete("/api/relatorios/{relatorio_id}")
+def excluir_relatorio(
+    relatorio_id: str,
+    definitivo: bool = False,
+    usuario=Depends(validar_token),
+):
+    """Inativa o relatorio (soft delete). Com ?definitivo=true remove de vez
+    — so funciona se nao houver versoes/execucoes referenciando (FK)."""
+    _rel_carregar_definicao(relatorio_id)
+
+    if definitivo:
+        _rel_sb_delete(REPORTBUILDER_TABELA_DEF, relatorio_id)
+        return {"mensagem": "Relatório removido definitivamente.", "id": relatorio_id}
+
+    _rel_sb_update(REPORTBUILDER_TABELA_DEF, relatorio_id, {
+        "status": "INATIVO",
+        "atualizado_por": str(usuario or ""),
+        "atualizado_em": datetime.now().isoformat(),
+    })
+    return {"mensagem": "Relatório inativado.", "id": relatorio_id}
+
+
+@app.get("/api/relatorios/{relatorio_id}/versoes")
+def listar_versoes_relatorio(relatorio_id: str, usuario=Depends(validar_token)):
+    """Lista o historico de versoes (snapshots) de um relatorio."""
+    _rel_carregar_definicao(relatorio_id)
+    dados = _rel_sb_get(
+        REPORTBUILDER_TABELA_VER,
+        f"report_id=eq.{relatorio_id}&select=*&order=versao.desc",
+    )
+    return {"total": len(dados), "versoes": dados}
+
+
+@app.post("/api/relatorios/{relatorio_id}/publicar")
+def publicar_relatorio(relatorio_id: str, usuario=Depends(validar_token)):
+    """Publica o relatorio (status PUBLICADO). Revalida a SQL antes."""
+    definicao = _rel_carregar_definicao(relatorio_id)
+    val = _rel_validar_sql(definicao.get("sql_base") or "")
+    if not val["valido"]:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Não é possível publicar — SQL inválida: {val['erro']}",
+        )
+    atualizado = _rel_sb_update(REPORTBUILDER_TABELA_DEF, relatorio_id, {
+        "status": "PUBLICADO",
+        "atualizado_por": str(usuario or ""),
+        "atualizado_em": datetime.now().isoformat(),
+    })
+    return {"mensagem": "Relatório publicado.", "relatorio": atualizado}
+
+
+@app.post("/api/relatorios/{relatorio_id}/executar")
+def executar_relatorio(
+    relatorio_id: str,
+    payload: _RelExecutarPayload,
+    usuario=Depends(validar_token),
+):
+    """Executa o relatorio completo (com paginacao) e registra a execucao."""
+    definicao = _rel_carregar_definicao(relatorio_id)
+
+    if (definicao.get("fonte_dados") or "ERP_SENIOR") != "ERP_SENIOR":
+        raise HTTPException(
+            status_code=422,
+            detail="Execução só suportada para fonte ERP_SENIOR nesta versão.",
+        )
+
+    pagina = max(1, int(payload.pagina or 1))
+    tamanho = max(1, min(int(payload.tamanho_pagina or 100), 5000))
+    # ROWCOUNT cobre pagina*tamanho + 1 (a +1 detecta se ha proxima pagina)
+    limite = min(pagina * tamanho + 1, 50000)
+
+    valores = _rel_resolver_valores(
+        definicao.get("sql_base") or "",
+        definicao.get("parametros_config") or [],
+        payload.parametros,
+    )
+
+    inicio = datetime.now()
+    try:
+        resultado = _rel_executar_sql(definicao.get("sql_base") or "", valores, limite)
+    except HTTPException as exc:
+        _rel_registrar_execucao(
+            relatorio_id, valores, 0,
+            int((datetime.now() - inicio).total_seconds() * 1000),
+            "ERRO", str(exc.detail), str(usuario or ""),
+        )
+        raise
+    except Exception as exc:
+        _rel_registrar_execucao(
+            relatorio_id, valores, 0,
+            int((datetime.now() - inicio).total_seconds() * 1000),
+            "ERRO", str(exc), str(usuario or ""),
+        )
+        raise HTTPException(status_code=500, detail=f"Erro ao executar relatório: {str(exc)}")
+
+    todas = resultado["linhas"]
+    ini = (pagina - 1) * tamanho
+    fim = pagina * tamanho
+    pagina_linhas = todas[ini:fim]
+    tem_proxima = len(todas) > fim
+
+    _rel_registrar_execucao(
+        relatorio_id, valores, len(pagina_linhas),
+        resultado["tempo_ms"], "SUCESSO", None, str(usuario or ""),
+    )
+
+    # Totalizadores e grafico consideram TODAS as linhas do resultado
+    # (nao apenas a pagina exibida).
+    colunas_config_def = definicao.get("colunas_config") or []
+    totalizadores = _rel_calcular_totalizadores(todas, colunas_config_def)
+    grafico = _rel_agregar_grafico(
+        todas, (definicao.get("layout_config") or {}).get("grafico"),
+    )
+
+    return {
+        "relatorio_id": relatorio_id,
+        "nome": definicao.get("nome"),
+        "pagina": pagina,
+        "tamanho_pagina": tamanho,
+        "tem_proxima_pagina": tem_proxima,
+        "qtd_linhas_pagina": len(pagina_linhas),
+        "qtd_linhas_total": len(todas),
+        "tempo_ms": resultado["tempo_ms"],
+        "colunas": resultado["colunas"],
+        "linhas": pagina_linhas,
+        "totalizadores": totalizadores,
+        "grafico": grafico,
+        "parametros_aplicados": valores,
+        "observacao": (
+            "Paginação aproximada via SET ROWCOUNT — re-executa a consulta a cada "
+            "página. Totalizadores/gráfico consideram todas as linhas carregadas. "
+            "Para volumes grandes, use filtros nos parâmetros."
+        ),
+    }
+
+
+# ------------------------------------------------------------
+# Segunda Onda — colunas, historico, duplicar
+# ------------------------------------------------------------
+
+class _RelColunaConfig(BaseModel):
+    campo: str
+    titulo: Optional[str] = None
+    visivel: bool = True
+    ordem: int = 0
+    tipo: str = "texto"
+    alinhamento: str = "esquerda"
+    formato: Optional[str] = None
+    largura: Optional[int] = 120
+    totalizar: bool = False
+    agrupar: bool = False
+
+
+class _RelColunasPayload(BaseModel):
+    colunas_config: List[_RelColunaConfig] = Field(default_factory=list)
+
+
+@app.put("/api/relatorios/{relatorio_id}/colunas")
+def atualizar_colunas_relatorio(
+    relatorio_id: str,
+    payload: _RelColunasPayload,
+    usuario=Depends(validar_token),
+):
+    """Salva a configuração de colunas do relatório (aba Colunas do editor)."""
+    _rel_carregar_definicao(relatorio_id)
+    colunas_json = [c.model_dump() for c in payload.colunas_config]
+
+    atualizado = _rel_sb_update(REPORTBUILDER_TABELA_DEF, relatorio_id, {
+        "colunas_config": colunas_json,
+        "atualizado_por": str(usuario or ""),
+        "atualizado_em": datetime.now().isoformat(),
+    })
+    return {
+        "ok": True,
+        "relatorio_id": relatorio_id,
+        "qtd_colunas": len(colunas_json),
+        "colunas_config": colunas_json,
+        "relatorio": atualizado or None,
+    }
+
+
+@app.get("/api/relatorios/{relatorio_id}/execucoes")
+def listar_execucoes_relatorio(
+    relatorio_id: str,
+    limite: int = 50,
+    usuario=Depends(validar_token),
+):
+    """Histórico de execuções/exportações do relatório (report_executions)."""
+    _rel_carregar_definicao(relatorio_id)
+    limite = max(1, min(int(limite or 50), 500))
+    dados = _rel_sb_get(
+        REPORTBUILDER_TABELA_EXEC,
+        f"report_id=eq.{relatorio_id}&select=*&order=executado_em.desc&limit={limite}",
+    )
+    return {
+        "relatorio_id": relatorio_id,
+        "total": len(dados),
+        "execucoes": dados,
+    }
+
+
+@app.post("/api/relatorios/{relatorio_id}/duplicar")
+def duplicar_relatorio(relatorio_id: str, usuario=Depends(validar_token)):
+    """Cria uma cópia do relatório em status RASCUNHO."""
+    origem = _rel_carregar_definicao(relatorio_id)
+    usr = str(usuario or "")
+    agora = datetime.now().isoformat()
+
+    novo = {
+        "codigo": f"REL-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+        "nome": f"{origem.get('nome') or 'Relatório'} - Cópia",
+        "descricao": origem.get("descricao"),
+        "modulo": origem.get("modulo"),
+        "categoria": origem.get("categoria"),
+        "fonte_dados": origem.get("fonte_dados") or "ERP_SENIOR",
+        "sql_base": origem.get("sql_base") or "",
+        "status": "RASCUNHO",
+        "layout_config": origem.get("layout_config") or {},
+        "parametros_config": origem.get("parametros_config") or [],
+        "colunas_config": origem.get("colunas_config") or [],
+        "permissao_config": origem.get("permissao_config") or {},
+        "criado_por": usr,
+        "atualizado_por": usr,
+        "criado_em": agora,
+        "atualizado_em": agora,
+    }
+    criado = _rel_sb_insert(REPORTBUILDER_TABELA_DEF, novo)
+    _rel_snapshot_versao(criado, usr)
+    return {
+        "ok": True,
+        "mensagem": "Relatório duplicado.",
+        "origem_id": relatorio_id,
+        "relatorio": criado,
+    }
+
+
+_REL_EXPORT_EXTENSAO = {"EXCEL": "xlsx", "CSV": "csv", "PDF": "pdf"}
+
+
+def _rel_carregar_e_rodar_para_export(relatorio_id: str, parametros: dict,
+                                      limite: int, permissao_flag: str,
+                                      usuario: str, formato: str):
+    """Helper comum dos exports: carrega o relatorio, checa flag de exportacao,
+    executa a SQL, registra a execucao (tipo EXPORTACAO) e devolve
+    (definicao, colunas, linhas, nome_arquivo)."""
+    definicao = _rel_carregar_definicao(relatorio_id)
+
+    layout = definicao.get("layout_config") or {}
+    if permissao_flag and layout.get(permissao_flag) is False:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Exportação desabilitada para este relatório ({permissao_flag}).",
+        )
+
+    if (definicao.get("fonte_dados") or "ERP_SENIOR") != "ERP_SENIOR":
+        raise HTTPException(
+            status_code=422,
+            detail="Exportação só suportada para fonte ERP_SENIOR nesta versão.",
+        )
+
+    valores = _rel_resolver_valores(
+        definicao.get("sql_base") or "",
+        definicao.get("parametros_config") or [],
+        parametros,
+    )
+    limite = max(1, min(int(limite or 10000), 50000))
+
+    ext = _REL_EXPORT_EXTENSAO.get(formato, "dat")
+    base_nome = re.sub(r"[^\w\-]+", "_", str(definicao.get("nome") or definicao.get("codigo") or relatorio_id)).strip("_")
+    nome_arq = f"{(base_nome or 'relatorio').lower()}.{ext}"
+
+    inicio = datetime.now()
+    try:
+        resultado = _rel_executar_sql(definicao.get("sql_base") or "", valores, limite)
+    except Exception as exc:
+        _rel_registrar_execucao(
+            relatorio_id, valores, 0,
+            int((datetime.now() - inicio).total_seconds() * 1000),
+            "ERRO", str(getattr(exc, "detail", exc)), str(usuario or ""),
+            tipo_execucao="EXPORTACAO", formato_exportacao=formato, arquivo_nome=None,
+        )
+        raise
+    _rel_registrar_execucao(
+        relatorio_id, valores, resultado["qtd_linhas"],
+        resultado["tempo_ms"], "SUCESSO", None, str(usuario or ""),
+        tipo_execucao="EXPORTACAO", formato_exportacao=formato, arquivo_nome=nome_arq,
+    )
+    return definicao, resultado["colunas"], resultado["linhas"], nome_arq
+
+
+def _rel_colunas_visiveis(definicao: dict, colunas: list) -> list:
+    """Devolve a colunas_config efetiva, apenas visiveis e ordenadas.
+    Se a definicao nao tem colunas_config, monta a padrao a partir das colunas."""
+    cfg = definicao.get("colunas_config") or []
+    if not cfg:
+        cfg = _rel_montar_colunas_config_padrao(colunas)
+    visiveis = [
+        c for c in sorted(cfg, key=lambda x: x.get("ordem", 999))
+        if c.get("visivel", True) and c.get("campo")
+    ]
+    return visiveis or _rel_montar_colunas_config_padrao(colunas)
+
+
+_REL_NUMBER_FORMATS = {
+    "moeda": 'R$ #,##0.00',
+    "numero": '#,##0.00',
+    "percentual": '0.00%',
+    "data": 'DD/MM/YYYY',
+    "data_hora": 'DD/MM/YYYY HH:MM',
+}
+
+
+def _rel_construir_excel(definicao: dict, colunas: list, linhas: list, relatorio_id: str):
+    """Monta o .xlsx do relatorio respeitando colunas_config (titulo, ordem,
+    visivel, tipo/formato, alinhamento) e com linha de TOTAL no rodape."""
+    colunas_cfg = _rel_colunas_visiveis(definicao, colunas)
+    campos = [c["campo"] for c in colunas_cfg]
+    totalizadores = _rel_calcular_totalizadores(linhas, definicao.get("colunas_config") or colunas_cfg)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = (definicao.get("nome") or "Relatório")[:31]
+
+    # Titulo + data de geracao
+    ws.cell(row=1, column=1, value=str(definicao.get("nome") or "Relatório")).font = Font(bold=True, size=14)
+    ws.cell(row=2, column=1,
+            value=f"Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+    linha_cab = 4
+
+    for col_idx, cfg in enumerate(colunas_cfg, start=1):
+        cell = ws.cell(row=linha_cab, column=col_idx,
+                       value=cfg.get("titulo") or cfg.get("campo"))
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="DDDDDD")
+        cell.alignment = Alignment(horizontal="center")
+        try:
+            largura = int((cfg.get("largura") or 120) / 7)
+        except (ValueError, TypeError):
+            largura = 17
+        ws.column_dimensions[cell.column_letter].width = max(largura, 12)
+
+    for row_off, linha in enumerate(linhas, start=linha_cab + 1):
+        for col_idx, cfg in enumerate(colunas_cfg, start=1):
+            campo = cfg["campo"]
+            valor = linha.get(campo)
+            cell = ws.cell(row=row_off, column=col_idx, value=valor)
+            alinhamento = str(cfg.get("alinhamento") or "esquerda").lower()
+            cell.alignment = Alignment(horizontal={
+                "direita": "right", "centro": "center", "center": "center",
+            }.get(alinhamento, "left"))
+            fmt = _REL_NUMBER_FORMATS.get(str(cfg.get("tipo") or "").lower())
+            if fmt:
+                cell.number_format = fmt
+
+    if totalizadores:
+        linha_total = linha_cab + len(linhas) + 1
+        ws.cell(row=linha_total, column=1, value="TOTAL").font = Font(bold=True)
+        for col_idx, cfg in enumerate(colunas_cfg, start=1):
+            campo = cfg["campo"]
+            if campo in totalizadores:
+                cell = ws.cell(row=linha_total, column=col_idx, value=totalizadores[campo])
+                cell.font = Font(bold=True)
+                fmt = _REL_NUMBER_FORMATS.get(str(cfg.get("tipo") or "").lower())
+                cell.number_format = fmt or '#,##0.00'
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    payload_xlsx = buffer.getvalue()
+    nome_arq = f"relatorio_{(definicao.get('codigo') or relatorio_id)}.xlsx"
+    return Response(
+        content=payload_xlsx,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{nome_arq}"',
+            "Access-Control-Expose-Headers": "Content-Disposition",
+            "Content-Length": str(len(payload_xlsx)),
+            "Cache-Control": "no-store, max-age=0",
+        },
+    )
+
+
+@app.post("/api/relatorios/{relatorio_id}/exportar/excel")
+def exportar_relatorio_excel(
+    relatorio_id: str,
+    payload: _RelExportarPayload,
+    usuario=Depends(validar_token),
+):
+    """Exporta o resultado do relatorio em Excel (.xlsx), respeitando a
+    configuração de colunas e com linha de TOTAL."""
+    definicao, colunas, linhas, _nome = _rel_carregar_e_rodar_para_export(
+        relatorio_id, payload.parametros, payload.limite,
+        "permitir_excel", str(usuario or ""), "EXCEL",
+    )
+    return _rel_construir_excel(definicao, colunas, linhas, relatorio_id)
+
+
+@app.post("/api/relatorios/{relatorio_id}/exportar/csv")
+def exportar_relatorio_csv(
+    relatorio_id: str,
+    payload: _RelExportarPayload,
+    usuario=Depends(validar_token),
+):
+    """Exporta o resultado do relatorio em CSV, respeitando a configuração
+    de colunas e com linha de TOTAL quando houver totalizadores."""
+    definicao, colunas, linhas, nome_arq = _rel_carregar_e_rodar_para_export(
+        relatorio_id, payload.parametros, payload.limite,
+        "permitir_csv", str(usuario or ""), "CSV",
+    )
+    colunas_cfg = _rel_colunas_visiveis(definicao, colunas)
+    campos = [c["campo"] for c in colunas_cfg]
+    cabecalhos = {c["campo"]: (c.get("titulo") or c["campo"]) for c in colunas_cfg}
+
+    linhas_exibidas = [{campo: linha.get(campo) for campo in campos} for linha in linhas]
+
+    totalizadores = _rel_calcular_totalizadores(linhas, definicao.get("colunas_config") or colunas_cfg)
+    if totalizadores and campos:
+        linha_total = {campo: "" for campo in campos}
+        linha_total[campos[0]] = "TOTAL"
+        for campo, valor in totalizadores.items():
+            if campo in linha_total:
+                linha_total[campo] = valor
+        linhas_exibidas.append(linha_total)
+
+    return _csv_response(nome_arq, linhas_exibidas, cabecalhos or None)
+
+
+class _RelExportarPdfPayload(BaseModel):
+    parametros: dict = Field(default_factory=dict)
+    limite: int = 10000
+    orientacao: Optional[str] = None             # 'retrato' | 'paisagem'
+    mostrar_filtros: Optional[bool] = None
+    mostrar_totalizadores: Optional[bool] = None
+    mostrar_data_hora: Optional[bool] = None
+    mostrar_usuario: Optional[bool] = None
+
+
+def _rel_fmt_valor_pdf(valor) -> str:
+    """Formata um valor para a celula do PDF (texto curto)."""
+    if valor is None:
+        return ""
+    if isinstance(valor, float):
+        return f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return str(valor)[:80]
+
+
+@app.post("/api/relatorios/{relatorio_id}/exportar/pdf")
+def exportar_relatorio_pdf(
+    relatorio_id: str,
+    payload: _RelExportarPdfPayload,
+    usuario=Depends(validar_token),
+):
+    """Exporta o relatório em PDF profissional. As opções vêm do payload e,
+    quando ausentes, dos defaults em layout_config.pdf. Requer reportlab."""
+    if not _REPORTLAB_OK:
+        raise HTTPException(
+            status_code=501,
+            detail="Exportação PDF indisponível: instale 'reportlab' no servidor (pip install reportlab).",
+        )
+
+    definicao, colunas, linhas, _nome = _rel_carregar_e_rodar_para_export(
+        relatorio_id, payload.parametros, payload.limite,
+        "permitir_pdf", str(usuario or ""), "PDF",
+    )
+
+    # Config de PDF: payload sobrepoe layout_config.pdf; default no fim.
+    pdf_cfg = (definicao.get("layout_config") or {}).get("pdf") or {}
+
+    def _resolver_bool(do_payload, chave_cfg, padrao):
+        if do_payload is not None:
+            return bool(do_payload)
+        if chave_cfg in pdf_cfg:
+            return bool(pdf_cfg.get(chave_cfg))
+        return padrao
+
+    orientacao = (payload.orientacao or pdf_cfg.get("orientacao") or "paisagem").lower()
+    mostrar_filtros = _resolver_bool(payload.mostrar_filtros, "mostrar_filtros", True)
+    mostrar_totais = _resolver_bool(payload.mostrar_totalizadores, "mostrar_totalizadores", True)
+    mostrar_data_hora = _resolver_bool(payload.mostrar_data_hora, "mostrar_data_hora", True)
+    mostrar_usuario = _resolver_bool(payload.mostrar_usuario, "mostrar_usuario", True)
+
+    colunas_cfg = _rel_colunas_visiveis(definicao, colunas)
+    campos = [c["campo"] for c in colunas_cfg]
+    cabecalhos = {c["campo"]: (c.get("titulo") or c["campo"]) for c in colunas_cfg}
+
+    totalizadores = _rel_calcular_totalizadores(
+        linhas, definicao.get("colunas_config") or colunas_cfg,
+    ) if mostrar_totais else {}
+
+    # Re-resolve os valores so para exibir o bloco de filtros aplicados.
+    valores_filtros = {}
+    if mostrar_filtros:
+        try:
+            valores_filtros = _rel_resolver_valores(
+                definicao.get("sql_base") or "",
+                definicao.get("parametros_config") or [],
+                payload.parametros,
+            )
+        except Exception:
+            valores_filtros = payload.parametros or {}
+
+    MAX_LINHAS_PDF = 2000
+    linhas_pdf = linhas[:MAX_LINHAS_PDF]
+
+    pagesize = A4 if orientacao == "retrato" else landscape(A4)
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=pagesize,
+        leftMargin=10 * _rl_mm, rightMargin=10 * _rl_mm,
+        topMargin=12 * _rl_mm, bottomMargin=12 * _rl_mm,
+    )
+    estilos = _rl_styles()
+    elementos = []
+
+    elementos.append(_RLParagraph(str(definicao.get("nome") or "Relatório"), estilos["Title"]))
+
+    sub_partes = [
+        f"Código: {definicao.get('codigo') or '-'}",
+        f"Módulo: {definicao.get('modulo') or '-'}",
+    ]
+    if mostrar_data_hora:
+        sub_partes.append(f"Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    if mostrar_usuario:
+        sub_partes.append(f"Usuário: {str(usuario or '-')}")
+    sub_partes.append(f"{len(linhas)} linha(s)")
+    elementos.append(_RLParagraph(" | ".join(sub_partes), estilos["Normal"]))
+
+    if definicao.get("descricao"):
+        elementos.append(_RLParagraph(str(definicao["descricao"]), estilos["Normal"]))
+
+    if mostrar_filtros and valores_filtros:
+        filtros_txt = "  ".join(
+            f"<b>{k}</b>: {('' if v is None else v)}"
+            for k, v in valores_filtros.items()
+        )
+        elementos.append(_RLSpacer(1, 2 * _rl_mm))
+        elementos.append(_RLParagraph(f"Filtros aplicados — {filtros_txt}", estilos["Normal"]))
+
+    elementos.append(_RLSpacer(1, 6 * _rl_mm))
+
+    if not campos:
+        elementos.append(_RLParagraph("Sem dados para exibir.", estilos["Normal"]))
+    else:
+        matriz = [[str(cabecalhos.get(c, c)) for c in campos]]
+        for linha in linhas_pdf:
+            matriz.append([_rel_fmt_valor_pdf(linha.get(c)) for c in campos])
+
+        estilo_tabela = [
+            ("BACKGROUND", (0, 0), (-1, 0), _rl_colors.HexColor("#1f2937")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), _rl_colors.white),
+            ("FONTSIZE", (0, 0), (-1, -1), 6),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("GRID", (0, 0), (-1, -1), 0.25, _rl_colors.grey),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+             [_rl_colors.white, _rl_colors.HexColor("#f3f4f6")]),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]
+
+        if totalizadores and campos:
+            linha_total = ["" for _ in campos]
+            linha_total[0] = "TOTAL"
+            for idx, campo in enumerate(campos):
+                if campo in totalizadores:
+                    linha_total[idx] = _rel_fmt_valor_pdf(float(totalizadores[campo]))
+            matriz.append(linha_total)
+            ult = len(matriz) - 1
+            estilo_tabela.append(("FONTNAME", (0, ult), (-1, ult), "Helvetica-Bold"))
+            estilo_tabela.append(
+                ("BACKGROUND", (0, ult), (-1, ult), _rl_colors.HexColor("#e5e7eb"))
+            )
+
+        tabela = _RLTable(matriz, repeatRows=1)
+        tabela.setStyle(_RLTableStyle(estilo_tabela))
+        elementos.append(tabela)
+
+        if len(linhas) > MAX_LINHAS_PDF:
+            elementos.append(_RLSpacer(1, 4 * _rl_mm))
+            elementos.append(_RLParagraph(
+                f"Exibindo as primeiras {MAX_LINHAS_PDF} de {len(linhas)} linhas. "
+                "Use Excel/CSV para o conjunto completo.",
+                estilos["Normal"],
+            ))
+
+    doc.build(elementos)
+    payload_pdf = buffer.getvalue()
+    nome_arq = f"relatorio_{(definicao.get('codigo') or relatorio_id)}.pdf"
+    return Response(
+        content=payload_pdf,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{nome_arq}"',
+            "Access-Control-Expose-Headers": "Content-Disposition",
+            "Content-Length": str(len(payload_pdf)),
+            "Cache-Control": "no-store, max-age=0",
+        },
+    )
+
+
+# ------------------------------------------------------------
+# Terceira Onda A — favoritar / criar a partir de modelo
+# ------------------------------------------------------------
+
+@app.post("/api/relatorios/{relatorio_id}/favoritar")
+def favoritar_relatorio(relatorio_id: str, usuario=Depends(validar_token)):
+    """Marca o relatório como favorito do usuário (idempotente)."""
+    _supabase_required()
+    _rel_carregar_definicao(relatorio_id)
+    resp = requests.post(
+        f"{SUPABASE_URL}/rest/v1/{REPORTBUILDER_TABELA_FAV}"
+        "?on_conflict=report_id,usuario",
+        json={"report_id": relatorio_id, "usuario": str(usuario or "")},
+        headers=_supabase_headers("return=representation,resolution=merge-duplicates"),
+        timeout=30,
+    )
+    if resp.status_code not in (200, 201):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase favoritar HTTP {resp.status_code}: {(resp.text or '')[:300]}",
+        )
+    return {"ok": True, "favorito": True, "relatorio_id": relatorio_id}
+
+
+@app.delete("/api/relatorios/{relatorio_id}/favoritar")
+def desfavoritar_relatorio(relatorio_id: str, usuario=Depends(validar_token)):
+    """Remove o relatório dos favoritos do usuário."""
+    _supabase_required()
+    usr = quote(str(usuario or ""), safe="")
+    resp = requests.delete(
+        f"{SUPABASE_URL}/rest/v1/{REPORTBUILDER_TABELA_FAV}"
+        f"?report_id=eq.{relatorio_id}&usuario=eq.{usr}",
+        headers=_supabase_headers("return=minimal"),
+        timeout=30,
+    )
+    if resp.status_code not in (200, 204):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase desfavoritar HTTP {resp.status_code}: {(resp.text or '')[:300]}",
+        )
+    return {"ok": True, "favorito": False, "relatorio_id": relatorio_id}
+
+
+@app.post("/api/relatorios/templates/{template_id}/criar-relatorio")
+def criar_relatorio_de_template(template_id: str, usuario=Depends(validar_token)):
+    """Cria uma nova definição de relatório a partir de um modelo da biblioteca."""
+    templates = _rel_sb_get(
+        REPORTBUILDER_TABELA_TPL, f"id=eq.{template_id}&select=*&limit=1",
+    )
+    if not templates:
+        raise HTTPException(status_code=404, detail="Modelo de relatório não encontrado.")
+    tpl = templates[0]
+
+    val = _rel_validar_sql(tpl.get("sql_base") or "")
+    if not val["valido"]:
+        raise HTTPException(
+            status_code=422,
+            detail=f"SQL do modelo é inválida: {val['erro']}",
+        )
+
+    usr = str(usuario or "")
+    agora = datetime.now().isoformat()
+    row = {
+        "codigo": f"REL-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+        "nome": tpl.get("nome") or "Relatório",
+        "descricao": tpl.get("descricao"),
+        "modulo": tpl.get("modulo"),
+        "categoria": "Modelo",
+        "fonte_dados": "ERP_SENIOR",
+        "sql_base": tpl.get("sql_base") or "",
+        "status": "RASCUNHO",
+        "layout_config": tpl.get("layout_config") or {},
+        "parametros_config": tpl.get("parametros_config") or [],
+        "colunas_config": tpl.get("colunas_config") or [],
+        "permissao_config": {},
+        "criado_por": usr,
+        "atualizado_por": usr,
+        "criado_em": agora,
+        "atualizado_em": agora,
+    }
+    criado = _rel_sb_insert(REPORTBUILDER_TABELA_DEF, row)
+    _rel_snapshot_versao(criado, usr)
+    return {
+        "ok": True,
+        "mensagem": "Relatório criado a partir do modelo.",
+        "template_id": template_id,
+        "relatorio": criado,
+    }
+
+
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run(app, host='0.0.0.0', port=8001)
+    uvicorn.run(app, host='0.0.0.0', port=8070)
