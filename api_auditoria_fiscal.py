@@ -4619,8 +4619,20 @@ def _auditoria_tributaria_inner(
             divergencias_reais.append("Item com CST PIS diferente de CST COFINS")
         if is_num_diff(r.get("item_base_pis"), r.get("item_base_cofins")):
             divergencias_reais.append("Item com base de PIS diferente da base de COFINS")
-        if is_num_diff(r.get("tns_bascre"), r.get("item_bascre")):
-            divergencias_reais.append("Base de crédito do item diferente da base de crédito da transação")
+
+        # Base de crédito: só compara se os DOIS campos existem na NF.
+        # Item_bascre pode vir NULL em várias queries; sem o valor real, comparar é falso positivo.
+        _tns_bascre = r.get("tns_bascre")
+        _item_bascre = r.get("item_bascre")
+        if _tns_bascre is not None and _item_bascre is not None:
+            if is_num_diff(_tns_bascre, _item_bascre):
+                divergencias_reais.append(
+                    "Base de crédito do item diferente da base de crédito da transação"
+                )
+        elif _tns_bascre is not None and _item_bascre is None:
+            pendencias_mapeamento.append(
+                "Base de crédito do item não mapeada para comparação com a transação"
+            )
 
         impostos["pis_cofins"] = {
             "item_cst_pis": r.get("item_cst_pis"), "item_cst_cofins": r.get("item_cst_cofins"),
@@ -4817,45 +4829,26 @@ def _auditoria_tributaria_inner(
             fam_cst_ipi_v = _clean_str(r.get("fam_cst_ipi"))
             cad_cst_ipi = _clean_str(r.get("cad_cstipi_produto"))
 
-            # ----- CST PIS (hierarquia Item NF > Transação > Família > Cadastro) -----
+            # ----- CST PIS (só aviso se cadastro vazio E sem CST efetiva em item/transação) -----
             if not cad_cst_pis:
-                if item_cst_pis or tns_cst_pis:
-                    # Parametrização efetiva veio do item/transação. Não apontar nada.
-                    pass
-                elif fam_cst_pis_v:
+                if not (item_cst_pis or tns_cst_pis):
                     cadastro_produto_motivos.append(
-                        f"Produto sem CST PIS no cadastro, porém família possui CST PIS {fam_cst_pis_v}"
+                        "Cadastro do produto sem CST PIS e sem CST PIS efetivo no item/transação"
                     )
-                else:
-                    divergencias_reais.append(
-                        "Produto sem CST PIS no cadastro e sem CST PIS efetivo no item/transação/família"
-                    )
+                # Caso contrário: item ou transação resolveu, não apontar nada.
 
             # ----- CST COFINS -----
             if not cad_cst_cofins:
-                if item_cst_cofins or tns_cst_cofins:
-                    pass
-                elif fam_cst_cofins_v:
+                if not (item_cst_cofins or tns_cst_cofins):
                     cadastro_produto_motivos.append(
-                        f"Produto sem CST COFINS no cadastro, porém família possui CST COFINS {fam_cst_cofins_v}"
-                    )
-                else:
-                    divergencias_reais.append(
-                        "Produto sem CST COFINS no cadastro e sem CST COFINS efetivo no item/transação/família"
+                        "Cadastro do produto sem CST COFINS e sem CST COFINS efetivo no item/transação"
                     )
 
-            # ----- CST IPI (mesma lógica, sem camada de transação na maioria dos casos) -----
+            # ----- CST IPI (sem camada de transação consistente) -----
             if not cad_cst_ipi:
-                if item_cst_ipi:
-                    pass
-                elif fam_cst_ipi_v:
+                if not item_cst_ipi:
                     cadastro_produto_motivos.append(
-                        f"Produto sem CST IPI no cadastro, porém família possui CST IPI {fam_cst_ipi_v}"
-                    )
-                # Sem CST IPI em camada nenhuma para produto: tratamos como aviso (depende do CFOP/NCM)
-                else:
-                    cadastro_produto_motivos.append(
-                        "Produto sem CST IPI no cadastro (verificar se a operação exige IPI)"
+                        "Cadastro do produto sem CST IPI (verificar se a operação exige IPI)"
                     )
 
             # ----- Tipos de tributação PIS/COFINS (TriPIS/TriCOF) -----
@@ -4973,31 +4966,45 @@ def _auditoria_tributaria_inner(
                 familia_vs_cadastro_motivos.append("Família com Recupera PIS diferente do cadastro do produto")
         avisos_cadastrais.extend(familia_vs_cadastro_motivos)
 
-        # Divergencias familia x item gravado na NF (com hierarquia Item NF > Transacao > Familia > Cadastro)
+        # Divergencias familia x item gravado na NF (com hierarquia Item NF > Transacao > Familia > Cadastro).
+        # Regras:
+        #  - Se família OU item estiverem vazios, nao gera mensagem (evita "família () difere ...").
+        #  - Se item bate com a transacao, e familia diverge: NAO aponta nada (operacao resolveu).
+        #  - Caso contrario, familia x item vira divergencia real.
         familia_vs_item_divergencias = []
         familia_vs_item_avisos = []
+
+        def _igual_preenchido(a, b):
+            aa, bb = _clean_str(a), _clean_str(b)
+            return aa != "" and bb != "" and aa == bb
+
+        def _diff_preenchido(a, b):
+            aa, bb = _clean_str(a), _clean_str(b)
+            return aa != "" and bb != "" and aa != bb
+
         if r.get("tipo_item") == "PRODUTO" and r.get("movimento") in ("ENTRADA", "SAIDA"):
             fam_pis, item_pis, tns_pis = r.get("fam_cst_pis"), r.get("item_cst_pis"), r.get("tns_cst_pis")
-            if fam_pis is not None and item_pis is not None and is_str_diff(fam_pis, item_pis):
-                if tns_pis is not None and not is_str_diff(tns_pis, item_pis):
-                    familia_vs_item_avisos.append(
-                        f"CST PIS da família ({fam_pis}) difere do item ({item_pis}), mas o item está coerente com a transação ({tns_pis})"
-                    )
+            if _diff_preenchido(fam_pis, item_pis):
+                if _igual_preenchido(item_pis, tns_pis):
+                    pass  # Operação resolveu - silenciar
                 else:
-                    familia_vs_item_divergencias.append(f"CST PIS da família ({fam_pis}) difere do item NF ({item_pis})")
+                    familia_vs_item_divergencias.append(
+                        f"CST PIS da família ({_clean_str(fam_pis)}) difere do item NF ({_clean_str(item_pis)})"
+                    )
 
             fam_cof, item_cof, tns_cof = r.get("fam_cst_cofins"), r.get("item_cst_cofins"), r.get("tns_cst_cofins")
-            if fam_cof is not None and item_cof is not None and is_str_diff(fam_cof, item_cof):
-                if tns_cof is not None and not is_str_diff(tns_cof, item_cof):
-                    familia_vs_item_avisos.append(
-                        f"CST COFINS da família ({fam_cof}) difere do item ({item_cof}), mas o item está coerente com a transação ({tns_cof})"
-                    )
+            if _diff_preenchido(fam_cof, item_cof):
+                if _igual_preenchido(item_cof, tns_cof):
+                    pass
                 else:
-                    familia_vs_item_divergencias.append(f"CST COFINS da família ({fam_cof}) difere do item NF ({item_cof})")
+                    familia_vs_item_divergencias.append(
+                        f"CST COFINS da família ({_clean_str(fam_cof)}) difere do item NF ({_clean_str(item_cof)})"
+                    )
 
-            fam_ipi, item_ipi = r.get("fam_cst_ipi"), r.get("item_cst_ipi")
-            if fam_ipi is not None and item_ipi is not None and is_str_diff(fam_ipi, item_ipi):
-                familia_vs_item_avisos.append(f"CST IPI da família ({fam_ipi}) difere do item NF ({item_ipi})")
+            if _diff_preenchido(r.get("fam_cst_ipi"), r.get("item_cst_ipi")):
+                familia_vs_item_avisos.append(
+                    f"CST IPI da família ({_clean_str(r.get('fam_cst_ipi'))}) difere do item NF ({_clean_str(r.get('item_cst_ipi'))})"
+                )
 
             fam_peripi = r.get("fam_peripi")
             if fam_peripi is not None and r.get("item_aliq_ipi") is not None and is_num_diff(fam_peripi, r.get("item_aliq_ipi")):
@@ -5005,8 +5012,10 @@ def _auditoria_tributaria_inner(
             fam_pericm = r.get("fam_pericm")
             if fam_pericm is not None and r.get("item_aliq_icms") is not None and is_num_diff(fam_pericm, r.get("item_aliq_icms")):
                 familia_vs_item_avisos.append(f"Alíquota ICMS da família ({fam_pericm}%) difere da aplicada no item ({r.get('item_aliq_icms')}%)")
-            if r.get("fam_codstr") is not None and r.get("item_cst_icms") is not None and is_str_diff(r.get("fam_codstr"), r.get("item_cst_icms")):
-                familia_vs_item_avisos.append(f"Estratégia ICMS da família ({r.get('fam_codstr')}) difere da aplicada no item ({r.get('item_cst_icms')})")
+            if _diff_preenchido(r.get("fam_codstr"), r.get("item_cst_icms")):
+                familia_vs_item_avisos.append(
+                    f"Estratégia ICMS da família ({_clean_str(r.get('fam_codstr'))}) difere da aplicada no item ({_clean_str(r.get('item_cst_icms'))})"
+                )
         divergencias_reais.extend(familia_vs_item_divergencias)
         avisos_cadastrais.extend(familia_vs_item_avisos)
         familia_vs_item_motivos = familia_vs_item_divergencias + familia_vs_item_avisos
