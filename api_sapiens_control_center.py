@@ -6,7 +6,7 @@ import pyodbc
 from jose import jwt
 from jose.exceptions import ExpiredSignatureError, JWTError
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Any, List, Dict
 from pydantic import BaseModel, Field, AliasChoices, ConfigDict
 from openpyxl import Workbook
@@ -13900,31 +13900,116 @@ def _metadata_arquivo_desenho(caminho: Path):
     }
 
 
-def formatar_tempo_decimal_horas(valor):
-    """Converte horas decimais (ex: 0.3) em string legivel (ex: "18 min" ou "1 h 30 min").
+def formatar_numero_op_exibicao(num_orp):
+    """Numero da OP para exibicao no relatorio (sem zeros a esquerda).
 
-    Aceita None/"" e qualquer valor convertível em float. Retorna "" para entradas invalidas.
+    Exemplos:
+      69072       -> "69072"
+      "000069072" -> "69072"
+      0 / "" / None -> "0"
     """
     try:
-        horas_dec = float(valor or 0)
+        return str(int(num_orp))
     except Exception:
-        return ""
+        valor = str(num_orp or "").strip().lstrip("0")
+        return valor or "0"
 
-    if horas_dec <= 0:
-        return "0 min"
 
-    minutos_total = int(round(horas_dec * 60))
+def formatar_numero_op_barcode(num_orp):
+    """Numero da OP para o codigo de barras (9 digitos com zeros a esquerda).
 
-    if minutos_total < 60:
-        return f"{minutos_total} min"
+    Exemplos:
+      69072       -> "000069072"
+      "1112"      -> "000001112"
+      None / ""   -> "000000000"
+    """
+    try:
+        return str(int(num_orp)).zfill(9)
+    except Exception:
+        return str(num_orp or "").strip().zfill(9)
 
-    horas = minutos_total // 60
-    minutos = minutos_total % 60
 
-    if minutos == 0:
-        return f"{horas} h"
+# Alias retrocompativel — algum codigo antigo pode ainda chamar formatar_numero_op.
+# Aponta para a versao barcode (9 digitos), que era o comportamento anterior.
+formatar_numero_op = formatar_numero_op_barcode
 
-    return f"{horas} h {minutos} min"
+
+def formatar_codigo_barras_op(cod_ori, num_orp):
+    """Monta o codigo de barras da OP: origem + OP de 9 digitos.
+
+    Exemplo: cod_ori="210", num_orp=69072 -> "210000069072"
+    """
+    origem = str(cod_ori or "").strip()
+    op_barcode = formatar_numero_op_barcode(num_orp)
+    return f"{origem}{op_barcode}"
+
+
+def numero_para_decimal(valor):
+    """Converte um valor heterogeneo em Decimal de forma tolerante.
+
+    Aceita None, int, float, Decimal, string com virgula ou ponto.
+    Retorna Decimal("0") quando nao consegue interpretar.
+    """
+    if valor is None:
+        return Decimal("0")
+    if isinstance(valor, Decimal):
+        return valor
+    try:
+        return Decimal(str(valor).replace(",", "."))
+    except Exception:
+        return Decimal("0")
+
+
+def tempo_para_minutos(valor):
+    """Trata o valor de tempo unitario como JA estando em minutos.
+
+    Regra atual (alinhada ao MCAP700 / planilha de operacao):
+    - tmp_unit do banco vem em minutos. Nao multiplicar por 60.
+    - Exemplos: 5 -> 5 min, 90 -> 90 min, 0.5 -> 1 min (arredonda).
+
+    Devolve int (minutos arredondados para o mais proximo).
+    """
+    minutos = numero_para_decimal(valor)
+    return int(minutos.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def formatar_minutos(minutos):
+    """Formata minutos como string. Ex: 60 -> "60 min", 0 -> "0 min"."""
+    try:
+        minutos_int = int(minutos or 0)
+    except Exception:
+        minutos_int = 0
+    return f"{minutos_int} min"
+
+
+def calcular_tempos_operacao_em_minutos(tmp_unit, quantidade_op):
+    """Calcula tmp_unit_min, tmp_total_min e seus formatados.
+
+    Formula:
+      tmp_total_min = tmp_unit_min * quantidade_op
+    """
+    tmp_unit_min = tempo_para_minutos(tmp_unit)
+    quantidade = numero_para_decimal(quantidade_op)
+
+    tmp_total_decimal = (Decimal(tmp_unit_min) * quantidade).quantize(
+        Decimal("1"),
+        rounding=ROUND_HALF_UP,
+    )
+    tmp_total_min = int(tmp_total_decimal)
+
+    return {
+        "tmp_unit_min": tmp_unit_min,
+        "tmp_total_min": tmp_total_min,
+        "tmp_unit_formatado": formatar_minutos(tmp_unit_min),
+        "tmp_total_formatado": formatar_minutos(tmp_total_min),
+    }
+
+
+# Alias retrocompativel — algum codigo antigo pode chamar formatar_tempo_decimal_horas.
+# Aponta para o formatador novo (minutos). A regra mudou: tmp_unit vem em minutos,
+# nao mais em horas decimais.
+def formatar_tempo_decimal_horas(valor):
+    return formatar_minutos(tempo_para_minutos(valor))
 
 
 def localizar_desenhos_produto(cod_pro):
@@ -15182,6 +15267,24 @@ def _consultar_dados_impressao_op(
                 ISNULL(REVOP.revisao, '') AS revisao,
                 ISNULL(DEROP.derivacao, '') AS derivacao,
 
+                -- Revisao do MODELO (produto): prioridade COP.VerMod -> versao
+                -- corrente (E700VMO) -> ultima do modelo (E700MOD) -> "-".
+                COALESCE(
+                    NULLIF(LTRIM(RTRIM(COP.VerMod)), ''),
+                    NULLIF(LTRIM(RTRIM(VMOD.VerMod)), ''),
+                    NULLIF(LTRIM(RTRIM(MMOD.VerMod)), ''),
+                    '-'
+                ) AS revisao_modelo,
+
+                -- Revisao do ROTEIRO: prioridade COP.VerRot -> versao corrente
+                -- (E710VRO) -> ultima do roteiro (E710ROT) -> "-".
+                COALESCE(
+                    NULLIF(LTRIM(RTRIM(COP.VerRot)), ''),
+                    NULLIF(LTRIM(RTRIM(VROT.VerRot)), ''),
+                    NULLIF(LTRIM(RTRIM(MROT.VerRot)), ''),
+                    '-'
+                ) AS revisao_roteiro,
+
                 ISNULL(COP.ObsOrp, '') AS observacao_1,
                 ISNULL(COP.ObsOr2, '') AS observacao_2
 
@@ -15214,6 +15317,46 @@ def _consultar_dados_impressao_op(
                 ORDER BY Q.CodDer
             ) DEROP
 
+            -- Versao corrente do MODELO (tabela de historico E700VMO).
+            -- Usado quando COP.VerMod nao esta preenchido.
+            OUTER APPLY (
+                SELECT TOP 1 V.VerMod
+                FROM E700VMO V
+                WHERE V.CodEmp = COP.CodEmp
+                  AND V.CodMod = COP.CodPro
+                  AND NULLIF(LTRIM(RTRIM(V.VerMod)), '') IS NOT NULL
+                ORDER BY V.VerMod DESC
+            ) VMOD
+
+            -- Ultimo registro do MODELO em E700MOD (fallback final do modelo).
+            OUTER APPLY (
+                SELECT TOP 1 M.VerMod
+                FROM E700MOD M
+                WHERE M.CodEmp = COP.CodEmp
+                  AND M.CodMod = COP.CodPro
+                  AND NULLIF(LTRIM(RTRIM(M.VerMod)), '') IS NOT NULL
+            ) MMOD
+
+            -- Versao corrente do ROTEIRO (tabela de historico E710VRO).
+            -- Usado quando COP.VerRot nao esta preenchido.
+            OUTER APPLY (
+                SELECT TOP 1 V.VerRot
+                FROM E710VRO V
+                WHERE V.CodEmp = COP.CodEmp
+                  AND V.CodRot = COP.CodRot
+                  AND NULLIF(LTRIM(RTRIM(V.VerRot)), '') IS NOT NULL
+                ORDER BY V.VerRot DESC
+            ) VROT
+
+            -- Ultimo registro do ROTEIRO em E710ROT (fallback final do roteiro).
+            OUTER APPLY (
+                SELECT TOP 1 R.VerRot
+                FROM E710ROT R
+                WHERE R.CodEmp = COP.CodEmp
+                  AND R.CodRot = COP.CodRot
+                  AND NULLIF(LTRIM(RTRIM(R.VerRot)), '') IS NOT NULL
+            ) MROT
+
             WHERE COP.CodEmp = ?
               AND COP.CodOri = ?
               AND COP.NumOrp = ?
@@ -15227,6 +15370,41 @@ def _consultar_dados_impressao_op(
         if not cabecalho:
             # OP nao encontrada, cancelada ou origem 100 -> caller decide o que fazer
             return None
+
+        # Padronizacao das revisoes (modelo/roteiro). O SQL ja devolve "-" como
+        # ultimo fallback via COALESCE, mas reaplicamos em Python para tratar
+        # o caso da string vir literalmente vazia/whitespace ou None (defesa
+        # contra mudancas na query). Tambem montamos o label combinado usado
+        # na caixa "REV" do relatorio.
+        def _norm_rev(valor):
+            if valor is None:
+                return "-"
+            texto = str(valor).strip()
+            return texto if texto else "-"
+
+        cabecalho["revisao_modelo"] = _norm_rev(cabecalho.get("revisao_modelo"))
+        cabecalho["revisao_roteiro"] = _norm_rev(cabecalho.get("revisao_roteiro"))
+        cabecalho["revisao_label"] = (
+            f"MOD {cabecalho['revisao_modelo']} / ROT {cabecalho['revisao_roteiro']}"
+        )
+
+        # Padronizacao dos zeros da OP:
+        # - num_orp_exibicao: para o campo visual "O.P.:" no relatorio
+        #   (sem zeros a esquerda — "69072" em vez de "000069072").
+        # - num_orp_formatado: ALIAS para num_orp_exibicao. O Lovable ja
+        #   usa este campo para exibir, entao mantemos o nome mas com o
+        #   conteudo limpo (sem zeros) — atende a regra nova sem precisar
+        #   alterar o front imediatamente.
+        # - codigo_barras_op: continua com 9 digitos zero-padded (origem +
+        #   OP formatada), porque o codigo de barras depende desse padrao.
+        num_orp_exibicao = formatar_numero_op_exibicao(cabecalho.get("num_orp"))
+        cabecalho["num_orp_exibicao"] = num_orp_exibicao
+        cabecalho["num_orp_formatado"] = num_orp_exibicao
+        cabecalho["num_orp_barcode"] = formatar_numero_op_barcode(cabecalho.get("num_orp"))
+        cabecalho["codigo_barras_op"] = formatar_codigo_barras_op(
+            cabecalho.get("cod_ori"),
+            cabecalho.get("num_orp"),
+        )
 
         # ============================================================
         # 2) Componentes
@@ -15406,6 +15584,13 @@ def _consultar_dados_impressao_op(
         # A proxima operacao agora vem direto do SQL (OUTER APPLY na OP completa),
         # entao o codigo Python so normaliza os nomes finais usados pelo Lovable
         # e inicializa o array de narrativas que sera populado depois.
+        # Quantidade da OP usada para calcular tmp_total = tmp_unit * qtd.
+        quantidade_op_cab = (
+            cabecalho.get("quantidade")
+            or cabecalho.get("quantidade_prevista")
+            or cabecalho.get("qtd_prv")
+            or 1
+        )
         for operacao in operacoes:
             proxima_cod = operacao.get("proxima_operacao_codigo") or ""
             proxima_desc = operacao.get("proxima_operacao_descricao_sql") or ""
@@ -15417,9 +15602,21 @@ def _consultar_dados_impressao_op(
             # Remove o nome interno usado so para evitar conflito com a chave antiga
             operacao.pop("proxima_operacao_descricao_sql", None)
             operacao["narrativas"] = []
-            # Tempos formatados em min/h para o Lovable nao precisar formatar no front
-            operacao["tmp_unit_formatado"] = formatar_tempo_decimal_horas(operacao.get("tmp_unit"))
-            operacao["tmp_total_formatado"] = formatar_tempo_decimal_horas(operacao.get("tmp_total"))
+
+            # Tempos sempre em MINUTOS:
+            # - tmp_unit_min: vem do banco em minutos (TmpPrp do Senior Sapiens).
+            # - tmp_total_min: tmp_unit_min * quantidade_op (regra do MCAP700).
+            # tmp_total do banco (OOP.TmpTpr) e ignorado de proposito — a regra
+            # correta no relatorio e recalcular pela quantidade da OP, e nao
+            # confiar no campo persistido que pode estar desatualizado.
+            tempos = calcular_tempos_operacao_em_minutos(
+                tmp_unit=operacao.get("tmp_unit"),
+                quantidade_op=quantidade_op_cab,
+            )
+            operacao["tmp_unit_min"] = tempos["tmp_unit_min"]
+            operacao["tmp_total_min"] = tempos["tmp_total_min"]
+            operacao["tmp_unit_formatado"] = tempos["tmp_unit_formatado"]
+            operacao["tmp_total_formatado"] = tempos["tmp_total_formatado"]
 
         # ============================================================
         # 4) Narrativas
@@ -36682,4 +36879,4 @@ def criar_relatorio_de_template(template_id: str, usuario=Depends(validar_token)
 
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run(app, host='0.0.0.0', port=8070)
+    uvicorn.run(app, host='0.0.0.0', port=8001)
