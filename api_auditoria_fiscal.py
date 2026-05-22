@@ -3537,17 +3537,20 @@ def auditoria_tributaria(
 # EXPORTACAO XLSX DA AUDITORIA TRIBUTARIA
 # =========================================================
 def _status_auditoria_export(item: Dict[str, Any]) -> str:
-    """Status visual usado na exportacao - segue mesma regra acordada com o front."""
+    """Status visual usado na exportacao - segue exatamente o status_auditoria da API.
+
+    Prioridade: DIVERGENTE > ANALISAR (pendencia de hierarquia) > OK_COM_AVISO > OK.
+    """
     div = item.get("divergencias_reais") or []
     avi = item.get("avisos_cadastrais") or []
     pen = item.get("pendencias_mapeamento") or []
     status_api = (item.get("status_auditoria") or "").upper()
     if status_api == "DIVERGENTE" or len(div) > 0:
         return "DIVERGENTE"
-    if len(avi) > 0:
+    if status_api in ("ANALISAR", "PENDENTE_MAPEAMENTO") or len(pen) > 0:
+        return "ANALISAR"
+    if status_api == "OK_COM_AVISO" or len(avi) > 0:
         return "OK_COM_AVISO"
-    if len(pen) > 0:
-        return "PENDENTE_MAPEAMENTO"
     return "OK"
 
 
@@ -3732,10 +3735,10 @@ def auditoria_tributaria_export(
 
         # Cores por status
         fills_status = {
-            "DIVERGENTE":         PatternFill("solid", fgColor="FECACA"),
-            "OK_COM_AVISO":       PatternFill("solid", fgColor="FDE68A"),
-            "PENDENTE_MAPEAMENTO":PatternFill("solid", fgColor="DDD6FE"),
-            "OK":                 PatternFill("solid", fgColor="DCFCE7"),
+            "DIVERGENTE":   PatternFill("solid", fgColor="FECACA"),
+            "ANALISAR":     PatternFill("solid", fgColor="DDD6FE"),
+            "OK_COM_AVISO": PatternFill("solid", fgColor="FDE68A"),
+            "OK":           PatternFill("solid", fgColor="DCFCE7"),
         }
 
         for ln in linhas:
@@ -3775,8 +3778,8 @@ def auditoria_tributaria_export(
         ws_resumo = wb.create_sheet("Resumo")
         total = len(linhas)
         total_div = sum(1 for ln in linhas if ln["Status Auditoria"] == "DIVERGENTE")
+        total_analisar = sum(1 for ln in linhas if ln["Status Auditoria"] == "ANALISAR")
         total_aviso = sum(1 for ln in linhas if ln["Status Auditoria"] == "OK_COM_AVISO")
-        total_pend = sum(1 for ln in linhas if ln["Status Auditoria"] == "PENDENTE_MAPEAMENTO")
         total_ok = sum(1 for ln in linhas if ln["Status Auditoria"] == "OK")
         resumo_rows = [
             ("Geração", _dt.now().strftime("%d/%m/%Y %H:%M:%S")),
@@ -3789,8 +3792,8 @@ def auditoria_tributaria_export(
             ("", ""),
             ("Total itens exportados", total),
             ("Divergentes", total_div),
+            ("Analisar (hierarquia)", total_analisar),
             ("OK com aviso", total_aviso),
-            ("Pendentes de mapeamento", total_pend),
             ("OK", total_ok),
         ]
         for r_idx, (chave, valor) in enumerate(resumo_rows, start=1):
@@ -4630,7 +4633,8 @@ def _auditoria_tributaria_inner(
                     "Base de crédito do item diferente da base de crédito da transação"
                 )
         elif _tns_bascre is not None and _item_bascre is None:
-            pendencias_mapeamento.append(
+            # Saneamento de base: nao e analise de hierarquia. Vira aviso cadastral.
+            avisos_cadastrais.append(
                 "Base de crédito do item não mapeada para comparação com a transação"
             )
 
@@ -4894,7 +4898,7 @@ def _auditoria_tributaria_inner(
             "item_valor_iss": r.get("item_valor_iss"), "municipio_iss": r.get("municipio_iss"),
             "iss_retido": r.get("iss_retido"), "motivos": iss_motivos,
         }
-        pendencias_mapeamento.extend(iss_motivos)
+        avisos_cadastrais.extend(iss_motivos)
 
         ret_motivos = []
         if r.get("tipo_item") == "SERVICO":
@@ -4906,7 +4910,7 @@ def _auditoria_tributaria_inner(
             "item_valor_csll": r.get("item_valor_csll"), "item_valor_pis_ret": r.get("item_valor_pis_ret"),
             "item_valor_cofins_ret": r.get("item_valor_cofins_ret"), "motivos": ret_motivos,
         }
-        pendencias_mapeamento.extend(ret_motivos)
+        avisos_cadastrais.extend(ret_motivos)
 
         difal_motivos = []
         if r.get("movimento") == "SAIDA" and r.get("cliente_uf"):
@@ -4918,7 +4922,7 @@ def _auditoria_tributaria_inner(
             "item_valor_fcp": r.get("item_valor_fcp"), "item_valor_fcp_st": r.get("item_valor_fcp_st"),
             "motivos": difal_motivos,
         }
-        pendencias_mapeamento.extend(difal_motivos)
+        avisos_cadastrais.extend(difal_motivos)
 
         # Verificacoes especificas para auditoria cadastral (sem movimento) - todas viram avisos cadastrais
         if r.get("origem_auditoria") == "CADASTRO":
@@ -5031,9 +5035,10 @@ def _auditoria_tributaria_inner(
         if r.get("movimento") not in (None, "SEM_MOVIMENTO") and not transacao_atual:
             operacao_divergencias.append("Documento sem transação fiscal")
 
-        # Regra correta: o item NF é a fonte primária. Se ele está sem CST, é divergência.
-        # Se o item NF tem CST mas a transação não tem mapeada, isso é apenas aviso cadastral
-        # (parametrização incompleta, mas o lançamento fiscal saiu correto).
+        # Regra definitiva PIS/COFINS:
+        #  1) Item NF sem CST -> DIVERGENCIA REAL (lancamento fiscal incompleto).
+        #  2) Item OK mas transacao sem CST mapeada -> AVISO CADASTRAL (NF saiu correta).
+        #  3) Item e transacao com CST mas diferentes -> ANALISAR (pendencia de hierarquia).
         _item_pis = _clean_str(r.get("item_cst_pis"))
         _item_cof = _clean_str(r.get("item_cst_cofins"))
         _tns_pis = _clean_str(r.get("tns_cst_pis"))
@@ -5041,24 +5046,28 @@ def _auditoria_tributaria_inner(
         if transacao_atual and r.get("movimento") in ("ENTRADA", "SAIDA") and r.get("tipo_item") == "PRODUTO":
             if not _item_pis or not _item_cof:
                 operacao_divergencias.append("Item da NF sem CST PIS/COFINS efetivo")
-            else:
-                if not _tns_pis or not _tns_cof:
-                    avisos_cadastrais.append(
-                        f"Transação {transacao_atual} sem CST PIS/COFINS mapeado, "
-                        f"porém o item da NF foi gerado com CST PIS {_item_pis} e CST COFINS {_item_cof}"
-                    )
+            elif not _tns_pis and not _tns_cof:
+                avisos_cadastrais.append(
+                    f"Transação {transacao_atual} sem CST PIS/COFINS mapeado, "
+                    f"porém o item da NF possui CST PIS {_item_pis} e CST COFINS {_item_cof}"
+                )
+            elif _item_pis != _tns_pis or _item_cof != _tns_cof:
+                operacao_pendencias.append(
+                    f"CST PIS/COFINS do item ({_item_pis}/{_item_cof}) "
+                    f"difere da transação ({_tns_pis}/{_tns_cof}); analisar hierarquia"
+                )
 
         if transacao_atual and r.get("item_bascre") is not None and r.get("tns_bascre") is None:
-            operacao_pendencias.append("Transação sem base de crédito mapeada")
+            avisos_cadastrais.append("Transação sem base de crédito mapeada")
 
         if r.get("movimento") == "SAIDA" and not cfop_atual:
             operacao_divergencias.append("CFOP da transação não mapeado")
 
         if r.get("movimento") == "SAIDA" and not natureza_operacao_atual:
-            operacao_pendencias.append("Natureza da operação não mapeada")
+            avisos_cadastrais.append("Natureza da operação não mapeada")
 
         if r.get("tipo_item") == "SERVICO" and transacao_atual and not _clean_str(r.get("tns_inss_ref")):
-            operacao_pendencias.append("Transação de serviço sem referência de INSS")
+            avisos_cadastrais.append("Transação de serviço sem referência de INSS")
 
         operacao_motivos = operacao_divergencias + operacao_pendencias
 
@@ -5085,22 +5094,22 @@ def _auditoria_tributaria_inner(
 
         class_motivos = []
         class_divergencias = []
-        class_pendencias = []
+        class_avisos = []
         if r.get("tipo_item") == "PRODUTO":
             if not (r.get("ncm") or "").strip():
                 class_divergencias.append("Produto sem NCM")
             if r.get("cest") is None:
-                class_pendencias.append("Mapear CEST na base para auditoria fiscal mais completa")
-        class_motivos = class_divergencias + class_pendencias
+                class_avisos.append("Mapear CEST na base para auditoria fiscal mais completa")
+        class_motivos = class_divergencias + class_avisos
         impostos["classificacao_fiscal"] = {
             "ncm": r.get("ncm"), "classificacao": r.get("cod_classificacao"),
             "cest": r.get("cest"), "familia_codigo": r.get("familia_codigo"),
             "origem_codigo": r.get("origem_codigo"), "motivos": class_motivos,
             "divergencias_reais": class_divergencias,
-            "pendencias_mapeamento": class_pendencias,
+            "avisos_cadastrais": class_avisos,
         }
         divergencias_reais.extend(class_divergencias)
-        pendencias_mapeamento.extend(class_pendencias)
+        avisos_cadastrais.extend(class_avisos)
 
         def _fonte_imposto(item_v, tns_v, fam_v, cad_v):
             # Hierarquia: ITEM_NF > TRANSACAO > FAMILIA > PRODUTO (cadastro)
@@ -5138,14 +5147,15 @@ def _auditoria_tributaria_inner(
         pendencias_unicas = list(dict.fromkeys([m for m in pendencias_mapeamento if m]))
 
         # IMPORTANTE: "motivos" (campo legado) agora contém SOMENTE divergências reais.
-        # Avisos cadastrais ficam em "avisos_cadastrais"; pendências em "pendencias_mapeamento".
+        # Avisos cadastrais (saneamento) NAO derrubam a nota.
+        # Pendencias = casos que precisam analise de hierarquia (status ANALISAR).
         motivos_unicos = list(divergencias_unicas)
         if divergencias_unicas:
             status = "DIVERGENTE"
+        elif pendencias_unicas:
+            status = "ANALISAR"
         elif avisos_unicos:
             status = "OK_COM_AVISO"
-        elif pendencias_unicas:
-            status = "PENDENTE_MAPEAMENTO"
         else:
             status = "OK"
 
@@ -5285,8 +5295,8 @@ def _auditoria_tributaria_inner(
         "entradas": len([x for x in itens if x.get("movimento") == "ENTRADA"]),
         "saidas": len([x for x in itens if x.get("movimento") == "SAIDA"]),
         "divergentes": len([x for x in itens if x["status_auditoria"] == "DIVERGENTE"]),
+        "analisar": len([x for x in itens if x["status_auditoria"] == "ANALISAR"]),
         "ok_com_aviso": len([x for x in itens if x["status_auditoria"] == "OK_COM_AVISO"]),
-        "pendente_mapeamento": len([x for x in itens if x["status_auditoria"] == "PENDENTE_MAPEAMENTO"]),
         "ok": len([x for x in itens if x["status_auditoria"] == "OK"]),
         "fontes_item_nf": len([x for x in itens if x["fonte_prioritaria"] == "ITEM_NF"]),
         "fontes_transacao": len([x for x in itens if x["fonte_prioritaria"] == "TRANSACAO"]),
@@ -6351,7 +6361,8 @@ function renderResumo(r){
 function badgeStatus(s){
     if(s==="OK") return `<span class="status ok">OK</span>`;
     if(s==="OK_COM_AVISO") return `<span class="status" style="background:#78350f;border:1px solid #f59e0b;color:#fde68a">OK COM AVISO</span>`;
-    if(s==="PENDENTE_MAPEAMENTO") return `<span class="status" style="background:#4c1d95;border:1px solid #7c3aed;color:#d8b4fe">PENDENTE MAPEAMENTO</span>`;
+    if(s==="ANALISAR") return `<span class="status" style="background:#4c1d95;border:1px solid #7c3aed;color:#d8b4fe">ANALISAR</span>`;
+    if(s==="PENDENTE_MAPEAMENTO") return `<span class="status" style="background:#4c1d95;border:1px solid #7c3aed;color:#d8b4fe">ANALISAR</span>`;
     if(s==="DIVERGENTE") return `<span class="status bad">DIVERGENTE</span>`;
     return `<span class="status">${s||"-"}</span>`;
 }
