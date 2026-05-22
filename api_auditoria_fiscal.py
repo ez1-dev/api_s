@@ -204,52 +204,71 @@ def chamar_gemini(prompt: str, instrucao_sistema: str = "") -> Optional[Dict[str
 
 
 def calcular_score_risco(item: Dict[str, Any]) -> Dict[str, Any]:
-    """Calcula score de risco fiscal 0-100 localmente, sem API."""
+    """Calcula score de risco fiscal 0-100 localmente, sem API.
+
+    Hierarquia de peso:
+      - divergências reais (erro fiscal da NF): peso alto.
+      - avisos cadastrais (saneamento de cadastro): peso reduzido.
+      - pendências de mapeamento (campos não coletados): ignoradas.
+    """
     score = 0
     fatores: List[str] = []
-    motivos = item.get("motivos", []) or []
+    divergencias = item.get("divergencias_reais", []) or []
+    avisos = item.get("avisos_cadastrais", []) or []
     impostos = item.get("impostos", {}) or {}
-    qtd = len(motivos)
+    qtd_div = len(divergencias)
+    qtd_avi = len(avisos)
 
     icms = impostos.get("icms", {}) or {}
     cadastro = impostos.get("cadastro_produto", {}) or {}
 
-    if any("ICMS" in m.upper() and "divergente" in m.lower() for m in motivos):
+    # ICMS - apenas se houver divergência real
+    if any("ICMS" in m.upper() for m in divergencias):
         score += 30; fatores.append("Divergência de ICMS")
-    elif icms.get("item_aliq_icms") is None and item.get("tipo_item") == "PRODUTO":
-        score += 15; fatores.append("Alíquota ICMS ausente")
+    elif icms.get("item_aliq_icms") is None and item.get("tipo_item") == "PRODUTO" and item.get("movimento") in ("ENTRADA", "SAIDA"):
+        score += 15; fatores.append("Alíquota ICMS ausente no item")
 
-    if any(("PIS" in m.upper() or "COFINS" in m.upper()) and "divergente" in m.lower() for m in motivos):
+    # PIS/COFINS - apenas divergência real
+    if any(("PIS" in m.upper() or "COFINS" in m.upper()) for m in divergencias):
         score += 25; fatores.append("Divergência PIS/COFINS")
-    elif any("CST PIS diferente" in m or "CST COFINS diferente" in m for m in motivos):
-        score += 20; fatores.append("CST PIS/COFINS divergente")
 
-    if any("sem NCM" in m or "[Cadastral] Produto sem NCM" in m for m in motivos):
+    # NCM ausente (real)
+    if any("sem NCM" in m for m in divergencias):
         score += 20; fatores.append("Produto sem NCM")
 
-    if not _clean_str(cadastro.get("cad_codtrd")) and item.get("tipo_item") == "PRODUTO":
-        score += 15; fatores.append("Produto sem CodTrd")
+    # Documento sem transação fiscal (real)
+    if any("sem transação" in m.lower() for m in divergencias):
+        score += 15; fatores.append("Documento sem transação fiscal")
 
-    if any("família" in m.lower() and "difere" in m.lower() for m in motivos):
-        score += 20; fatores.append("Conflito família Á— cadastro Á— item")
+    # Conflito família x item (após hierarquia) - real
+    if any("família" in m.lower() and "difere" in m.lower() for m in divergencias):
+        score += 20; fatores.append("Conflito família x item (não justificado pela transação)")
 
-    if any("sem transação" in m.lower() for m in motivos):
-        score += 10; fatores.append("Documento sem transação fiscal")
+    # Avisos cadastrais (saneamento) - impacto pequeno e limitado
+    if qtd_avi > 0:
+        peso_avisos = min(10, qtd_avi)  # no máximo +10 pontos
+        score += peso_avisos
+        fatores.append(f"{qtd_avi} aviso(s) de saneamento cadastral")
 
-    if any("CEST" in m.upper() for m in motivos):
-        score += 5; fatores.append("CEST ausente")
+    # CodTrd ausente é cadastral (saneamento) - só pesa se tiver divergência junto
+    if not _clean_str(cadastro.get("cad_codtrd")) and item.get("tipo_item") == "PRODUTO" and qtd_div > 0:
+        score += 5; fatores.append("Cadastro sem CodTrd")
 
-    if any("INSS" in m.upper() for m in motivos):
-        score += 8; fatores.append("INSS não mapeado")
-
-    if qtd > 5:
-        score += 10; fatores.append(f"{qtd} motivos acumulados")
-    elif qtd > 2:
+    # Acúmulo de divergências reais
+    if qtd_div > 5:
+        score += 10; fatores.append(f"{qtd_div} divergências reais acumuladas")
+    elif qtd_div > 2:
         score += 5
 
     score = min(100, score)
     nivel = "CRITICO" if score >= 75 else "ALTO" if score >= 50 else "MEDIO" if score >= 25 else "BAIXO"
-    return {"score_risco": score, "nivel_risco": nivel, "fatores_risco": fatores}
+    return {
+        "score_risco": score,
+        "nivel_risco": nivel,
+        "fatores_risco": fatores,
+        "qtd_divergencias_reais": qtd_div,
+        "qtd_avisos_cadastrais": qtd_avi,
+    }
 
 
 def pick_prefixed_fields(data: Dict[str, Any], prefix: str, extra_keys=None) -> Dict[str, Any]:
@@ -3514,6 +3533,288 @@ def auditoria_tributaria(
         raise HTTPException(status_code=500, detail=f"Erro na auditoria tributária: {str(e)}")
 
 
+# =========================================================
+# EXPORTACAO XLSX DA AUDITORIA TRIBUTARIA
+# =========================================================
+def _status_auditoria_export(item: Dict[str, Any]) -> str:
+    """Status visual usado na exportacao - segue mesma regra acordada com o front."""
+    div = item.get("divergencias_reais") or []
+    avi = item.get("avisos_cadastrais") or []
+    pen = item.get("pendencias_mapeamento") or []
+    status_api = (item.get("status_auditoria") or "").upper()
+    if status_api == "DIVERGENTE" or len(div) > 0:
+        return "DIVERGENTE"
+    if len(avi) > 0:
+        return "OK_COM_AVISO"
+    if len(pen) > 0:
+        return "PENDENTE_MAPEAMENTO"
+    return "OK"
+
+
+def _coletar_itens_auditoria_para_export(filtros: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Itera o endpoint interno paginando ate trazer todos os itens compativeis com os filtros."""
+    itens_total: List[Dict[str, Any]] = []
+    pagina = 1
+    tamanho_pagina = 200
+    while True:
+        resultado = _auditoria_tributaria_inner(
+            filtros["tipo_item"], filtros["movimento"], filtros["numero_documento"],
+            filtros["serie"], filtros["parceiro"], filtros["codigo_item"],
+            filtros["codigo_produto"], filtros["descricao"], filtros["familia"],
+            filtros["origem"], filtros["transacao"], filtros["data_emissao_ini"],
+            filtros["data_emissao_fim"], filtros["categoria_material"],
+            filtros["base_auditoria"], filtros["apenas_divergencia"],
+            pagina, tamanho_pagina
+        )
+        itens_pagina = resultado.get("itens") or []
+        itens_total.extend(itens_pagina)
+        total_paginas = int(resultado.get("total_paginas") or 1)
+        if pagina >= total_paginas or not itens_pagina:
+            break
+        pagina += 1
+        # Salvaguarda - evita loop em payload corrompido
+        if pagina > 500:
+            break
+    return itens_total
+
+
+def _linha_export_auditoria(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Monta a linha de Excel com as colunas combinadas com o front."""
+    div = item.get("divergencias_reais") or []
+    avi = item.get("avisos_cadastrais") or []
+    pen = item.get("pendencias_mapeamento") or []
+    pis = (item.get("impostos") or {}).get("pis_cofins") or {}
+    risco = item.get("risco") or {}
+    fonte_efetiva = item.get("fonte_efetiva") or {}
+    sep = " | "
+    return {
+        "Status Auditoria": _status_auditoria_export(item),
+        "Movimento": item.get("movimento") or "",
+        "Tipo Documento": item.get("documento_tipo") or "",
+        "Nº Documento": item.get("numero_documento") or "",
+        "Série": item.get("serie") or "",
+        "Seq Item": item.get("seq_item") or "",
+        "Data Emissão": item.get("data_emissao") or "",
+        "Tipo Item": item.get("tipo_item") or "",
+        "Código Item": item.get("codigo_item") or "",
+        "Derivação": item.get("derivacao") or "",
+        "Descrição Item": item.get("descricao_item") or "",
+        "Fornecedor": item.get("fornecedor_nome") or "",
+        "Cliente": item.get("cliente_nome") or "",
+        "Transação": item.get("transacao") or "",
+        "CFOP": item.get("cfop") or "",
+        "Família": item.get("familia_codigo") or "",
+        "Origem": item.get("origem_codigo") or "",
+        "NCM": item.get("ncm") or "",
+        "CEST": item.get("cest") or "",
+        "Qtd Divergências Reais": len(div),
+        "Divergências Reais": sep.join(div),
+        "Qtd Avisos Cadastrais": len(avi),
+        "Avisos Cadastrais": sep.join(avi),
+        "Qtd Pendências Mapeamento": len(pen),
+        "Pendências Mapeamento": sep.join(pen),
+        "CST PIS Item NF": pis.get("item_cst_pis") or "",
+        "CST PIS Transação": pis.get("tns_cst_pis") or "",
+        "CST PIS Cadastro Produto": pis.get("cad_cstpis_produto") or "",
+        "CST PIS Família": pis.get("fam_cst_pis") or "",
+        "CST COFINS Item NF": pis.get("item_cst_cofins") or "",
+        "CST COFINS Transação": pis.get("tns_cst_cofins") or "",
+        "CST COFINS Cadastro Produto": pis.get("cad_cstcof_produto") or "",
+        "CST COFINS Família": pis.get("fam_cst_cofins") or "",
+        "Fonte Efetiva PIS": fonte_efetiva.get("pis") or "",
+        "Fonte Efetiva COFINS": fonte_efetiva.get("cofins") or "",
+        "Fonte Efetiva IPI": fonte_efetiva.get("ipi") or "",
+        "Fonte Efetiva ICMS": fonte_efetiva.get("icms") or "",
+        "Score Risco": risco.get("score_risco") if risco else "",
+        "Nível Risco": risco.get("nivel_risco") or "" if risco else "",
+        "Fatores Risco": sep.join(risco.get("fatores_risco") or []) if risco else "",
+    }
+
+
+@app.get("/api/auditoria-tributaria/export")
+def auditoria_tributaria_export(
+    tipo_item: str = Query("TODOS"),
+    movimento: str = Query("TODOS"),
+    numero_documento: Optional[int] = Query(None),
+    serie: Optional[str] = Query(None),
+    parceiro: Optional[int] = Query(None),
+    codigo_item: Optional[str] = Query(None),
+    codigo_produto: Optional[str] = Query(None),
+    descricao: Optional[str] = Query(None),
+    familia: Optional[str] = Query(None),
+    origem: Optional[str] = Query(None),
+    transacao: Optional[str] = Query(None),
+    data_emissao_ini: Optional[str] = Query(None),
+    data_emissao_fim: Optional[str] = Query(None),
+    categoria_material: Optional[str] = Query(None),
+    base_auditoria: str = Query("MOVIMENTOS"),
+    apenas_divergencia: bool = Query(False),
+    formato: str = Query("xlsx", description="xlsx | csv"),
+    usuario=Depends(validar_token)
+):
+    """Exporta o resultado da auditoria tributaria em XLSX (default) ou CSV.
+
+    Regras de classificacao seguem o backend:
+      - status DIVERGENTE so quando ha divergencias_reais
+      - avisos cadastrais nao derrubam a nota
+      - filtro apenas_divergencia opera sobre divergencias_reais
+    """
+    try:
+        from fastapi.responses import StreamingResponse
+        from io import BytesIO, StringIO
+        import csv as _csv
+        from datetime import datetime as _dt
+
+        filtros = {
+            "tipo_item": tipo_item, "movimento": movimento,
+            "numero_documento": numero_documento, "serie": serie, "parceiro": parceiro,
+            "codigo_item": codigo_item, "codigo_produto": codigo_produto,
+            "descricao": descricao, "familia": familia, "origem": origem,
+            "transacao": transacao, "data_emissao_ini": data_emissao_ini,
+            "data_emissao_fim": data_emissao_fim, "categoria_material": categoria_material,
+            "base_auditoria": base_auditoria, "apenas_divergencia": apenas_divergencia,
+        }
+
+        itens = _coletar_itens_auditoria_para_export(filtros)
+
+        # Garantia extra de filtro: mesmo que o backend ja filtre, aplicamos de novo aqui
+        if apenas_divergencia:
+            itens = [it for it in itens if len(it.get("divergencias_reais") or []) > 0]
+
+        linhas = [_linha_export_auditoria(it) for it in itens]
+        colunas: List[str] = list(linhas[0].keys()) if linhas else [
+            "Status Auditoria", "Movimento", "Nº Documento", "Série", "Código Item",
+            "Descrição Item", "Divergências Reais", "Avisos Cadastrais", "Pendências Mapeamento"
+        ]
+
+        timestamp = _dt.now().strftime("%Y%m%d_%H%M%S")
+        formato_final = (formato or "xlsx").lower().strip()
+
+        if formato_final == "csv":
+            buf_txt = StringIO()
+            writer = _csv.DictWriter(buf_txt, fieldnames=colunas, delimiter=";")
+            writer.writeheader()
+            for ln in linhas:
+                writer.writerow(ln)
+            data = buf_txt.getvalue().encode("utf-8-sig")
+            filename = f"auditoria_tributaria_{timestamp}.csv"
+            return StreamingResponse(
+                BytesIO(data),
+                media_type="text/csv; charset=utf-8",
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+            )
+
+        # XLSX (padrao) - exige openpyxl
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Font, PatternFill, Alignment
+            from openpyxl.utils import get_column_letter
+        except ImportError:
+            raise HTTPException(
+                status_code=500,
+                detail="openpyxl nao instalado no servidor. Instale com 'pip install openpyxl' ou solicite o export em formato=csv"
+            )
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Auditoria"
+
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill("solid", fgColor="1F2937")
+        center = Alignment(horizontal="left", vertical="center", wrap_text=False)
+
+        ws.append(colunas)
+        for col_idx, _ in enumerate(colunas, start=1):
+            cell = ws.cell(row=1, column=col_idx)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center
+
+        # Cores por status
+        fills_status = {
+            "DIVERGENTE":         PatternFill("solid", fgColor="FECACA"),
+            "OK_COM_AVISO":       PatternFill("solid", fgColor="FDE68A"),
+            "PENDENTE_MAPEAMENTO":PatternFill("solid", fgColor="DDD6FE"),
+            "OK":                 PatternFill("solid", fgColor="DCFCE7"),
+        }
+
+        for ln in linhas:
+            valores = [ln.get(col, "") for col in colunas]
+            ws.append(valores)
+            row_idx = ws.max_row
+            status = ln.get("Status Auditoria")
+            fill = fills_status.get(status)
+            if fill:
+                ws.cell(row=row_idx, column=1).fill = fill
+
+        # Larguras razoaveis
+        larguras = {
+            "Status Auditoria": 20, "Movimento": 12, "Tipo Documento": 14,
+            "Nº Documento": 14, "Série": 8, "Seq Item": 8, "Data Emissão": 14,
+            "Tipo Item": 12, "Código Item": 18, "Derivação": 12,
+            "Descrição Item": 50, "Fornecedor": 35, "Cliente": 35,
+            "Transação": 12, "CFOP": 10, "Família": 12, "Origem": 12,
+            "NCM": 14, "CEST": 12,
+            "Qtd Divergências Reais": 14, "Divergências Reais": 60,
+            "Qtd Avisos Cadastrais": 14, "Avisos Cadastrais": 60,
+            "Qtd Pendências Mapeamento": 14, "Pendências Mapeamento": 60,
+            "CST PIS Item NF": 12, "CST PIS Transação": 14,
+            "CST PIS Cadastro Produto": 16, "CST PIS Família": 12,
+            "CST COFINS Item NF": 14, "CST COFINS Transação": 16,
+            "CST COFINS Cadastro Produto": 18, "CST COFINS Família": 14,
+            "Fonte Efetiva PIS": 16, "Fonte Efetiva COFINS": 18,
+            "Fonte Efetiva IPI": 16, "Fonte Efetiva ICMS": 16,
+            "Score Risco": 10, "Nível Risco": 12, "Fatores Risco": 50,
+        }
+        for col_idx, col_name in enumerate(colunas, start=1):
+            ws.column_dimensions[get_column_letter(col_idx)].width = larguras.get(col_name, 16)
+
+        ws.freeze_panes = "A2"
+
+        # Aba de resumo - facilita conferencia
+        ws_resumo = wb.create_sheet("Resumo")
+        total = len(linhas)
+        total_div = sum(1 for ln in linhas if ln["Status Auditoria"] == "DIVERGENTE")
+        total_aviso = sum(1 for ln in linhas if ln["Status Auditoria"] == "OK_COM_AVISO")
+        total_pend = sum(1 for ln in linhas if ln["Status Auditoria"] == "PENDENTE_MAPEAMENTO")
+        total_ok = sum(1 for ln in linhas if ln["Status Auditoria"] == "OK")
+        resumo_rows = [
+            ("Geração", _dt.now().strftime("%d/%m/%Y %H:%M:%S")),
+            ("Filtro movimento", movimento or "TODOS"),
+            ("Filtro tipo_item", tipo_item or "TODOS"),
+            ("Período (ini)", data_emissao_ini or "-"),
+            ("Período (fim)", data_emissao_fim or "-"),
+            ("Apenas divergentes", "SIM" if apenas_divergencia else "NÃO"),
+            ("Base auditoria", base_auditoria or "MOVIMENTOS"),
+            ("", ""),
+            ("Total itens exportados", total),
+            ("Divergentes", total_div),
+            ("OK com aviso", total_aviso),
+            ("Pendentes de mapeamento", total_pend),
+            ("OK", total_ok),
+        ]
+        for r_idx, (chave, valor) in enumerate(resumo_rows, start=1):
+            ws_resumo.cell(row=r_idx, column=1, value=chave).font = Font(bold=True)
+            ws_resumo.cell(row=r_idx, column=2, value=valor)
+        ws_resumo.column_dimensions["A"].width = 28
+        ws_resumo.column_dimensions["B"].width = 32
+
+        buffer = BytesIO()
+        wb.save(buffer)
+        buffer.seek(0)
+        filename = f"auditoria_tributaria_{timestamp}.xlsx"
+        return StreamingResponse(
+            buffer,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao exportar auditoria tributária: {str(e)}")
+
+
 def _auditoria_tributaria_inner(
     tipo_item, movimento, numero_documento, serie, parceiro,
     codigo_item, codigo_produto, descricao, familia, origem,
@@ -4299,7 +4600,8 @@ def _auditoria_tributaria_inner(
 
     itens = []
     for r in registros:
-        motivos = []
+        divergencias_reais = []
+        avisos_cadastrais = []
         pendencias_mapeamento = []
         impostos = {}
 
@@ -4310,19 +4612,15 @@ def _auditoria_tributaria_inner(
             r, "ori_", {"origem_codigo", "origem_descricao"}
         )
         if is_str_diff(r.get("tns_cst_pis"), r.get("tns_cst_cofins")):
-            motivos.append("Transação com CST PIS diferente de CST COFINS")
+            divergencias_reais.append("Transação com CST PIS diferente de CST COFINS")
         if is_str_diff(r.get("cad_recpis"), r.get("cad_reccof")):
-            motivos.append("Cadastro com Recupera PIS diferente de Recupera COFINS")
+            avisos_cadastrais.append("Cadastro com Recupera PIS diferente de Recupera COFINS")
         if is_str_diff(r.get("item_cst_pis"), r.get("item_cst_cofins")):
-            motivos.append("Item com CST PIS diferente de CST COFINS")
+            divergencias_reais.append("Item com CST PIS diferente de CST COFINS")
         if is_num_diff(r.get("item_base_pis"), r.get("item_base_cofins")):
-            motivos.append("Item com base de PIS diferente da base de COFINS")
+            divergencias_reais.append("Item com base de PIS diferente da base de COFINS")
         if is_num_diff(r.get("tns_bascre"), r.get("item_bascre")):
-            motivos.append("Base de crédito do item diferente da base de crédito da transação")
-        if r.get("fam_cst_pis") is not None and r.get("item_cst_pis") is not None and is_str_diff(r.get("fam_cst_pis"), r.get("item_cst_pis")):
-            motivos.append("Família com CST PIS diferente do item")
-        if r.get("fam_cst_cofins") is not None and r.get("item_cst_cofins") is not None and is_str_diff(r.get("fam_cst_cofins"), r.get("item_cst_cofins")):
-            motivos.append("Família com CST COFINS diferente do item")
+            divergencias_reais.append("Base de crédito do item diferente da base de crédito da transação")
 
         impostos["pis_cofins"] = {
             "item_cst_pis": r.get("item_cst_pis"), "item_cst_cofins": r.get("item_cst_cofins"),
@@ -4331,43 +4629,50 @@ def _auditoria_tributaria_inner(
             "tns_cst_pis": r.get("tns_cst_pis"), "tns_cst_cofins": r.get("tns_cst_cofins"),
             "tns_bascre": r.get("tns_bascre"), "item_bascre": r.get("item_bascre"),
             "cad_recpis": r.get("cad_recpis"), "cad_reccof": r.get("cad_reccof"),
+            "cad_cstpis_produto": r.get("cad_cstpis_produto"),
+            "cad_cstcof_produto": r.get("cad_cstcof_produto"),
             "fam_cst_pis": r.get("fam_cst_pis"), "fam_cst_cofins": r.get("fam_cst_cofins"),
         }
 
         ipi_motivos = []
-        if r.get("tipo_item") == "SERVICO":
-            if is_str_diff(r.get("fam_cst_ipi"), r.get("item_cst_ipi")) and r.get("fam_cst_ipi"):
-                ipi_motivos.append("Família com CST IPI diferente do item")
-        else:
-            if r.get("cad_peripi") is None and r.get("fam_cst_ipi"):
-                ipi_motivos.append("Família possui CST IPI, mas cadastro do item não trouxe driver IPI")
+        ipi_divergencias = []
+        ipi_avisos = []
+        if r.get("cad_peripi") is None and r.get("fam_cst_ipi") and r.get("tipo_item") != "SERVICO":
+            ipi_avisos.append("Família possui CST IPI, mas cadastro do item não trouxe driver IPI")
         if r.get("cad_recipi") is None:
-            ipi_motivos.append("Cadastro sem flag de recuperação de IPI")
+            ipi_avisos.append("Cadastro sem flag de recuperação de IPI")
         if r.get("fam_proimp") is None and r.get("tipo_item") == "PRODUTO":
-            ipi_motivos.append("Família sem tipo de produto para impostos (ProImp)")
+            ipi_avisos.append("Família sem tipo de produto para impostos (ProImp)")
+        ipi_motivos = ipi_divergencias + ipi_avisos
         impostos["ipi"] = {
             "item_cst_ipi": r.get("item_cst_ipi"), "item_aliq_ipi": r.get("item_aliq_ipi"),
             "item_base_ipi": r.get("item_base_ipi"), "item_valor_ipi": r.get("item_valor_ipi"),
             "cad_peripi": r.get("cad_peripi"), "cad_recipi": r.get("cad_recipi"),
             "fam_cst_ipi": r.get("fam_cst_ipi"), "fam_proimp": r.get("fam_proimp"),
             "motivos": ipi_motivos,
+            "divergencias_reais": ipi_divergencias,
+            "avisos_cadastrais": ipi_avisos,
         }
-        motivos.extend(ipi_motivos)
+        divergencias_reais.extend(ipi_divergencias)
+        avisos_cadastrais.extend(ipi_avisos)
 
         icms_motivos = []
+        icms_divergencias = []
+        icms_avisos = []
         if r.get("cad_temicm") is None:
-            icms_motivos.append("Cadastro sem indicador de incidência de ICMS")
+            icms_avisos.append("Cadastro sem indicador de incidência de ICMS")
         if r.get("tipo_item") == "PRODUTO" and r.get("cad_codtrd") is None:
-            icms_motivos.append("Cadastro sem código de tributação/diferencial (CodTrd)")
+            icms_avisos.append("Cadastro sem código de tributação/diferencial (CodTrd)")
         if r.get("tipo_item") == "PRODUTO" and r.get("cad_recicm") is None:
-            icms_motivos.append("Cadastro sem flag de recuperação de ICMS")
+            icms_avisos.append("Cadastro sem flag de recuperação de ICMS")
         if r.get("movimento") in ("ENTRADA", "SAIDA") and r.get("tipo_item") == "PRODUTO":
             if r.get("item_base_icms") is None:
-                icms_motivos.append("Item sem base de ICMS mapeada")
+                icms_divergencias.append("Item sem base de ICMS mapeada")
             if r.get("item_aliq_icms") is None:
-                icms_motivos.append("Item sem alíquota de ICMS mapeada")
+                icms_divergencias.append("Item sem alíquota de ICMS mapeada")
             if not _clean_str(r.get("item_cst_icms")):
-                icms_motivos.append("Item sem CST/estratégia ICMS mapeada")
+                icms_divergencias.append("Item sem CST/estratégia ICMS mapeada")
+        icms_motivos = icms_divergencias + icms_avisos
         impostos["icms"] = {
             "item_aliq_icms": r.get("item_aliq_icms"),
             "item_base_icms": r.get("item_base_icms"),
@@ -4377,8 +4682,11 @@ def _auditoria_tributaria_inner(
             "cad_codtrd": r.get("cad_codtrd"),
             "cad_recicm": r.get("cad_recicm"),
             "motivos": icms_motivos,
+            "divergencias_reais": icms_divergencias,
+            "avisos_cadastrais": icms_avisos,
         }
-        motivos.extend(icms_motivos)
+        divergencias_reais.extend(icms_divergencias)
+        avisos_cadastrais.extend(icms_avisos)
 
         st_motivos = []
         if r.get("tipo_item") == "PRODUTO":
@@ -4390,8 +4698,9 @@ def _auditoria_tributaria_inner(
             "item_valor_icms_st": r.get("item_valor_icms_st"),
             "cad_codtst": r.get("cad_codtst"), "cad_codstp": r.get("cad_codstp"),
             "motivos": st_motivos,
+            "avisos_cadastrais": list(st_motivos),
         }
-        motivos.extend(st_motivos)
+        avisos_cadastrais.extend(st_motivos)
 
         origem_motivos = []
         if r.get("tipo_item") == "PRODUTO":
@@ -4400,8 +4709,9 @@ def _auditoria_tributaria_inner(
         impostos["origem"] = {
             **origem_parametrizacao,
             "motivos": origem_motivos,
+            "avisos_cadastrais": list(origem_motivos),
         }
-        motivos.extend(origem_motivos)
+        avisos_cadastrais.extend(origem_motivos)
 
         inss_motivos = []
         if r.get("tipo_item") == "SERVICO":
@@ -4411,28 +4721,32 @@ def _auditoria_tributaria_inner(
         impostos["inss"] = {
             "item_base_inss": r.get("item_base_inss"), "item_valor_inss": r.get("item_valor_inss"),
             "tns_inss_ref": r.get("tns_inss_ref"), "motivos": inss_motivos,
+            "avisos_cadastrais": list(inss_motivos),
         }
-        motivos.extend(inss_motivos)
+        avisos_cadastrais.extend(inss_motivos)
 
         cliente_motivos = []
+        cliente_divergencias = []
+        cliente_avisos = []
         if r.get("movimento") == "SAIDA":
             if not r.get("cliente_codigo"):
-                cliente_motivos.append("NF de saída sem cliente associado")
+                cliente_divergencias.append("NF de saída sem cliente associado")
             if not _clean_str(r.get("cliente_uf")):
-                cliente_motivos.append("Cliente sem UF cadastrada para regras fiscais de saída")
+                cliente_divergencias.append("Cliente sem UF cadastrada para regras fiscais de saída")
             if _clean_str(r.get("cliente_situacao")) not in ("", "A"):
-                cliente_motivos.append("Cliente inativo")
+                cliente_divergencias.append("Cliente inativo")
             if not _clean_str(r.get("cliente_endereco")):
-                cliente_motivos.append("Cliente sem endereço cadastrado")
+                cliente_avisos.append("Cliente sem endereço cadastrado")
             if not _clean_str(r.get("cliente_cidade")):
-                cliente_motivos.append("Cliente sem cidade cadastrada")
+                cliente_avisos.append("Cliente sem cidade cadastrada")
             origem_saida = _clean_str(r.get("origem_codigo")).upper()
             cod_clf = _clean_str(r.get("cod_classificacao")).upper()
             if origem_saida in {"250", "280", "PPG"} and cod_clf == "101":
                 if r.get("cad_codtrd") in (None, ""):
-                    cliente_motivos.append("Produto sem CodTrd para regra fiscal de saída baseada no cliente")
+                    cliente_avisos.append("Produto sem CodTrd para regra fiscal de saída baseada no cliente")
                 if r.get("cliente_redsai_pis") is None and r.get("cliente_redsai_cofins") is None:
-                    cliente_motivos.append("Cliente/UF sem regra RedSai encontrada em E019RED")
+                    cliente_avisos.append("Cliente/UF sem regra RedSai encontrada em E019RED")
+        cliente_motivos = cliente_divergencias + cliente_avisos
         impostos["cliente"] = {
             "cliente_codigo": r.get("cliente_codigo"),
             "cliente_nome": r.get("cliente_nome"),
@@ -4446,26 +4760,32 @@ def _auditoria_tributaria_inner(
             "cliente_redsai_pis": r.get("cliente_redsai_pis"),
             "cliente_redsai_cofins": r.get("cliente_redsai_cofins"),
             "motivos": cliente_motivos,
+            "divergencias_reais": cliente_divergencias,
+            "avisos_cadastrais": cliente_avisos,
         }
-        motivos.extend(cliente_motivos)
+        divergencias_reais.extend(cliente_divergencias)
+        avisos_cadastrais.extend(cliente_avisos)
 
         fornecedor_motivos = []
+        fornecedor_divergencias = []
+        fornecedor_avisos = []
         if r.get("movimento") == "ENTRADA":
             if not r.get("fornecedor_codigo"):
-                fornecedor_motivos.append("NF de entrada sem fornecedor associado")
+                fornecedor_divergencias.append("NF de entrada sem fornecedor associado")
             if not _clean_str(r.get("fornecedor_uf")):
-                fornecedor_motivos.append("Fornecedor sem UF cadastrada")
+                fornecedor_divergencias.append("Fornecedor sem UF cadastrada")
             if _clean_str(r.get("fornecedor_situacao")) not in ("", "A"):
-                fornecedor_motivos.append("Fornecedor inativo")
+                fornecedor_divergencias.append("Fornecedor inativo")
             if r.get("tipo_item") == "SERVICO":
                 if not _clean_str(r.get("fornecedor_codtri")):
-                    fornecedor_motivos.append("Fornecedor sem código de tributação (CodTri) para análise fiscal do serviço")
+                    fornecedor_avisos.append("Fornecedor sem código de tributação (CodTri) para análise fiscal do serviço")
                 tns_srv = _clean_str(r.get("transacao")).upper()
                 tipfor = _clean_str(r.get("fornecedor_tipfor")).upper()
                 if tns_srv in {"1933F", "2933F"} and tipfor == "J":
-                    fornecedor_motivos.append("Transação de serviço PF usada para fornecedor PJ")
+                    fornecedor_divergencias.append("Transação de serviço PF usada para fornecedor PJ")
                 if tns_srv in {"1933", "2933", "1933A", "2933A"} and tipfor == "F":
-                    fornecedor_motivos.append("Transação de serviço PJ usada para fornecedor PF")
+                    fornecedor_divergencias.append("Transação de serviço PJ usada para fornecedor PF")
+        fornecedor_motivos = fornecedor_divergencias + fornecedor_avisos
         impostos["fornecedor"] = {
             "fornecedor_codigo": r.get("fornecedor_codigo"),
             "fornecedor_nome": r.get("fornecedor_nome"),
@@ -4474,11 +4794,86 @@ def _auditoria_tributaria_inner(
             "fornecedor_tipfor": r.get("fornecedor_tipfor"),
             "fornecedor_situacao": r.get("fornecedor_situacao"),
             "motivos": fornecedor_motivos,
+            "divergencias_reais": fornecedor_divergencias,
+            "avisos_cadastrais": fornecedor_avisos,
         }
-        motivos.extend(fornecedor_motivos)
+        divergencias_reais.extend(fornecedor_divergencias)
+        avisos_cadastrais.extend(fornecedor_avisos)
 
         cadastro_produto_motivos = []
         if r.get("tipo_item") == "PRODUTO":
+            # Valores efetivos por camada (string normalizada)
+            item_cst_pis = _clean_str(r.get("item_cst_pis"))
+            tns_cst_pis = _clean_str(r.get("tns_cst_pis"))
+            fam_cst_pis_v = _clean_str(r.get("fam_cst_pis"))
+            cad_cst_pis = _clean_str(r.get("cad_cstpis_produto"))
+
+            item_cst_cofins = _clean_str(r.get("item_cst_cofins"))
+            tns_cst_cofins = _clean_str(r.get("tns_cst_cofins"))
+            fam_cst_cofins_v = _clean_str(r.get("fam_cst_cofins"))
+            cad_cst_cofins = _clean_str(r.get("cad_cstcof_produto"))
+
+            item_cst_ipi = _clean_str(r.get("item_cst_ipi"))
+            fam_cst_ipi_v = _clean_str(r.get("fam_cst_ipi"))
+            cad_cst_ipi = _clean_str(r.get("cad_cstipi_produto"))
+
+            # ----- CST PIS (hierarquia Item NF > Transação > Família > Cadastro) -----
+            if not cad_cst_pis:
+                if item_cst_pis or tns_cst_pis:
+                    # Parametrização efetiva veio do item/transação. Não apontar nada.
+                    pass
+                elif fam_cst_pis_v:
+                    cadastro_produto_motivos.append(
+                        f"Produto sem CST PIS no cadastro, porém família possui CST PIS {fam_cst_pis_v}"
+                    )
+                else:
+                    divergencias_reais.append(
+                        "Produto sem CST PIS no cadastro e sem CST PIS efetivo no item/transação/família"
+                    )
+
+            # ----- CST COFINS -----
+            if not cad_cst_cofins:
+                if item_cst_cofins or tns_cst_cofins:
+                    pass
+                elif fam_cst_cofins_v:
+                    cadastro_produto_motivos.append(
+                        f"Produto sem CST COFINS no cadastro, porém família possui CST COFINS {fam_cst_cofins_v}"
+                    )
+                else:
+                    divergencias_reais.append(
+                        "Produto sem CST COFINS no cadastro e sem CST COFINS efetivo no item/transação/família"
+                    )
+
+            # ----- CST IPI (mesma lógica, sem camada de transação na maioria dos casos) -----
+            if not cad_cst_ipi:
+                if item_cst_ipi:
+                    pass
+                elif fam_cst_ipi_v:
+                    cadastro_produto_motivos.append(
+                        f"Produto sem CST IPI no cadastro, porém família possui CST IPI {fam_cst_ipi_v}"
+                    )
+                # Sem CST IPI em camada nenhuma para produto: tratamos como aviso (depende do CFOP/NCM)
+                else:
+                    cadastro_produto_motivos.append(
+                        "Produto sem CST IPI no cadastro (verificar se a operação exige IPI)"
+                    )
+
+            # ----- Tipos de tributação PIS/COFINS (TriPIS/TriCOF) -----
+            # Só vira aviso se também não houver CST efetiva pela camada de operação.
+            if not _clean_str(r.get("cad_tripis")) and not (item_cst_pis or tns_cst_pis):
+                cadastro_produto_motivos.append("Cadastro do produto sem tipo de tributação de PIS")
+            if not _clean_str(r.get("cad_tricof")) and not (item_cst_cofins or tns_cst_cofins):
+                cadastro_produto_motivos.append("Cadastro do produto sem tipo de tributação de COFINS")
+
+            # ----- Natureza de receita PIS/COFINS -----
+            # Só faz sentido em saídas. Em entradas, não apontar.
+            if r.get("movimento") == "SAIDA":
+                if not _clean_str(r.get("cad_natpis")):
+                    cadastro_produto_motivos.append("Cadastro do produto sem natureza de receita PIS")
+                if not _clean_str(r.get("cad_natcof")):
+                    cadastro_produto_motivos.append("Cadastro do produto sem natureza de receita COFINS")
+
+            # ----- Demais campos cadastrais: continuam como avisos cadastrais (saneamento) -----
             if not _clean_str(r.get("cad_codstr")):
                 cadastro_produto_motivos.append("Cadastro do produto sem Código de Situação/estratégia ICMS (CodStr)")
             if not _clean_str(r.get("cad_codtic")):
@@ -4489,27 +4884,13 @@ def _auditoria_tributaria_inner(
                 cadastro_produto_motivos.append("Cadastro do produto sem base de recuperação (BasRec)")
             if r.get("cad_bascre_produto") is None:
                 cadastro_produto_motivos.append("Cadastro do produto sem base de crédito (BasCre)")
-            if not _clean_str(r.get("cad_tripis")):
-                cadastro_produto_motivos.append("Cadastro do produto sem tipo de tributação de PIS")
-            if not _clean_str(r.get("cad_tricof")):
-                cadastro_produto_motivos.append("Cadastro do produto sem tipo de tributação de COFINS")
-            if not _clean_str(r.get("cad_cstipi_produto")):
-                cadastro_produto_motivos.append("Cadastro do produto sem CST IPI")
-            if not _clean_str(r.get("cad_cstpis_produto")):
-                cadastro_produto_motivos.append("Cadastro do produto sem CST PIS")
-            if not _clean_str(r.get("cad_cstcof_produto")):
-                cadastro_produto_motivos.append("Cadastro do produto sem CST COFINS")
-            if not _clean_str(r.get("cad_natpis")):
-                cadastro_produto_motivos.append("Cadastro do produto sem natureza de receita PIS")
-            if not _clean_str(r.get("cad_natcof")):
-                cadastro_produto_motivos.append("Cadastro do produto sem natureza de receita COFINS")
             if not _clean_str(r.get("cad_regtri")):
                 cadastro_produto_motivos.append("Cadastro do produto sem regime tributário")
             if not _clean_str(r.get("cad_codenq")):
                 cadastro_produto_motivos.append("Cadastro do produto sem código de enquadramento")
             if not _clean_str(r.get("cad_codces")):
                 cadastro_produto_motivos.append("Cadastro do produto sem CEST/código correspondente")
-        motivos.extend(cadastro_produto_motivos)
+        avisos_cadastrais.extend(cadastro_produto_motivos)
 
         iss_motivos = []
         if r.get("tipo_item") == "SERVICO":
@@ -4546,26 +4927,26 @@ def _auditoria_tributaria_inner(
         }
         pendencias_mapeamento.extend(difal_motivos)
 
-        # Verificacoes especificas para auditoria cadastral (sem movimento)
+        # Verificacoes especificas para auditoria cadastral (sem movimento) - todas viram avisos cadastrais
         if r.get("origem_auditoria") == "CADASTRO":
             if not _clean_str(r.get("ncm")):
-                motivos.append("[Cadastral] Produto sem NCM")
+                avisos_cadastrais.append("[Cadastral] Produto sem NCM")
             if not _clean_str(r.get("familia_codigo")):
-                motivos.append("[Cadastral] Produto sem família fiscal")
+                avisos_cadastrais.append("[Cadastral] Produto sem família fiscal")
             if not _clean_str(r.get("origem_codigo")):
-                motivos.append("[Cadastral] Produto sem origem")
+                avisos_cadastrais.append("[Cadastral] Produto sem origem")
             if not _clean_str(r.get("cad_codtrd")):
-                motivos.append("[Cadastral] Produto sem CodTrd (tratamento diferencial ICMS)")
+                avisos_cadastrais.append("[Cadastral] Produto sem CodTrd (tratamento diferencial ICMS)")
             if r.get("cad_temicm") is None:
-                motivos.append("[Cadastral] Produto sem indicador de incidência de ICMS")
+                avisos_cadastrais.append("[Cadastral] Produto sem indicador de incidência de ICMS")
             if r.get("cad_recpis") is None:
-                motivos.append("[Cadastral] Produto sem flag de recuperação de PIS")
+                avisos_cadastrais.append("[Cadastral] Produto sem flag de recuperação de PIS")
             if r.get("cad_reccof") is None:
-                motivos.append("[Cadastral] Produto sem flag de recuperação de COFINS")
+                avisos_cadastrais.append("[Cadastral] Produto sem flag de recuperação de COFINS")
             if not _clean_str(r.get("fam_cst_pis")):
-                motivos.append("[Cadastral] Família sem CST PIS")
+                avisos_cadastrais.append("[Cadastral] Família sem CST PIS")
             if not _clean_str(r.get("fam_cst_cofins")):
-                motivos.append("[Cadastral] Família sem CST COFINS")
+                avisos_cadastrais.append("[Cadastral] Família sem CST COFINS")
 
         # Divergencias familia x cadastro do produto
         familia_vs_cadastro_motivos = []
@@ -4590,50 +4971,73 @@ def _auditoria_tributaria_inner(
                 familia_vs_cadastro_motivos.append("Família com Recupera ICMS diferente do cadastro do produto")
             if is_str_diff(r.get("fam_recpis"), r.get("cad_recpis")):
                 familia_vs_cadastro_motivos.append("Família com Recupera PIS diferente do cadastro do produto")
-        motivos.extend(familia_vs_cadastro_motivos)
+        avisos_cadastrais.extend(familia_vs_cadastro_motivos)
 
-        # Divergencias familia x item gravado na NF
-        familia_vs_item_motivos = []
+        # Divergencias familia x item gravado na NF (com hierarquia Item NF > Transacao > Familia > Cadastro)
+        familia_vs_item_divergencias = []
+        familia_vs_item_avisos = []
         if r.get("tipo_item") == "PRODUTO" and r.get("movimento") in ("ENTRADA", "SAIDA"):
-            if r.get("fam_cst_pis") is not None and r.get("item_cst_pis") is not None and is_str_diff(r.get("fam_cst_pis"), r.get("item_cst_pis")):
-                familia_vs_item_motivos.append(f"CST PIS da família ({r.get('fam_cst_pis')}) difere do item NF ({r.get('item_cst_pis')})")
-            if r.get("fam_cst_cofins") is not None and r.get("item_cst_cofins") is not None and is_str_diff(r.get("fam_cst_cofins"), r.get("item_cst_cofins")):
-                familia_vs_item_motivos.append(f"CST COFINS da família ({r.get('fam_cst_cofins')}) difere do item NF ({r.get('item_cst_cofins')})")
-            if r.get("fam_cst_ipi") is not None and r.get("item_cst_ipi") is not None and is_str_diff(r.get("fam_cst_ipi"), r.get("item_cst_ipi")):
-                familia_vs_item_motivos.append(f"CST IPI da família ({r.get('fam_cst_ipi')}) difere do item NF ({r.get('item_cst_ipi')})")
+            fam_pis, item_pis, tns_pis = r.get("fam_cst_pis"), r.get("item_cst_pis"), r.get("tns_cst_pis")
+            if fam_pis is not None and item_pis is not None and is_str_diff(fam_pis, item_pis):
+                if tns_pis is not None and not is_str_diff(tns_pis, item_pis):
+                    familia_vs_item_avisos.append(
+                        f"CST PIS da família ({fam_pis}) difere do item ({item_pis}), mas o item está coerente com a transação ({tns_pis})"
+                    )
+                else:
+                    familia_vs_item_divergencias.append(f"CST PIS da família ({fam_pis}) difere do item NF ({item_pis})")
+
+            fam_cof, item_cof, tns_cof = r.get("fam_cst_cofins"), r.get("item_cst_cofins"), r.get("tns_cst_cofins")
+            if fam_cof is not None and item_cof is not None and is_str_diff(fam_cof, item_cof):
+                if tns_cof is not None and not is_str_diff(tns_cof, item_cof):
+                    familia_vs_item_avisos.append(
+                        f"CST COFINS da família ({fam_cof}) difere do item ({item_cof}), mas o item está coerente com a transação ({tns_cof})"
+                    )
+                else:
+                    familia_vs_item_divergencias.append(f"CST COFINS da família ({fam_cof}) difere do item NF ({item_cof})")
+
+            fam_ipi, item_ipi = r.get("fam_cst_ipi"), r.get("item_cst_ipi")
+            if fam_ipi is not None and item_ipi is not None and is_str_diff(fam_ipi, item_ipi):
+                familia_vs_item_avisos.append(f"CST IPI da família ({fam_ipi}) difere do item NF ({item_ipi})")
+
             fam_peripi = r.get("fam_peripi")
             if fam_peripi is not None and r.get("item_aliq_ipi") is not None and is_num_diff(fam_peripi, r.get("item_aliq_ipi")):
-                familia_vs_item_motivos.append(f"Alíquota IPI da família ({fam_peripi}%) difere da aplicada no item ({r.get('item_aliq_ipi')}%)")
+                familia_vs_item_avisos.append(f"Alíquota IPI da família ({fam_peripi}%) difere da aplicada no item ({r.get('item_aliq_ipi')}%)")
             fam_pericm = r.get("fam_pericm")
             if fam_pericm is not None and r.get("item_aliq_icms") is not None and is_num_diff(fam_pericm, r.get("item_aliq_icms")):
-                familia_vs_item_motivos.append(f"Alíquota ICMS da família ({fam_pericm}%) difere da aplicada no item ({r.get('item_aliq_icms')}%)")
+                familia_vs_item_avisos.append(f"Alíquota ICMS da família ({fam_pericm}%) difere da aplicada no item ({r.get('item_aliq_icms')}%)")
             if r.get("fam_codstr") is not None and r.get("item_cst_icms") is not None and is_str_diff(r.get("fam_codstr"), r.get("item_cst_icms")):
-                familia_vs_item_motivos.append(f"Estratégia ICMS da família ({r.get('fam_codstr')}) difere da aplicada no item ({r.get('item_cst_icms')})")
-        motivos.extend(familia_vs_item_motivos)
+                familia_vs_item_avisos.append(f"Estratégia ICMS da família ({r.get('fam_codstr')}) difere da aplicada no item ({r.get('item_cst_icms')})")
+        divergencias_reais.extend(familia_vs_item_divergencias)
+        avisos_cadastrais.extend(familia_vs_item_avisos)
+        familia_vs_item_motivos = familia_vs_item_divergencias + familia_vs_item_avisos
 
         operacao_motivos = []
+        operacao_divergencias = []
+        operacao_pendencias = []
 
         transacao_atual = _clean_str(r.get("transacao"))
         cfop_atual = _clean_str(r.get("cfop"))
         natureza_operacao_atual = _clean_str(r.get("natureza_operacao"))
 
         if r.get("movimento") not in (None, "SEM_MOVIMENTO") and not transacao_atual:
-            operacao_motivos.append("Documento sem transação fiscal")
+            operacao_divergencias.append("Documento sem transação fiscal")
 
         if transacao_atual and r.get("tns_cst_pis") is None and r.get("tns_cst_cofins") is None:
-            operacao_motivos.append("Transação sem CST PIS/COFINS mapeado")
+            operacao_divergencias.append("Transação sem CST PIS/COFINS mapeado")
 
         if transacao_atual and r.get("item_bascre") is not None and r.get("tns_bascre") is None:
-            operacao_motivos.append("Transação sem base de crédito mapeada")
+            operacao_pendencias.append("Transação sem base de crédito mapeada")
 
         if r.get("movimento") == "SAIDA" and not cfop_atual:
-            operacao_motivos.append("CFOP da transação não mapeado")
+            operacao_divergencias.append("CFOP da transação não mapeado")
 
         if r.get("movimento") == "SAIDA" and not natureza_operacao_atual:
-            operacao_motivos.append("Natureza da operação não mapeada")
+            operacao_pendencias.append("Natureza da operação não mapeada")
 
         if r.get("tipo_item") == "SERVICO" and transacao_atual and not _clean_str(r.get("tns_inss_ref")):
-            operacao_motivos.append("Transação de serviço sem referência de INSS")
+            operacao_pendencias.append("Transação de serviço sem referência de INSS")
+
+        operacao_motivos = operacao_divergencias + operacao_pendencias
 
         transacao_parametros = {
             "transacao": transacao_atual,
@@ -4650,21 +5054,30 @@ def _auditoria_tributaria_inner(
         impostos["operacao_fiscal"] = {
             **transacao_parametros,
             "motivos": operacao_motivos,
+            "divergencias_reais": operacao_divergencias,
+            "pendencias_mapeamento": operacao_pendencias,
         }
-        pendencias_mapeamento.extend(operacao_motivos)
+        divergencias_reais.extend(operacao_divergencias)
+        pendencias_mapeamento.extend(operacao_pendencias)
 
         class_motivos = []
+        class_divergencias = []
+        class_pendencias = []
         if r.get("tipo_item") == "PRODUTO":
             if not (r.get("ncm") or "").strip():
-                class_motivos.append("Produto sem NCM")
+                class_divergencias.append("Produto sem NCM")
             if r.get("cest") is None:
-                class_motivos.append("Mapear CEST na base para auditoria fiscal mais completa")
+                class_pendencias.append("Mapear CEST na base para auditoria fiscal mais completa")
+        class_motivos = class_divergencias + class_pendencias
         impostos["classificacao_fiscal"] = {
             "ncm": r.get("ncm"), "classificacao": r.get("cod_classificacao"),
             "cest": r.get("cest"), "familia_codigo": r.get("familia_codigo"),
             "origem_codigo": r.get("origem_codigo"), "motivos": class_motivos,
+            "divergencias_reais": class_divergencias,
+            "pendencias_mapeamento": class_pendencias,
         }
-        pendencias_mapeamento.extend(class_motivos)
+        divergencias_reais.extend(class_divergencias)
+        pendencias_mapeamento.extend(class_pendencias)
 
         if _clean_str(r.get("transacao")) and (
             r.get("tns_cst_pis") is not None
@@ -4681,8 +5094,40 @@ def _auditoria_tributaria_inner(
         else:
             fonte = "ITEM"
 
-        motivos_unicos = list(dict.fromkeys([m for m in motivos if m]))
-        status = "DIVERGENTE" if motivos_unicos else "OK"
+        def _fonte_imposto(item_v, tns_v, fam_v, cad_v):
+            # Hierarquia: ITEM_NF > TRANSACAO > FAMILIA > CADASTRO
+            if _clean_str(item_v):
+                return "ITEM_NF"
+            if _clean_str(tns_v):
+                return "TRANSACAO"
+            if _clean_str(fam_v):
+                return "FAMILIA"
+            if _clean_str(cad_v):
+                return "CADASTRO"
+            return None
+
+        fonte_efetiva = {
+            "pis": _fonte_imposto(r.get("item_cst_pis"), r.get("tns_cst_pis"), r.get("fam_cst_pis"), r.get("cad_cstpis_produto")),
+            "cofins": _fonte_imposto(r.get("item_cst_cofins"), r.get("tns_cst_cofins"), r.get("fam_cst_cofins"), r.get("cad_cstcof_produto")),
+            "ipi": _fonte_imposto(r.get("item_cst_ipi"), None, r.get("fam_cst_ipi"), r.get("cad_cstipi_produto")),
+            "icms": _fonte_imposto(r.get("item_cst_icms"), None, r.get("fam_codstr"), r.get("cad_codstr")),
+        }
+
+        divergencias_unicas = list(dict.fromkeys([m for m in divergencias_reais if m]))
+        avisos_unicos = list(dict.fromkeys([m for m in avisos_cadastrais if m]))
+        pendencias_unicas = list(dict.fromkeys([m for m in pendencias_mapeamento if m]))
+
+        # IMPORTANTE: "motivos" (campo legado) agora contém SOMENTE divergências reais.
+        # Avisos cadastrais ficam em "avisos_cadastrais"; pendências em "pendencias_mapeamento".
+        motivos_unicos = list(divergencias_unicas)
+        if divergencias_unicas:
+            status = "DIVERGENTE"
+        elif avisos_unicos:
+            status = "OK_COM_AVISO"
+        elif pendencias_unicas:
+            status = "PENDENTE_MAPEAMENTO"
+        else:
+            status = "OK"
 
         impostos["familia_parametrizacao"] = familia_parametrizacao
 
@@ -4778,9 +5223,14 @@ def _auditoria_tributaria_inner(
             "parceiro_nome": r.get("cliente_nome") or r.get("fornecedor_nome"),
             "status_auditoria": status,
             "fonte_prioritaria": fonte,
+            "fonte_efetiva": fonte_efetiva,
             "motivos": motivos_unicos,
             "qtd_motivos": len(motivos_unicos),
-            "pendencias_mapeamento": list(dict.fromkeys([m for m in pendencias_mapeamento if m])),
+            "divergencias_reais": divergencias_unicas,
+            "qtd_divergencias_reais": len(divergencias_unicas),
+            "avisos_cadastrais": avisos_unicos,
+            "qtd_avisos_cadastrais": len(avisos_unicos),
+            "pendencias_mapeamento": pendencias_unicas,
             "impostos": impostos,
             "comparativo_camadas": comparativo_camadas,
             "trilha_decisao": [
@@ -4815,6 +5265,8 @@ def _auditoria_tributaria_inner(
         "entradas": len([x for x in itens if x.get("movimento") == "ENTRADA"]),
         "saidas": len([x for x in itens if x.get("movimento") == "SAIDA"]),
         "divergentes": len([x for x in itens if x["status_auditoria"] == "DIVERGENTE"]),
+        "ok_com_aviso": len([x for x in itens if x["status_auditoria"] == "OK_COM_AVISO"]),
+        "pendente_mapeamento": len([x for x in itens if x["status_auditoria"] == "PENDENTE_MAPEAMENTO"]),
         "ok": len([x for x in itens if x["status_auditoria"] == "OK"]),
         "fontes_transacao": len([x for x in itens if x["fonte_prioritaria"] == "TRANSACAO"]),
         "fontes_cadastro": len([x for x in itens if x["fonte_prioritaria"] == "CADASTRO"]),
@@ -5109,7 +5561,10 @@ def montar_resumo_erp(item_erp: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "item_valor_icms": icms.get("item_valor_icms"),
         "status_auditoria": item_erp.get("status_auditoria"),
         "fonte_prioritaria": item_erp.get("fonte_prioritaria"),
+        "fonte_efetiva": item_erp.get("fonte_efetiva", {}),
         "motivos": item_erp.get("motivos", []),
+        "divergencias_reais": item_erp.get("divergencias_reais", []),
+        "avisos_cadastrais": item_erp.get("avisos_cadastrais", []),
         "pendencias_mapeamento": item_erp.get("pendencias_mapeamento", []),
     }
 
@@ -5867,7 +6322,13 @@ function renderResumo(r){
     document.getElementById("m_cad").innerText=r.fontes_cadastro||0;
 }
 
-function badgeStatus(s){return s==="OK"?`<span class="status ok">OK</span>`:`<span class="status bad">DIVERGENTE</span>`;}
+function badgeStatus(s){
+    if(s==="OK") return `<span class="status ok">OK</span>`;
+    if(s==="OK_COM_AVISO") return `<span class="status" style="background:#78350f;border:1px solid #f59e0b;color:#fde68a">OK COM AVISO</span>`;
+    if(s==="PENDENTE_MAPEAMENTO") return `<span class="status" style="background:#4c1d95;border:1px solid #7c3aed;color:#d8b4fe">PENDENTE MAPEAMENTO</span>`;
+    if(s==="DIVERGENTE") return `<span class="status bad">DIVERGENTE</span>`;
+    return `<span class="status">${s||"-"}</span>`;
+}
 function badgeMovimento(m){return m==="ENTRADA"?`<span class="status ent">ENTRADA</span>`:`<span class="status sai">SAÁDA</span>`;}
 
 function renderTabela(lista){
@@ -5933,9 +6394,14 @@ function abrirDetalhe(index){
         <div style="margin-top:10px;font-weight:700">${item.descricao_item||""}</div>
         <div class="muted small" style="margin-top:6px">${parceiroLinha} | Família: ${item.familia_codigo||"-"} ${item.familia_descricao||""} | Origem: ${item.origem_codigo||"-"} ${item.origem_descricao||""} | NCM: ${item.ncm||"-"} | Transação: ${item.transacao||"-"}</div>`;
 
-    const chipsM=(item.motivos||[]).map(m=>`<span class="chip">${m}</span>`);
-    const chipsP=(item.pendencias_mapeamento||[]).map(m=>`<span class="chip" style="border-color:#7c3aed;color:#d8b4fe">${m}</span>`);
-    document.getElementById("detalheMotivos").innerHTML=(chipsM.length||chipsP.length)?[...chipsM,...chipsP].join(""):`<span class="chip">Sem divergência</span>`;
+    const divs=(item.divergencias_reais||[]);
+    const avs=(item.avisos_cadastrais||[]);
+    const pendsArr=(item.pendencias_mapeamento||[]);
+    const chipsD=divs.map(m=>`<span class="chip" style="border-color:#dc2626;color:#fecaca" title="Divergência fiscal real">${m}</span>`);
+    const chipsA=avs.map(m=>`<span class="chip" style="border-color:#f59e0b;color:#fde68a" title="Aviso cadastral (saneamento)">${m}</span>`);
+    const chipsP=pendsArr.map(m=>`<span class="chip" style="border-color:#7c3aed;color:#d8b4fe" title="Pendência de mapeamento">${m}</span>`);
+    const lbl=`<div class="muted small" style="margin-bottom:6px">Divergências reais: <b style="color:#fecaca">${divs.length}</b> | Avisos cadastrais: <b style="color:#fde68a">${avs.length}</b> | Pendências: <b style="color:#d8b4fe">${pendsArr.length}</b></div>`;
+    document.getElementById("detalheMotivos").innerHTML=(chipsD.length||chipsA.length||chipsP.length)?lbl+[...chipsD,...chipsA,...chipsP].join(""):`<span class="chip">Sem divergência</span>`;
 
     const cam=item.comparativo_camadas||{};
     document.getElementById("tabQuadro").innerHTML=`<div class="layer-grid">${["Transação","Cadastro","Família","Origem","Produto","Cliente","Fornecedor","Item gravado"].map(c=>layerCard(rotuloCamada(c),cam[c.toLowerCase().replace(/ /g,"_").replace("ção","cao").replace("ília","ilia").replace("Item gravado","item_gravado")]||cam[{Transação:"transacao",Cadastro:"cadastro",Família:"familia",Origem:"origem",Produto:"produto",Cliente:"cliente",Fornecedor:"fornecedor","Item gravado":"item_gravado"}[c]])).join("")}</div>`;
@@ -5943,7 +6409,9 @@ function abrirDetalhe(index){
     document.getElementById("tabTrilha").innerHTML=(item.trilha_decisao||[]).map(t=>`<div style="padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:#0b1830;margin-bottom:8px"><div style="font-weight:700">${t.ordem}. ${rotuloCamada(t.camada)}</div><div class="small muted" style="margin-top:6px;line-height:1.6">${Object.entries(t).filter(([k])=>!["ordem","camada"].includes(k)).map(([k,v])=>`<div>${k}: <strong>${v??"-"}</strong></div>`).join("")}</div></div>`).join("");
 
     const pis=item.impostos?.pis_cofins||{};
-    document.getElementById("tabPisCofins").innerHTML=`<div class="table-wrap" style="max-height:none"><table><thead><tr><th>Campo</th><th>Transação/Família</th><th>Cadastro</th><th>Item</th></tr></thead><tbody>${tableRow("CST PIS",pis.tns_cst_pis??pis.fam_cst_pis??"",pis.cad_recpis??"",pis.item_cst_pis??"")}${tableRow("CST COFINS",pis.tns_cst_cofins??pis.fam_cst_cofins??"",pis.cad_reccof??"",pis.item_cst_cofins??"")}${tableRow("Base crédito",pis.tns_bascre??"","",pis.item_bascre??"")}${tableRow("Base PIS","","",pis.item_base_pis??"")}${tableRow("Base COFINS","","",pis.item_base_cofins??"")}${tableRow("Valor PIS","","",pis.item_valor_pis??"")}${tableRow("Valor COFINS","","",pis.item_valor_cofins??"")}</tbody></table></div>`;
+    const fontePis = (item.fonte_efetiva||{}).pis || "-";
+    const fonteCof = (item.fonte_efetiva||{}).cofins || "-";
+    document.getElementById("tabPisCofins").innerHTML=`<div class="muted small" style="margin-bottom:6px">Fonte efetiva — PIS: <strong>${fontePis}</strong> | COFINS: <strong>${fonteCof}</strong></div><div class="table-wrap" style="max-height:none"><table><thead><tr><th>Campo</th><th>Transação/Família</th><th>Cadastro</th><th>Item NF</th></tr></thead><tbody>${tableRow("CST PIS",pis.tns_cst_pis??pis.fam_cst_pis??"",pis.cad_cstpis_produto??"",pis.item_cst_pis??"")}${tableRow("CST COFINS",pis.tns_cst_cofins??pis.fam_cst_cofins??"",pis.cad_cstcof_produto??"",pis.item_cst_cofins??"")}${tableRow("Recupera PIS","",pis.cad_recpis??"","")}${tableRow("Recupera COFINS","",pis.cad_reccof??"","")}${tableRow("Base crédito",pis.tns_bascre??"","",pis.item_bascre??"")}${tableRow("Base PIS","","",pis.item_base_pis??"")}${tableRow("Base COFINS","","",pis.item_base_cofins??"")}${tableRow("Valor PIS","","",pis.item_valor_pis??"")}${tableRow("Valor COFINS","","",pis.item_valor_cofins??"")}</tbody></table></div>`;
 
     const ipi=item.impostos?.ipi||{};
     document.getElementById("tabIpi").innerHTML=`<div class="table-wrap" style="max-height:none"><table><thead><tr><th>Campo</th><th>Família</th><th>Cadastro</th><th>Item</th></tr></thead><tbody>${tableRow("CST IPI",ipi.fam_cst_ipi??"","",ipi.item_cst_ipi??"")}${tableRow("ProImp",ipi.fam_proimp??"","","")}${tableRow("Perc. IPI cad","",ipi.cad_peripi??"","")}${tableRow("Recupera IPI","",ipi.cad_recipi??"","")}${tableRow("Alíquota IPI","","",ipi.item_aliq_ipi??"")}${tableRow("Base IPI","","",ipi.item_base_ipi??"")}${tableRow("Valor IPI","","",ipi.item_valor_ipi??"")}</tbody></table></div><div class="chips" style="margin-top:10px">${(ipi.motivos||[]).map(m=>`<span class="chip">${m}</span>`).join("")||'<span class="chip">Sem observações</span>'}</div>`;
