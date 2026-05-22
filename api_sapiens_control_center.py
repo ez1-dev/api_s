@@ -14117,6 +14117,13 @@ def localizar_desenhos_produto(cod_pro):
                     "/api/producao/ordem-producao/desenho/impressao-a4/manifest"
                     f"?arquivo={arquivo_encoded}&v={versao_cache}"
                 ),
+                # Thumbnail para preview/grid — pequeno, cacheado, leve.
+                # Use loading="lazy" + IntersectionObserver no front.
+                # NUNCA usar para impressao (resolucao baixa de proposito).
+                "url_thumbnail": (
+                    "/api/producao/ordem-producao/desenho/thumbnail"
+                    f"?arquivo={arquivo_encoded}&v={versao_cache}"
+                ),
                 # Mantidos como legados (retrocompat) — front nao precisa usar.
                 "url_impressao_a4_inteiro": (
                     "/api/producao/ordem-producao/desenho/impressao-a4"
@@ -14420,6 +14427,14 @@ A4_MARGIN_PX = int(0.25 * DESENHO_A4_DPI)   # ~50 px de margem segura
 #   desenho na borda da folha A4 final.
 WHITE_TOLERANCE = 14
 CROP_PADDING_PX = 20
+
+# Miniatura para PREVIEW (tela). Nunca usada na impressao.
+# - 600px no maior lado eh suficiente para preview legivel.
+# - DPI baixo para PDF (96 dpi rasterizado) — economiza memoria/tempo.
+# - WEBP quando suportado (Pillow tem desde 9.x); JPEG como fallback.
+DESENHO_THUMB_MAX_PX = 600
+DESENHO_THUMB_QUALITY = 70
+DESENHO_THUMB_PDF_DPI = 96
 
 
 def _normalizar_imagem_para_a4(caminho: Path):
@@ -15014,6 +15029,154 @@ def obter_manifest_desenho_ordem_producao_impressao_a4(
         "altura_px": A4_HEIGHT_PX,
         "paginas": paginas,
     }
+
+
+# ============================================================================
+# Miniatura (thumbnail) para preview na tela.
+#
+# Diferente de /impressao-a4/pagina (que entrega A4 retrato pronto para
+# impressao, ~1654x2338px), este endpoint devolve uma versao reduzida
+# (~600px no maior lado, WEBP/JPEG 70%) que pode ser cacheada agressivamente
+# pelo browser. O Lovable usa para o preview/grid, e so baixa o A4 completo
+# no momento de imprimir.
+# ============================================================================
+
+
+def _gerar_thumbnail_desenho(caminho: Path, formato: str = "WEBP"):
+    """Gera uma miniatura do desenho (~DESENHO_THUMB_MAX_PX no maior lado).
+
+    - JPG/PNG: redimensiona com Pillow.
+    - PDF: rasteriza apenas a primeira pagina via fitz em DESENHO_THUMB_PDF_DPI.
+
+    Retorna (bytes, media_type). Se WEBP nao for suportado pelo Pillow
+    instalado, faz fallback para JPEG.
+    """
+    if Image is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Pillow nao esta instalado na API. Instale Pillow>=10.0.0.",
+        )
+
+    ext = caminho.suffix.lower()
+    img = None
+
+    if ext in (".jpg", ".jpeg", ".png"):
+        img = Image.open(caminho)
+        if ImageOps is not None:
+            img = ImageOps.exif_transpose(img)
+        img = img.convert("RGB")
+
+    elif ext == ".pdf":
+        if fitz is None:
+            # Sem fitz nao da pra rasterizar PDF — devolve erro claro.
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "PyMuPDF (fitz) nao esta instalado. Instale pymupdf para "
+                    "gerar thumbnails de PDF."
+                ),
+            )
+        doc = fitz.open(str(caminho))
+        try:
+            if len(doc) == 0:
+                raise HTTPException(
+                    status_code=422,
+                    detail="PDF nao tem paginas.",
+                )
+            page = doc[0]
+            zoom = DESENHO_THUMB_PDF_DPI / 72.0
+            matrix = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            img_bytes = pix.tobytes("png")
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        finally:
+            doc.close()
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="Formato nao permitido. Use JPG, JPEG, PNG ou PDF.",
+        )
+
+    # Redimensiona preservando proporcao: maior lado <= DESENHO_THUMB_MAX_PX.
+    largura, altura = img.size
+    maior = max(largura, altura)
+    if maior > DESENHO_THUMB_MAX_PX:
+        escala = DESENHO_THUMB_MAX_PX / float(maior)
+        nova_w = max(1, int(largura * escala))
+        nova_h = max(1, int(altura * escala))
+        img = img.resize((nova_w, nova_h), Image.LANCZOS)
+
+    saida = io.BytesIO()
+    formato_upper = (formato or "WEBP").upper().strip()
+
+    if formato_upper == "WEBP":
+        try:
+            img.save(saida, format="WEBP", quality=DESENHO_THUMB_QUALITY, method=4)
+            media_type = "image/webp"
+        except Exception:
+            # Pillow sem suporte a WEBP -> fallback JPEG
+            saida = io.BytesIO()
+            img.save(saida, format="JPEG", quality=DESENHO_THUMB_QUALITY, optimize=True)
+            media_type = "image/jpeg"
+            formato_upper = "JPEG"
+    else:
+        img.save(saida, format="JPEG", quality=DESENHO_THUMB_QUALITY, optimize=True)
+        media_type = "image/jpeg"
+        formato_upper = "JPEG"
+
+    saida.seek(0)
+    return saida, media_type, formato_upper, img.size
+
+
+@app.get("/api/producao/ordem-producao/desenho/thumbnail")
+def obter_desenho_ordem_producao_thumbnail(
+    arquivo: str,
+    formato: str = "WEBP",
+    usuario=Depends(validar_token),
+):
+    """Devolve uma miniatura do desenho para PREVIEW (nao usar para impressao).
+
+    Tamanho: ~600px no maior lado.
+    Formato: WEBP por padrao (fallback JPEG se Pillow nao suportar).
+    Qualidade: 70%.
+
+    Cache-Control: public, max-age=86400 (1 dia). Como a URL inclui ?v={mtime},
+    qualquer atualizacao do arquivo invalida o cache automaticamente.
+    """
+    caminho = _resolver_arquivo_desenho(arquivo)
+
+    try:
+        saida, media_type, formato_final, dimensoes = _gerar_thumbnail_desenho(
+            caminho, formato=formato
+        )
+        return StreamingResponse(
+            saida,
+            media_type=media_type,
+            headers={
+                # Thumbnails sao estaveis por (arquivo, mtime) — pode cachear
+                # bem agressivamente. O versionador ?v={mtime} no link da API
+                # garante invalidacao quando o desenho original muda.
+                "Cache-Control": "public, max-age=86400, immutable",
+                "X-Original-File": caminho.name,
+                "X-Thumbnail": "S",
+                "X-Thumbnail-Format": formato_final,
+                "X-Thumbnail-Width": str(dimensoes[0]),
+                "X-Thumbnail-Height": str(dimensoes[1]),
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "mensagem": "Erro ao gerar thumbnail do desenho.",
+                "arquivo": caminho.name,
+                "erro": str(exc),
+                "pillow_disponivel": Image is not None,
+                "pymupdf_disponivel": fitz is not None,
+            },
+        )
 
 
 @app.get("/api/producao/ordem-producao/desenhos/diagnostico")
