@@ -5031,8 +5031,22 @@ def _auditoria_tributaria_inner(
         if r.get("movimento") not in (None, "SEM_MOVIMENTO") and not transacao_atual:
             operacao_divergencias.append("Documento sem transação fiscal")
 
-        if transacao_atual and r.get("tns_cst_pis") is None and r.get("tns_cst_cofins") is None:
-            operacao_divergencias.append("Transação sem CST PIS/COFINS mapeado")
+        # Regra correta: o item NF é a fonte primária. Se ele está sem CST, é divergência.
+        # Se o item NF tem CST mas a transação não tem mapeada, isso é apenas aviso cadastral
+        # (parametrização incompleta, mas o lançamento fiscal saiu correto).
+        _item_pis = _clean_str(r.get("item_cst_pis"))
+        _item_cof = _clean_str(r.get("item_cst_cofins"))
+        _tns_pis = _clean_str(r.get("tns_cst_pis"))
+        _tns_cof = _clean_str(r.get("tns_cst_cofins"))
+        if transacao_atual and r.get("movimento") in ("ENTRADA", "SAIDA") and r.get("tipo_item") == "PRODUTO":
+            if not _item_pis or not _item_cof:
+                operacao_divergencias.append("Item da NF sem CST PIS/COFINS efetivo")
+            else:
+                if not _tns_pis or not _tns_cof:
+                    avisos_cadastrais.append(
+                        f"Transação {transacao_atual} sem CST PIS/COFINS mapeado, "
+                        f"porém o item da NF foi gerado com CST PIS {_item_pis} e CST COFINS {_item_cof}"
+                    )
 
         if transacao_atual and r.get("item_bascre") is not None and r.get("tns_bascre") is None:
             operacao_pendencias.append("Transação sem base de crédito mapeada")
@@ -5088,23 +5102,8 @@ def _auditoria_tributaria_inner(
         divergencias_reais.extend(class_divergencias)
         pendencias_mapeamento.extend(class_pendencias)
 
-        if _clean_str(r.get("transacao")) and (
-            r.get("tns_cst_pis") is not None
-            or r.get("tns_cst_cofins") is not None
-            or r.get("tns_bascre") is not None
-            or cfop_atual
-            or natureza_operacao_atual
-        ):
-            fonte = "TRANSACAO"
-        elif r.get("cad_recpis") is not None or r.get("cad_reccof") is not None:
-            fonte = "CADASTRO"
-        elif r.get("fam_cst_pis") is not None or r.get("fam_cst_cofins") is not None:
-            fonte = "FAMILIA"
-        else:
-            fonte = "ITEM"
-
         def _fonte_imposto(item_v, tns_v, fam_v, cad_v):
-            # Hierarquia: ITEM_NF > TRANSACAO > FAMILIA > CADASTRO
+            # Hierarquia: ITEM_NF > TRANSACAO > FAMILIA > PRODUTO (cadastro)
             if _clean_str(item_v):
                 return "ITEM_NF"
             if _clean_str(tns_v):
@@ -5112,15 +5111,27 @@ def _auditoria_tributaria_inner(
             if _clean_str(fam_v):
                 return "FAMILIA"
             if _clean_str(cad_v):
-                return "CADASTRO"
-            return None
+                return "PRODUTO"
+            return "NAO_MAPEADO"
+
+        fonte_pis = _fonte_imposto(r.get("item_cst_pis"), r.get("tns_cst_pis"), r.get("fam_cst_pis"), r.get("cad_cstpis_produto"))
+        fonte_cofins = _fonte_imposto(r.get("item_cst_cofins"), r.get("tns_cst_cofins"), r.get("fam_cst_cofins"), r.get("cad_cstcof_produto"))
+        fonte_ipi = _fonte_imposto(r.get("item_cst_ipi"), None, r.get("fam_cst_ipi"), r.get("cad_cstipi_produto"))
+        fonte_icms = _fonte_imposto(r.get("item_cst_icms"), None, r.get("fam_codstr"), r.get("cad_codstr"))
 
         fonte_efetiva = {
-            "pis": _fonte_imposto(r.get("item_cst_pis"), r.get("tns_cst_pis"), r.get("fam_cst_pis"), r.get("cad_cstpis_produto")),
-            "cofins": _fonte_imposto(r.get("item_cst_cofins"), r.get("tns_cst_cofins"), r.get("fam_cst_cofins"), r.get("cad_cstcof_produto")),
-            "ipi": _fonte_imposto(r.get("item_cst_ipi"), None, r.get("fam_cst_ipi"), r.get("cad_cstipi_produto")),
-            "icms": _fonte_imposto(r.get("item_cst_icms"), None, r.get("fam_codstr"), r.get("cad_codstr")),
+            "pis": fonte_pis,
+            "cofins": fonte_cofins,
+            "ipi": fonte_ipi,
+            "icms": fonte_icms,
         }
+
+        # fonte_prioritaria agora reflete PIS/COFINS (fonte fiscal usada).
+        # Se PIS e COFINS tiverem fontes diferentes, devolve MISTA.
+        if fonte_pis == fonte_cofins:
+            fonte = fonte_pis
+        else:
+            fonte = "MISTA"
 
         divergencias_unicas = list(dict.fromkeys([m for m in divergencias_reais if m]))
         avisos_unicos = list(dict.fromkeys([m for m in avisos_cadastrais if m]))
@@ -5277,8 +5288,14 @@ def _auditoria_tributaria_inner(
         "ok_com_aviso": len([x for x in itens if x["status_auditoria"] == "OK_COM_AVISO"]),
         "pendente_mapeamento": len([x for x in itens if x["status_auditoria"] == "PENDENTE_MAPEAMENTO"]),
         "ok": len([x for x in itens if x["status_auditoria"] == "OK"]),
+        "fontes_item_nf": len([x for x in itens if x["fonte_prioritaria"] == "ITEM_NF"]),
         "fontes_transacao": len([x for x in itens if x["fonte_prioritaria"] == "TRANSACAO"]),
-        "fontes_cadastro": len([x for x in itens if x["fonte_prioritaria"] == "CADASTRO"]),
+        "fontes_familia": len([x for x in itens if x["fonte_prioritaria"] == "FAMILIA"]),
+        "fontes_produto": len([x for x in itens if x["fonte_prioritaria"] == "PRODUTO"]),
+        "fontes_mista": len([x for x in itens if x["fonte_prioritaria"] == "MISTA"]),
+        "fontes_nao_mapeado": len([x for x in itens if x["fonte_prioritaria"] == "NAO_MAPEADO"]),
+        # Manter chave legada para compat com tela atual
+        "fontes_cadastro": len([x for x in itens if x["fonte_prioritaria"] == "PRODUTO"]),
         "itens_pagina": total_pagina,
     }
 
@@ -6318,7 +6335,7 @@ function renderPaginacao(data){
         </div>`;
 }
 
-function rotuloFonte(f){return{TRANSACAO:"TRANSAÁ‡ÁƒO",CADASTRO:"CADASTRO FISCAL",FAMILIA:"FAMÁLIA",ITEM:"TRIBUTAÁ‡ÁƒO GRAVADA NA NF"}[f]||f||"";}
+function rotuloFonte(f){return{ITEM_NF:"ITEM DA NF",TRANSACAO:"TRANSACAO",FAMILIA:"FAMILIA",PRODUTO:"CADASTRO DO PRODUTO",CADASTRO:"CADASTRO DO PRODUTO",MISTA:"MISTA (PIS!=COFINS)",NAO_MAPEADO:"NAO MAPEADO",ITEM:"ITEM DA NF"}[f]||f||"";}
 function rotuloCamada(c){return{"Transação":"Transação","Cadastro":"Cadastro fiscal","Família":"Família","Origem":"Origem","Produto":"Produto","Cliente":"Cliente","Fornecedor":"Fornecedor","Item gravado":"Tributação gravada na NF"}[c]||c||"";}
 
 function renderResumo(r){
