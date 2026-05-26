@@ -268,6 +268,126 @@ def _is_msg_pis_cofins_legacy(msg: Any) -> bool:
     return False
 
 
+def _item_pis_cofins_coerente(r: Dict[str, Any]) -> bool:
+    """
+    True quando o item da NF ja tem CST PIS e COFINS preenchidos e iguais.
+    Nesse caso, conflito de familia/cadastro nao pode ser divergencia real.
+    """
+    item_pis = _norm_cst(r.get("item_cst_pis"))
+    item_cof = _norm_cst(r.get("item_cst_cofins"))
+    return bool(item_pis and item_cof and item_pis == item_cof)
+
+
+def _msg_falso_positivo_pis_cofins(msg: Any) -> bool:
+    """
+    Identifica mensagens antigas que NAO devem ficar em divergencias_reais
+    quando o item da NF esta coerente. (Falso positivo do auditor antigo.)
+    """
+    txt = _clean_str(msg).lower()
+    if not txt:
+        return False
+    termos = [
+        "divergência pis/cofins",
+        "divergencia pis/cofins",
+        "conflito família x item",
+        "conflito familia x item",
+        "família x item",
+        "familia x item",
+        "cst pis da família",
+        "cst pis da familia",
+        "cst cofins da família",
+        "cst cofins da familia",
+        "cst pis do cadastro",
+        "cst cofins do cadastro",
+    ]
+    return any(t in txt for t in termos)
+
+
+def _reclassificar_pis_cofins_item_emitido(
+    r: Dict[str, Any],
+    divergencias_reais: list,
+    avisos_cadastrais: list,
+    pendencias_mapeamento: list
+):
+    """
+    Regra definitiva:
+      Se o item da NF emitida tem CST PIS e CST COFINS preenchidos e iguais,
+      ele e a verdade documental. Diferencas de familia/produto/cadastro/transacao
+      viram aviso ou pendencia de analise, NUNCA divergencia real de PIS/COFINS.
+
+    Se o item nao estiver coerente, mantem as listas como vieram (so dedup).
+    """
+    item_pis = _norm_cst(r.get("item_cst_pis"))
+    item_cof = _norm_cst(r.get("item_cst_cofins"))
+    tns_pis = _norm_cst(r.get("tns_cst_pis"))
+    tns_cof = _norm_cst(r.get("tns_cst_cofins"))
+    cad_pis = _norm_cst(r.get("cad_cstpis_produto"))
+    cad_cof = _norm_cst(r.get("cad_cstcof_produto"))
+    fam_pis = _norm_cst(r.get("fam_cst_pis"))
+    fam_cof = _norm_cst(r.get("fam_cst_cofins"))
+
+    if not (item_pis and item_cof and item_pis == item_cof):
+        return (
+            _dedup_lista(divergencias_reais),
+            _dedup_lista(avisos_cadastrais),
+            _dedup_lista(pendencias_mapeamento),
+        )
+
+    novas_divergencias = []
+    for msg in divergencias_reais or []:
+        if _msg_falso_positivo_pis_cofins(msg):
+            avisos_cadastrais.append(f"Saneamento cadastral: {msg}")
+        else:
+            novas_divergencias.append(msg)
+
+    # Transacao diferente do item: analisar (pendencia), nao divergencia
+    if tns_pis and tns_pis != item_pis:
+        pendencias_mapeamento.append(
+            f"CST PIS do item da NF ({item_pis}) difere da transação ({tns_pis}); analisar regra/hierarquia"
+        )
+    if tns_cof and tns_cof != item_cof:
+        pendencias_mapeamento.append(
+            f"CST COFINS do item da NF ({item_cof}) difere da transação ({tns_cof}); analisar regra/hierarquia"
+        )
+
+    # Cadastro/familia diferente do item: aviso cadastral
+    if cad_pis and cad_pis != item_pis:
+        avisos_cadastrais.append(
+            f"CST PIS do cadastro do produto ({cad_pis}) difere do item da NF ({item_pis})"
+        )
+    if cad_cof and cad_cof != item_cof:
+        avisos_cadastrais.append(
+            f"CST COFINS do cadastro do produto ({cad_cof}) difere do item da NF ({item_cof})"
+        )
+    if fam_pis and fam_pis != item_pis:
+        avisos_cadastrais.append(
+            f"CST PIS da família ({fam_pis}) difere do item da NF ({item_pis})"
+        )
+    if fam_cof and fam_cof != item_cof:
+        avisos_cadastrais.append(
+            f"CST COFINS da família ({fam_cof}) difere do item da NF ({item_cof})"
+        )
+
+    return (
+        _dedup_lista(novas_divergencias),
+        _dedup_lista(avisos_cadastrais),
+        _dedup_lista(pendencias_mapeamento),
+    )
+
+
+def _classificar_status_final(
+    divergencias_reais: list,
+    avisos_cadastrais: list,
+    pendencias_mapeamento: list
+) -> str:
+    """Alias de _classificar_status_auditoria - mesma regra DIVERGENTE>ANALISAR>OK_COM_AVISO>OK."""
+    return _classificar_status_auditoria(
+        divergencias_reais=divergencias_reais,
+        avisos_cadastrais=avisos_cadastrais,
+        pendencias_mapeamento=pendencias_mapeamento,
+    )
+
+
 def _classificar_status_auditoria(
     divergencias_reais: list,
     avisos_cadastrais: list,
@@ -3946,55 +4066,67 @@ def _coletar_itens_auditoria_para_export(filtros: Dict[str, Any]) -> List[Dict[s
 
 
 def _linha_export_auditoria(item: Dict[str, Any]) -> Dict[str, Any]:
-    """Monta a linha de Excel com as colunas combinadas com o front."""
+    """Monta a linha de Excel respeitando a classificacao oficial:
+       Status DIVERGENTE somente quando divergencias_reais > 0.
+       Avisos cadastrais e fatores_risco sao informativos, nao divergencia.
+    """
     div = item.get("divergencias_reais") or []
     avi = item.get("avisos_cadastrais") or []
     pen = item.get("pendencias_mapeamento") or []
     pis = (item.get("impostos") or {}).get("pis_cofins") or {}
     risco = item.get("risco") or {}
     fonte_efetiva = item.get("fonte_efetiva") or {}
+
     sep = " | "
+
+    # Status vem direto da API; fallback se nao tiver vindo no payload
+    status = item.get("status_auditoria") or _status_auditoria_export(item)
+
     return {
-        "Status Auditoria": _status_auditoria_export(item),
+        "Status Auditoria": status,
         "Movimento": item.get("movimento") or "",
         "Tipo Documento": item.get("documento_tipo") or "",
         "Nº Documento": item.get("numero_documento") or "",
         "Série": item.get("serie") or "",
-        "Seq Item": item.get("seq_item") or "",
+        "Seq Item": item.get("seq_item") or item.get("sequencia_item") or "",
         "Data Emissão": item.get("data_emissao") or "",
         "Tipo Item": item.get("tipo_item") or "",
+
         "Código Item": item.get("codigo_item") or "",
-        "Derivação": item.get("derivacao") or "",
         "Descrição Item": item.get("descricao_item") or "",
-        "Fornecedor": item.get("fornecedor_nome") or "",
-        "Cliente": item.get("cliente_nome") or "",
-        "Transação": item.get("transacao") or "",
-        "CFOP": item.get("cfop") or "",
         "Família": item.get("familia_codigo") or "",
         "Origem": item.get("origem_codigo") or "",
-        "NCM": item.get("ncm") or "",
-        "CEST": item.get("cest") or "",
-        "Qtd Divergências Reais": len(div),
-        "Divergências Reais": sep.join(div),
-        "Qtd Avisos Cadastrais": len(avi),
-        "Avisos Cadastrais": sep.join(avi),
-        "Qtd Pendências Mapeamento": len(pen),
-        "Pendências Mapeamento": sep.join(pen),
-        "CST PIS Item NF": pis.get("item_cst_pis") or "",
-        "CST PIS Transação": pis.get("tns_cst_pis") or "",
-        "CST PIS Cadastro Produto": pis.get("cad_cstpis_produto") or "",
-        "CST PIS Família": pis.get("fam_cst_pis") or "",
-        "CST COFINS Item NF": pis.get("item_cst_cofins") or "",
-        "CST COFINS Transação": pis.get("tns_cst_cofins") or "",
-        "CST COFINS Cadastro Produto": pis.get("cad_cstcof_produto") or "",
-        "CST COFINS Família": pis.get("fam_cst_cofins") or "",
+        "Transação": item.get("transacao") or "",
+        "CFOP": item.get("cfop") or "",
+
+        "CST PIS Item NF": item.get("item_cst_pis") or pis.get("item_cst_pis") or "",
+        "CST COFINS Item NF": item.get("item_cst_cofins") or pis.get("item_cst_cofins") or "",
+
+        "CST PIS Transação": item.get("tns_cst_pis") or pis.get("tns_cst_pis") or "",
+        "CST COFINS Transação": item.get("tns_cst_cofins") or pis.get("tns_cst_cofins") or "",
+
+        "CST PIS Cadastro Produto": item.get("cad_cstpis_produto") or pis.get("cad_cstpis_produto") or "",
+        "CST COFINS Cadastro Produto": item.get("cad_cstcof_produto") or pis.get("cad_cstcof_produto") or "",
+
+        "CST PIS Família": item.get("fam_cst_pis") or pis.get("fam_cst_pis") or "",
+        "CST COFINS Família": item.get("fam_cst_cofins") or pis.get("fam_cst_cofins") or "",
+
         "Fonte Efetiva PIS": fonte_efetiva.get("pis") or "",
         "Fonte Efetiva COFINS": fonte_efetiva.get("cofins") or "",
-        "Fonte Efetiva IPI": fonte_efetiva.get("ipi") or "",
-        "Fonte Efetiva ICMS": fonte_efetiva.get("icms") or "",
+        "Fonte Prioritária": item.get("fonte_prioritaria") or "",
+
+        "Qtd Divergências Reais": len(div),
+        "Divergências Reais": sep.join(div),
+
+        "Qtd Pendências": len(pen),
+        "Pendências Mapeamento": sep.join(pen),
+
+        "Qtd Avisos Cadastrais": len(avi),
+        "Avisos Cadastrais": sep.join(avi),
+
         "Score Risco": risco.get("score_risco") if risco else "",
         "Nível Risco": risco.get("nivel_risco") or "" if risco else "",
-        "Fatores Risco": sep.join(risco.get("fatores_risco") or []) if risco else "",
+        "Fatores Risco / Alertas": sep.join(risco.get("fatores_risco") or []) if risco else "",
     }
 
 
@@ -4050,8 +4182,9 @@ def auditoria_tributaria_export(
 
         linhas = [_linha_export_auditoria(it) for it in itens]
         colunas: List[str] = list(linhas[0].keys()) if linhas else [
-            "Status Auditoria", "Movimento", "Nº Documento", "Série", "Código Item",
-            "Descrição Item", "Divergências Reais", "Avisos Cadastrais", "Pendências Mapeamento"
+            "Status Auditoria", "Movimento", "Nº Documento", "Série",
+            "Código Item", "Descrição Item",
+            "Divergências Reais", "Pendências Mapeamento", "Avisos Cadastrais"
         ]
 
         timestamp = _dt.now().strftime("%Y%m%d_%H%M%S")
@@ -4118,20 +4251,19 @@ def auditoria_tributaria_export(
         larguras = {
             "Status Auditoria": 20, "Movimento": 12, "Tipo Documento": 14,
             "Nº Documento": 14, "Série": 8, "Seq Item": 8, "Data Emissão": 14,
-            "Tipo Item": 12, "Código Item": 18, "Derivação": 12,
-            "Descrição Item": 50, "Fornecedor": 35, "Cliente": 35,
-            "Transação": 12, "CFOP": 10, "Família": 12, "Origem": 12,
-            "NCM": 14, "CEST": 12,
-            "Qtd Divergências Reais": 14, "Divergências Reais": 60,
-            "Qtd Avisos Cadastrais": 14, "Avisos Cadastrais": 60,
-            "Qtd Pendências Mapeamento": 14, "Pendências Mapeamento": 60,
-            "CST PIS Item NF": 12, "CST PIS Transação": 14,
-            "CST PIS Cadastro Produto": 16, "CST PIS Família": 12,
-            "CST COFINS Item NF": 14, "CST COFINS Transação": 16,
-            "CST COFINS Cadastro Produto": 18, "CST COFINS Família": 14,
+            "Tipo Item": 12, "Código Item": 18, "Descrição Item": 50,
+            "Família": 12, "Origem": 12, "Transação": 12, "CFOP": 10,
+            "CST PIS Item NF": 14, "CST COFINS Item NF": 16,
+            "CST PIS Transação": 16, "CST COFINS Transação": 18,
+            "CST PIS Cadastro Produto": 22, "CST COFINS Cadastro Produto": 24,
+            "CST PIS Família": 14, "CST COFINS Família": 16,
             "Fonte Efetiva PIS": 16, "Fonte Efetiva COFINS": 18,
-            "Fonte Efetiva IPI": 16, "Fonte Efetiva ICMS": 16,
-            "Score Risco": 10, "Nível Risco": 12, "Fatores Risco": 50,
+            "Fonte Prioritária": 16,
+            "Qtd Divergências Reais": 14, "Divergências Reais": 60,
+            "Qtd Pendências": 14, "Pendências Mapeamento": 60,
+            "Qtd Avisos Cadastrais": 14, "Avisos Cadastrais": 60,
+            "Score Risco": 10, "Nível Risco": 12,
+            "Fatores Risco / Alertas": 50,
         }
         for col_idx, col_name in enumerate(colunas, start=1):
             ws.column_dimensions[get_column_letter(col_idx)].width = larguras.get(col_name, 16)
@@ -5506,38 +5638,45 @@ def _auditoria_tributaria_inner(
             fonte = "MISTA"
 
         # ============================================================
-        # CORRECAO PIS/COFINS: aplica regra oficial e remove falsos
-        # positivos antigos (familia x item, etc) antes de classificar.
+        # RECLASSIFICACAO PIS/COFINS (item NF emitido = verdade documental):
+        # se item.CST PIS == item.CST COFINS e ambos preenchidos, qualquer
+        # "Divergencia PIS/COFINS" ou "Conflito familia x item" cai para
+        # aviso cadastral. Cadastro/familia x item -> aviso. Transacao x
+        # item -> pendencia ANALISAR. Nunca DIVERGENCIA real.
         # ============================================================
-        (
-            divergencias_reais,
-            avisos_cadastrais,
-            pendencias_mapeamento,
-            fonte_efetiva,
-            fonte,
-            pis_cofins_corrigido,
-        ) = aplicar_correcao_pis_cofins_no_item(
-            r=r,
-            divergencias_reais=divergencias_reais,
-            avisos_cadastrais=avisos_cadastrais,
-            pendencias_mapeamento=pendencias_mapeamento,
-            fonte_efetiva=fonte_efetiva,
+        divergencias_reais, avisos_cadastrais, pendencias_mapeamento = (
+            _reclassificar_pis_cofins_item_emitido(
+                r,
+                divergencias_reais,
+                avisos_cadastrais,
+                pendencias_mapeamento,
+            )
         )
 
         divergencias_unicas = _dedup_lista(divergencias_reais)
         avisos_unicos = _dedup_lista(avisos_cadastrais)
         pendencias_unicas = _dedup_lista(pendencias_mapeamento)
 
-        status = _classificar_status_auditoria(
-            divergencias_reais=divergencias_unicas,
-            avisos_cadastrais=avisos_unicos,
-            pendencias_mapeamento=pendencias_unicas,
+        status = _classificar_status_final(
+            divergencias_unicas,
+            avisos_unicos,
+            pendencias_unicas,
         )
 
-        # motivos consolidado (legado): divergencias > pendencias > avisos
-        motivos_unicos = _dedup_lista(
-            list(divergencias_unicas) + list(pendencias_unicas) + list(avisos_unicos)
-        )
+        # Campo legado "motivos": SOMENTE divergencias reais (nao avisos, nao pendencias).
+        motivos_unicos = divergencias_unicas
+
+        # Bloco PIS/COFINS normalizado, exposto no item para o front consumir
+        pis_cofins_corrigido = {
+            "item_cst_pis": _norm_cst(r.get("item_cst_pis")),
+            "item_cst_cofins": _norm_cst(r.get("item_cst_cofins")),
+            "tns_cst_pis": _norm_cst(r.get("tns_cst_pis")),
+            "tns_cst_cofins": _norm_cst(r.get("tns_cst_cofins")),
+            "cad_cst_pis": _norm_cst(r.get("cad_cstpis_produto")),
+            "cad_cst_cofins": _norm_cst(r.get("cad_cstcof_produto")),
+            "fam_cst_pis": _norm_cst(r.get("fam_cst_pis")),
+            "fam_cst_cofins": _norm_cst(r.get("fam_cst_cofins")),
+        }
 
         impostos["familia_parametrizacao"] = familia_parametrizacao
 
@@ -5641,6 +5780,8 @@ def _auditoria_tributaria_inner(
             "avisos_cadastrais": avisos_unicos,
             "qtd_avisos_cadastrais": len(avisos_unicos),
             "pendencias_mapeamento": pendencias_unicas,
+            "qtd_pendencias_mapeamento": len(pendencias_unicas),
+            "pis_cofins_corrigido": pis_cofins_corrigido,
             "impostos": impostos,
             "comparativo_camadas": comparativo_camadas,
             "trilha_decisao": [
