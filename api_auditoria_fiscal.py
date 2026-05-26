@@ -4021,20 +4021,27 @@ def auditoria_tributaria(
 # EXPORTACAO XLSX DA AUDITORIA TRIBUTARIA
 # =========================================================
 def _status_auditoria_export(item: Dict[str, Any]) -> str:
-    """Status visual usado na exportacao - segue exatamente o status_auditoria da API.
-
-    Prioridade: DIVERGENTE > ANALISAR (pendencia de hierarquia) > OK_COM_AVISO > OK.
+    """
+    Status oficial do Excel.
+    A verdade para exportacao sao os arrays separados:
+      - divergencias_reais
+      - pendencias_mapeamento
+      - avisos_cadastrais
+    NAO confiar em status_auditoria legado, fatores_risco ou motivos.
     """
     div = item.get("divergencias_reais") or []
-    avi = item.get("avisos_cadastrais") or []
     pen = item.get("pendencias_mapeamento") or []
-    status_api = (item.get("status_auditoria") or "").upper()
-    if status_api == "DIVERGENTE" or len(div) > 0:
+    avi = item.get("avisos_cadastrais") or []
+
+    if len(div) > 0:
         return "DIVERGENTE"
-    if status_api in ("ANALISAR", "PENDENTE_MAPEAMENTO") or len(pen) > 0:
+
+    if len(pen) > 0:
         return "ANALISAR"
-    if status_api == "OK_COM_AVISO" or len(avi) > 0:
+
+    if len(avi) > 0:
         return "OK_COM_AVISO"
+
     return "OK"
 
 
@@ -4044,13 +4051,16 @@ def _coletar_itens_auditoria_para_export(filtros: Dict[str, Any]) -> List[Dict[s
     pagina = 1
     tamanho_pagina = 200
     while True:
+        # IMPORTANTE: sempre coleta TUDO (apenas_divergencia=False).
+        # O filtro real e aplicado no proprio export usando divergencias_reais,
+        # blindando contra qualquer status_auditoria legado.
         resultado = _auditoria_tributaria_inner(
             filtros["tipo_item"], filtros["movimento"], filtros["numero_documento"],
             filtros["serie"], filtros["parceiro"], filtros["codigo_item"],
             filtros["codigo_produto"], filtros["descricao"], filtros["familia"],
             filtros["origem"], filtros["transacao"], filtros["data_emissao_ini"],
             filtros["data_emissao_fim"], filtros["categoria_material"],
-            filtros["base_auditoria"], filtros["apenas_divergencia"],
+            filtros["base_auditoria"], False,
             pagina, tamanho_pagina
         )
         itens_pagina = resultado.get("itens") or []
@@ -4079,8 +4089,8 @@ def _linha_export_auditoria(item: Dict[str, Any]) -> Dict[str, Any]:
 
     sep = " | "
 
-    # Status vem direto da API; fallback se nao tiver vindo no payload
-    status = item.get("status_auditoria") or _status_auditoria_export(item)
+    # Status sempre recalculado pelos arrays (nunca confiar no status_auditoria legado).
+    status = _status_auditoria_export(item)
 
     return {
         "Status Auditoria": status,
