@@ -155,6 +155,332 @@ def _clean_str(v) -> str:
     return str(v).strip()
 
 
+# =========================================================
+# CORRECAO AUDITORIA PIS/COFINS
+# =========================================================
+
+def _norm_cst(v: Any) -> str:
+    """
+    Normaliza CST para comparacao.
+    Ex.: 1 -> '01', '1' -> '01', '01' -> '01'.
+    """
+    s = _clean_str(v).upper()
+    if not s:
+        return ""
+    if s.isdigit():
+        return s.zfill(2)
+    return s
+
+
+def _num_safe(v: Any) -> float:
+    """Converte numero do ERP/API para float sem quebrar."""
+    if v is None:
+        return 0.0
+
+    if isinstance(v, Decimal):
+        return float(v)
+
+    if isinstance(v, (int, float)):
+        return float(v)
+
+    s = str(v).strip()
+    if not s:
+        return 0.0
+
+    # padrao brasileiro quando vier como texto: 7.310,10
+    if "," in s:
+        s = s.replace(".", "").replace(",", ".")
+
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+def _dedup_lista(valores: list) -> list:
+    """Remove duplicidade mantendo ordem."""
+    saida = []
+    vistos = set()
+
+    for v in valores or []:
+        txt = _clean_str(v)
+        if not txt:
+            continue
+        chave = txt.lower()
+        if chave not in vistos:
+            vistos.add(chave)
+            saida.append(txt)
+
+    return saida
+
+
+def _fonte_valor_cst(item_cst: str, tns_cst: str, cad_cst: str, fam_cst: str) -> dict:
+    """
+    Fonte efetiva para auditoria:
+    1. ITEM_NF: valor gravado na nota, verdade documental apos emissao.
+    2. TRANSACAO: parametro operacional.
+    3. PRODUTO: cadastro do produto.
+    4. FAMILIA: cadastro da familia.
+    """
+    if item_cst:
+        return {"fonte": "ITEM_NF", "valor": item_cst}
+    if tns_cst:
+        return {"fonte": "TRANSACAO", "valor": tns_cst}
+    if cad_cst:
+        return {"fonte": "PRODUTO", "valor": cad_cst}
+    if fam_cst:
+        return {"fonte": "FAMILIA", "valor": fam_cst}
+    return {"fonte": "NAO_MAPEADO", "valor": ""}
+
+
+def _fonte_prioritaria_from_efetiva(fonte_efetiva: dict) -> str:
+    pis = _clean_str((fonte_efetiva or {}).get("pis")).upper()
+    cofins = _clean_str((fonte_efetiva or {}).get("cofins")).upper()
+
+    if not pis and not cofins:
+        return "NAO_MAPEADO"
+
+    if pis == cofins:
+        return pis or "NAO_MAPEADO"
+
+    return "MISTA"
+
+
+def _is_msg_pis_cofins_legacy(msg: Any) -> bool:
+    """
+    Remove mensagens antigas de PIS/COFINS antes de recalcular pela regra correta,
+    evitando manter falso positivo da auditoria anterior.
+    """
+    txt = _clean_str(msg).lower()
+
+    if not txt:
+        return False
+
+    if "pis" in txt or "cofins" in txt:
+        return True
+
+    if "família" in txt and "item" in txt:
+        return True
+
+    if "familia" in txt and "item" in txt:
+        return True
+
+    return False
+
+
+def _classificar_status_auditoria(
+    divergencias_reais: list,
+    avisos_cadastrais: list,
+    pendencias_mapeamento: list
+) -> str:
+    """
+    Regra oficial:
+      - DIVERGENTE: somente quando houver divergencia real documental/fiscal.
+      - ANALISAR: quando nao e erro direto, mas precisa decisao fiscal.
+      - OK_COM_AVISO: saneamento cadastral.
+      - OK: sem apontamentos.
+    """
+    if len(divergencias_reais or []) > 0:
+        return "DIVERGENTE"
+
+    if len(pendencias_mapeamento or []) > 0:
+        return "ANALISAR"
+
+    if len(avisos_cadastrais or []) > 0:
+        return "OK_COM_AVISO"
+
+    return "OK"
+
+
+def avaliar_pis_cofins_corrigido(r: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Corrige a auditoria de PIS/COFINS.
+
+    Premissa:
+      - Item da NF ja emitida e a verdade documental.
+      - Divergencia familia x item NAO e divergencia real se o item da NF possui CST valido.
+      - Transacao/cadastro/familia servem para parametrizacao e saneamento.
+    """
+    divergencias_reais = []
+    avisos_cadastrais = []
+    pendencias_mapeamento = []
+
+    item_cst_pis = _norm_cst(r.get("item_cst_pis"))
+    item_cst_cofins = _norm_cst(r.get("item_cst_cofins"))
+
+    tns_cst_pis = _norm_cst(r.get("tns_cst_pis"))
+    tns_cst_cofins = _norm_cst(r.get("tns_cst_cofins"))
+
+    cad_cst_pis = _norm_cst(r.get("cad_cstpis_produto"))
+    cad_cst_cofins = _norm_cst(r.get("cad_cstcof_produto"))
+
+    fam_cst_pis = _norm_cst(r.get("fam_cst_pis"))
+    fam_cst_cofins = _norm_cst(r.get("fam_cst_cofins"))
+
+    base_pis = _num_safe(r.get("item_base_pis"))
+    base_cofins = _num_safe(r.get("item_base_cofins"))
+    valor_pis = _num_safe(r.get("item_valor_pis"))
+    valor_cofins = _num_safe(r.get("item_valor_cofins"))
+
+    fonte_pis = _fonte_valor_cst(item_cst_pis, tns_cst_pis, cad_cst_pis, fam_cst_pis)
+    fonte_cofins = _fonte_valor_cst(item_cst_cofins, tns_cst_cofins, cad_cst_cofins, fam_cst_cofins)
+
+    fonte_efetiva = {
+        "pis": fonte_pis["fonte"],
+        "cofins": fonte_cofins["fonte"],
+    }
+
+    # 1) Divergencia real: item da NF tem CST PIS diferente de CST COFINS
+    if item_cst_pis and item_cst_cofins and item_cst_pis != item_cst_cofins:
+        divergencias_reais.append(
+            f"Divergência PIS/COFINS: CST PIS {item_cst_pis} diferente do CST COFINS {item_cst_cofins} no item da NF"
+        )
+
+    # 2) Divergencia real: ha base/valor tributado, mas CST nao esta gravado no item
+    if not item_cst_pis and (base_pis > 0 or valor_pis > 0):
+        divergencias_reais.append(
+            "Item da NF possui base/valor de PIS, mas está sem CST PIS gravado"
+        )
+
+    if not item_cst_cofins and (base_cofins > 0 or valor_cofins > 0):
+        divergencias_reais.append(
+            "Item da NF possui base/valor de COFINS, mas está sem CST COFINS gravado"
+        )
+
+    # 3) Se item esta preenchido e coerente, nao pode virar divergencia por familia/cadastro
+    item_pis_cofins_resolvido = (
+        item_cst_pis
+        and item_cst_cofins
+        and item_cst_pis == item_cst_cofins
+    )
+
+    if item_pis_cofins_resolvido:
+        # Transacao diferente do item: merece analise
+        if tns_cst_pis and tns_cst_pis != item_cst_pis:
+            pendencias_mapeamento.append(
+                f"CST PIS do item ({item_cst_pis}) difere da transação ({tns_cst_pis}); verificar se houve regra/alteração manual"
+            )
+
+        if tns_cst_cofins and tns_cst_cofins != item_cst_cofins:
+            pendencias_mapeamento.append(
+                f"CST COFINS do item ({item_cst_cofins}) difere da transação ({tns_cst_cofins}); verificar se houve regra/alteração manual"
+            )
+
+        # Cadastro/familia diferente do item: saneamento cadastral
+        if cad_cst_pis and cad_cst_pis != item_cst_pis:
+            avisos_cadastrais.append(
+                f"CST PIS do cadastro do produto ({cad_cst_pis}) difere do item da NF ({item_cst_pis})"
+            )
+
+        if cad_cst_cofins and cad_cst_cofins != item_cst_cofins:
+            avisos_cadastrais.append(
+                f"CST COFINS do cadastro do produto ({cad_cst_cofins}) difere do item da NF ({item_cst_cofins})"
+            )
+
+        if fam_cst_pis and fam_cst_pis != item_cst_pis:
+            avisos_cadastrais.append(
+                f"CST PIS da família ({fam_cst_pis}) difere do item da NF ({item_cst_pis})"
+            )
+
+        if fam_cst_cofins and fam_cst_cofins != item_cst_cofins:
+            avisos_cadastrais.append(
+                f"CST COFINS da família ({fam_cst_cofins}) difere do item da NF ({item_cst_cofins})"
+            )
+
+    # 4) Item nao resolveu mas existe parametrizacao em outra camada
+    if not item_pis_cofins_resolvido:
+        if not item_cst_pis and not item_cst_cofins:
+            if tns_cst_pis or tns_cst_cofins or cad_cst_pis or cad_cst_cofins or fam_cst_pis or fam_cst_cofins:
+                pendencias_mapeamento.append(
+                    "Item da NF sem CST PIS/COFINS gravado; existe parametrização em transação/cadastro/família para análise"
+                )
+
+        if tns_cst_pis and tns_cst_cofins and tns_cst_pis != tns_cst_cofins:
+            pendencias_mapeamento.append(
+                f"Transação possui CST PIS ({tns_cst_pis}) diferente de CST COFINS ({tns_cst_cofins})"
+            )
+
+    # 5) Familia/cadastro internamente diferentes sao avisos de saneamento
+    if cad_cst_pis and cad_cst_cofins and cad_cst_pis != cad_cst_cofins:
+        avisos_cadastrais.append(
+            f"Cadastro do produto possui CST PIS ({cad_cst_pis}) diferente de CST COFINS ({cad_cst_cofins})"
+        )
+
+    if fam_cst_pis and fam_cst_cofins and fam_cst_pis != fam_cst_cofins:
+        avisos_cadastrais.append(
+            f"Família possui CST PIS ({fam_cst_pis}) diferente de CST COFINS ({fam_cst_cofins})"
+        )
+
+    return {
+        "divergencias_reais": _dedup_lista(divergencias_reais),
+        "avisos_cadastrais": _dedup_lista(avisos_cadastrais),
+        "pendencias_mapeamento": _dedup_lista(pendencias_mapeamento),
+        "fonte_efetiva": fonte_efetiva,
+        "fonte_prioritaria": _fonte_prioritaria_from_efetiva(fonte_efetiva),
+        "pis_cofins": {
+            "item_cst_pis": item_cst_pis,
+            "item_cst_cofins": item_cst_cofins,
+            "tns_cst_pis": tns_cst_pis,
+            "tns_cst_cofins": tns_cst_cofins,
+            "cad_cst_pis": cad_cst_pis,
+            "cad_cst_cofins": cad_cst_cofins,
+            "fam_cst_pis": fam_cst_pis,
+            "fam_cst_cofins": fam_cst_cofins,
+        }
+    }
+
+
+def aplicar_correcao_pis_cofins_no_item(
+    r: Dict[str, Any],
+    divergencias_reais: list,
+    avisos_cadastrais: list,
+    pendencias_mapeamento: list,
+    fonte_efetiva: dict
+):
+    """
+    Remove as mensagens antigas de PIS/COFINS e recalcula pela regra correta.
+    Retorna as listas saneadas + fonte_efetiva + fonte_prioritaria + bloco pis_cofins.
+    """
+    divergencias_reais = [
+        m for m in (divergencias_reais or [])
+        if not _is_msg_pis_cofins_legacy(m)
+    ]
+
+    avisos_cadastrais = [
+        m for m in (avisos_cadastrais or [])
+        if not _is_msg_pis_cofins_legacy(m)
+    ]
+
+    pendencias_mapeamento = [
+        m for m in (pendencias_mapeamento or [])
+        if not _is_msg_pis_cofins_legacy(m)
+    ]
+
+    corr = avaliar_pis_cofins_corrigido(r)
+
+    divergencias_reais.extend(corr["divergencias_reais"])
+    avisos_cadastrais.extend(corr["avisos_cadastrais"])
+    pendencias_mapeamento.extend(corr["pendencias_mapeamento"])
+
+    divergencias_reais = _dedup_lista(divergencias_reais)
+    avisos_cadastrais = _dedup_lista(avisos_cadastrais)
+    pendencias_mapeamento = _dedup_lista(pendencias_mapeamento)
+
+    fonte_efetiva = fonte_efetiva or {}
+    fonte_efetiva["pis"] = corr["fonte_efetiva"]["pis"]
+    fonte_efetiva["cofins"] = corr["fonte_efetiva"]["cofins"]
+
+    fonte_prioritaria = _fonte_prioritaria_from_efetiva(fonte_efetiva)
+
+    return (
+        divergencias_reais,
+        avisos_cadastrais,
+        pendencias_mapeamento,
+        fonte_efetiva,
+        fonte_prioritaria,
+        corr["pis_cofins"]
+    )
+
 
 # =========================================================
 # IA HELPERS
@@ -204,70 +530,108 @@ def chamar_gemini(prompt: str, instrucao_sistema: str = "") -> Optional[Dict[str
 
 
 def calcular_score_risco(item: Dict[str, Any]) -> Dict[str, Any]:
-    """Calcula score de risco fiscal 0-100 localmente, sem API.
+    """
+    Calcula score de risco fiscal 0-100.
 
-    Hierarquia de peso:
-      - divergências reais (erro fiscal da NF): peso alto.
-      - avisos cadastrais (saneamento de cadastro): peso reduzido.
-      - pendências de mapeamento (campos não coletados): ignoradas.
+    Regra:
+      - Divergencia real pesa forte.
+      - Pendencia de analise pesa medio.
+      - Aviso cadastral pesa baixo.
+      - Aviso cadastral sozinho NUNCA deve virar ALTO.
     """
     score = 0
     fatores: List[str] = []
+
     divergencias = item.get("divergencias_reais", []) or []
     avisos = item.get("avisos_cadastrais", []) or []
+    pendencias = item.get("pendencias_mapeamento", []) or []
     impostos = item.get("impostos", {}) or {}
+
     qtd_div = len(divergencias)
     qtd_avi = len(avisos)
+    qtd_pen = len(pendencias)
 
     icms = impostos.get("icms", {}) or {}
     cadastro = impostos.get("cadastro_produto", {}) or {}
 
-    # ICMS - apenas se houver divergência real
+    # Divergencias reais
     if any("ICMS" in m.upper() for m in divergencias):
-        score += 30; fatores.append("Divergência de ICMS")
-    elif icms.get("item_aliq_icms") is None and item.get("tipo_item") == "PRODUTO" and item.get("movimento") in ("ENTRADA", "SAIDA"):
-        score += 15; fatores.append("Alíquota ICMS ausente no item")
+        score += 30
+        fatores.append("Divergência de ICMS")
 
-    # PIS/COFINS - apenas divergência real
     if any(("PIS" in m.upper() or "COFINS" in m.upper()) for m in divergencias):
-        score += 25; fatores.append("Divergência PIS/COFINS")
+        score += 25
+        fatores.append("Divergência PIS/COFINS")
 
-    # NCM ausente (real)
     if any("sem NCM" in m for m in divergencias):
-        score += 20; fatores.append("Produto sem NCM")
+        score += 20
+        fatores.append("Produto sem NCM")
 
-    # Documento sem transação fiscal (real)
     if any("sem transação" in m.lower() for m in divergencias):
-        score += 15; fatores.append("Documento sem transação fiscal")
+        score += 15
+        fatores.append("Documento sem transação fiscal")
 
-    # Conflito família x item (após hierarquia) - real
-    if any("família" in m.lower() and "difere" in m.lower() for m in divergencias):
-        score += 20; fatores.append("Conflito família x item (não justificado pela transação)")
+    if qtd_div > 5:
+        score += 10
+        fatores.append(f"{qtd_div} divergências reais acumuladas")
+    elif qtd_div > 2:
+        score += 5
+        fatores.append(f"{qtd_div} divergências reais")
 
-    # Avisos cadastrais (saneamento) - impacto pequeno e limitado
+    # Pendencias de analise
+    if qtd_pen > 0:
+        peso_pendencias = min(15, qtd_pen * 3)
+        score += peso_pendencias
+        fatores.append(f"{qtd_pen} pendência(s) de análise fiscal")
+
+    # Avisos cadastrais: baixo impacto
     if qtd_avi > 0:
-        peso_avisos = min(10, qtd_avi)  # no máximo +10 pontos
+        peso_avisos = min(8, qtd_avi)
         score += peso_avisos
         fatores.append(f"{qtd_avi} aviso(s) de saneamento cadastral")
 
-    # CodTrd ausente é cadastral (saneamento) - só pesa se tiver divergência junto
-    if not _clean_str(cadastro.get("cad_codtrd")) and item.get("tipo_item") == "PRODUTO" and qtd_div > 0:
-        score += 5; fatores.append("Cadastro sem CodTrd")
+    # Aliquota ICMS ausente so pesa se nao houver divergencia maior
+    if (
+        qtd_div == 0
+        and icms.get("item_aliq_icms") is None
+        and item.get("tipo_item") == "PRODUTO"
+        and item.get("movimento") in ("ENTRADA", "SAIDA")
+    ):
+        score += 8
+        fatores.append("Alíquota ICMS ausente no item")
 
-    # Acúmulo de divergências reais
-    if qtd_div > 5:
-        score += 10; fatores.append(f"{qtd_div} divergências reais acumuladas")
-    elif qtd_div > 2:
+    # CodTrd ausente so pesa com divergencia real
+    if (
+        not _clean_str(cadastro.get("cad_codtrd"))
+        and item.get("tipo_item") == "PRODUTO"
+        and qtd_div > 0
+    ):
         score += 5
+        fatores.append("Cadastro sem CodTrd")
 
     score = min(100, score)
-    nivel = "CRITICO" if score >= 75 else "ALTO" if score >= 50 else "MEDIO" if score >= 25 else "BAIXO"
+
+    # Regra final: aviso sozinho nao pode ser ALTO
+    if qtd_div == 0 and qtd_pen == 0:
+        score = min(score, 20)
+
+    if qtd_div == 0 and qtd_pen > 0:
+        score = min(score, 45)
+
+    nivel = (
+        "CRITICO" if score >= 75
+        else "ALTO" if score >= 50
+        else "MEDIO" if score >= 25
+        else "BAIXO"
+    )
+
     return {
         "score_risco": score,
         "nivel_risco": nivel,
-        "fatores_risco": fatores,
+        "fatores_risco": _dedup_lista(fatores),
         "qtd_divergencias_reais": qtd_div,
         "qtd_avisos_cadastrais": qtd_avi,
+        "qtd_pendencias_mapeamento": qtd_pen,
     }
 
 
@@ -5135,29 +5499,45 @@ def _auditoria_tributaria_inner(
             "icms": fonte_icms,
         }
 
-        # fonte_prioritaria agora reflete PIS/COFINS (fonte fiscal usada).
-        # Se PIS e COFINS tiverem fontes diferentes, devolve MISTA.
+        # fonte_prioritaria preliminar (sera sobrescrita pela funcao de correcao PIS/COFINS).
         if fonte_pis == fonte_cofins:
             fonte = fonte_pis
         else:
             fonte = "MISTA"
 
-        divergencias_unicas = list(dict.fromkeys([m for m in divergencias_reais if m]))
-        avisos_unicos = list(dict.fromkeys([m for m in avisos_cadastrais if m]))
-        pendencias_unicas = list(dict.fromkeys([m for m in pendencias_mapeamento if m]))
+        # ============================================================
+        # CORRECAO PIS/COFINS: aplica regra oficial e remove falsos
+        # positivos antigos (familia x item, etc) antes de classificar.
+        # ============================================================
+        (
+            divergencias_reais,
+            avisos_cadastrais,
+            pendencias_mapeamento,
+            fonte_efetiva,
+            fonte,
+            pis_cofins_corrigido,
+        ) = aplicar_correcao_pis_cofins_no_item(
+            r=r,
+            divergencias_reais=divergencias_reais,
+            avisos_cadastrais=avisos_cadastrais,
+            pendencias_mapeamento=pendencias_mapeamento,
+            fonte_efetiva=fonte_efetiva,
+        )
 
-        # IMPORTANTE: "motivos" (campo legado) agora contém SOMENTE divergências reais.
-        # Avisos cadastrais (saneamento) NAO derrubam a nota.
-        # Pendencias = casos que precisam analise de hierarquia (status ANALISAR).
-        motivos_unicos = list(divergencias_unicas)
-        if divergencias_unicas:
-            status = "DIVERGENTE"
-        elif pendencias_unicas:
-            status = "ANALISAR"
-        elif avisos_unicos:
-            status = "OK_COM_AVISO"
-        else:
-            status = "OK"
+        divergencias_unicas = _dedup_lista(divergencias_reais)
+        avisos_unicos = _dedup_lista(avisos_cadastrais)
+        pendencias_unicas = _dedup_lista(pendencias_mapeamento)
+
+        status = _classificar_status_auditoria(
+            divergencias_reais=divergencias_unicas,
+            avisos_cadastrais=avisos_unicos,
+            pendencias_mapeamento=pendencias_unicas,
+        )
+
+        # motivos consolidado (legado): divergencias > pendencias > avisos
+        motivos_unicos = _dedup_lista(
+            list(divergencias_unicas) + list(pendencias_unicas) + list(avisos_unicos)
+        )
 
         impostos["familia_parametrizacao"] = familia_parametrizacao
 
@@ -5261,6 +5641,8 @@ def _auditoria_tributaria_inner(
             "avisos_cadastrais": avisos_unicos,
             "qtd_avisos_cadastrais": len(avisos_unicos),
             "pendencias_mapeamento": pendencias_unicas,
+            "qtd_pendencias_mapeamento": len(pendencias_unicas),
+            "pis_cofins_corrigido": pis_cofins_corrigido,
             "impostos": impostos,
             "comparativo_camadas": comparativo_camadas,
             "trilha_decisao": [
@@ -5287,26 +5669,55 @@ def _auditoria_tributaria_inner(
         itens.append(item)
 
     if apenas_divergencia:
-        itens = [x for x in itens if x["status_auditoria"] == "DIVERGENTE"]
+        itens = [
+            x for x in itens
+            if len(x.get("divergencias_reais") or []) > 0
+        ]
 
     total_pagina = len(itens)
+
     resumo = {
         "total_itens": total_registros,
+        "total_itens_base": total_registros,
+        "itens_pagina": total_pagina,
+
         "entradas": len([x for x in itens if x.get("movimento") == "ENTRADA"]),
         "saidas": len([x for x in itens if x.get("movimento") == "SAIDA"]),
-        "divergentes": len([x for x in itens if x["status_auditoria"] == "DIVERGENTE"]),
-        "analisar": len([x for x in itens if x["status_auditoria"] == "ANALISAR"]),
-        "ok_com_aviso": len([x for x in itens if x["status_auditoria"] == "OK_COM_AVISO"]),
-        "ok": len([x for x in itens if x["status_auditoria"] == "OK"]),
-        "fontes_item_nf": len([x for x in itens if x["fonte_prioritaria"] == "ITEM_NF"]),
-        "fontes_transacao": len([x for x in itens if x["fonte_prioritaria"] == "TRANSACAO"]),
-        "fontes_familia": len([x for x in itens if x["fonte_prioritaria"] == "FAMILIA"]),
-        "fontes_produto": len([x for x in itens if x["fonte_prioritaria"] == "PRODUTO"]),
-        "fontes_mista": len([x for x in itens if x["fonte_prioritaria"] == "MISTA"]),
-        "fontes_nao_mapeado": len([x for x in itens if x["fonte_prioritaria"] == "NAO_MAPEADO"]),
-        # Manter chave legada para compat com tela atual
-        "fontes_cadastro": len([x for x in itens if x["fonte_prioritaria"] == "PRODUTO"]),
-        "itens_pagina": total_pagina,
+
+        "divergentes": len([
+            x for x in itens
+            if len(x.get("divergencias_reais") or []) > 0
+        ]),
+
+        "analisar": len([
+            x for x in itens
+            if len(x.get("divergencias_reais") or []) == 0
+            and len(x.get("pendencias_mapeamento") or []) > 0
+        ]),
+
+        "ok_com_aviso": len([
+            x for x in itens
+            if len(x.get("divergencias_reais") or []) == 0
+            and len(x.get("pendencias_mapeamento") or []) == 0
+            and len(x.get("avisos_cadastrais") or []) > 0
+        ]),
+
+        "ok": len([
+            x for x in itens
+            if len(x.get("divergencias_reais") or []) == 0
+            and len(x.get("pendencias_mapeamento") or []) == 0
+            and len(x.get("avisos_cadastrais") or []) == 0
+        ]),
+
+        "fontes_item_nf": len([x for x in itens if x.get("fonte_prioritaria") == "ITEM_NF"]),
+        "fontes_transacao": len([x for x in itens if x.get("fonte_prioritaria") == "TRANSACAO"]),
+        "fontes_familia": len([x for x in itens if x.get("fonte_prioritaria") == "FAMILIA"]),
+        "fontes_produto": len([x for x in itens if x.get("fonte_prioritaria") == "PRODUTO"]),
+        "fontes_mista": len([x for x in itens if x.get("fonte_prioritaria") == "MISTA"]),
+        "fontes_nao_mapeado": len([x for x in itens if x.get("fonte_prioritaria") == "NAO_MAPEADO"]),
+
+        # compatibilidade com frontend atual
+        "fontes_cadastro": len([x for x in itens if x.get("fonte_prioritaria") == "PRODUTO"]),
     }
 
     total_paginas = max(1, (total_registros + tamanho_pagina - 1) // tamanho_pagina) if total_registros else 1
