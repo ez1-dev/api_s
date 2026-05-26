@@ -214,6 +214,42 @@ def _dedup_lista(valores: list) -> list:
     return saida
 
 
+def _normalizar_msg_aviso(msg: Any) -> str:
+    """
+    Normaliza mensagem de aviso cadastral para detectar duplicidades semanticas
+    (mesmo conteudo gerado por blocos diferentes da auditoria).
+    """
+    txt = _clean_str(msg).lower()
+    txt = txt.replace("saneamento cadastral:", "")
+    txt = txt.replace("item nf", "item da nf")
+    while "  " in txt:
+        txt = txt.replace("  ", " ")
+    return txt.strip()
+
+
+def _dedup_avisos_cadastrais(valores: list) -> list:
+    """
+    Dedup forte para avisos cadastrais: considera equivalentes mensagens que
+    diferem apenas no prefixo "Saneamento cadastral:" ou em "item NF" vs "item da NF".
+    Preserva a primeira ocorrencia (mantendo o prefixo se vier primeiro).
+    """
+    saida = []
+    vistos = set()
+
+    for v in valores or []:
+        txt = _clean_str(v)
+        if not txt:
+            continue
+        chave = _normalizar_msg_aviso(txt)
+        if not chave:
+            continue
+        if chave not in vistos:
+            vistos.add(chave)
+            saida.append(txt)
+
+    return saida
+
+
 def _fonte_valor_cst(item_cst: str, tns_cst: str, cad_cst: str, fam_cst: str) -> dict:
     """
     Fonte efetiva para auditoria:
@@ -5664,7 +5700,7 @@ def _auditoria_tributaria_inner(
         )
 
         divergencias_unicas = _dedup_lista(divergencias_reais)
-        avisos_unicos = _dedup_lista(avisos_cadastrais)
+        avisos_unicos = _dedup_avisos_cadastrais(avisos_cadastrais)
         pendencias_unicas = _dedup_lista(pendencias_mapeamento)
 
         status = _classificar_status_final(
