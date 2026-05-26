@@ -5641,8 +5641,6 @@ def _auditoria_tributaria_inner(
             "avisos_cadastrais": avisos_unicos,
             "qtd_avisos_cadastrais": len(avisos_unicos),
             "pendencias_mapeamento": pendencias_unicas,
-            "qtd_pendencias_mapeamento": len(pendencias_unicas),
-            "pis_cofins_corrigido": pis_cofins_corrigido,
             "impostos": impostos,
             "comparativo_camadas": comparativo_camadas,
             "trilha_decisao": [
