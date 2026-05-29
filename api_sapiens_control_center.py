@@ -34095,6 +34095,8 @@ def _ops_jato_peso_cte_multinivel(codemp: int, *, data_ini=None, data_fim=None,
     return cte, params
 
 
+@app.get("/api/auditoria-apontamento-genius/ops-pintura-jato")
+@app.get("/api/auditoria-apontamento-genius/ops-pintura-jato-peso")
 @app.get("/api/auditoria-apontamento-genius/ops-jato-peso")
 def auditoria_genius_ops_jato_peso(
     codemp: int = EMPRESA_PADRAO,
