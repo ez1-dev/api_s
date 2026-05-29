@@ -1593,6 +1593,311 @@ def pagina_estoque_min_max():
     return html_content
 
 
+# ============================================================
+# CADASTROS - PRODUTOS
+# Consulta de produtos ativos por origem/família
+# ============================================================
+
+@app.get("/api/cadastros/produtos")
+def consultar_cadastros_produtos(
+    codemp: int = EMPRESA_PADRAO,
+    codori: Optional[str] = None,
+    codfam: Optional[str] = None,
+    codpro: Optional[str] = None,
+    despro: Optional[str] = None,
+    tippro: Optional[str] = None,
+    somente_ativos: bool = True,
+    incluir_derivacoes: bool = False,
+    pagina: int = 1,
+    tamanho_pagina: int = 100,
+    usuario=Depends(validar_token),
+):
+    """
+    Consulta produtos cadastrados no ERP Senior.
+
+    Filtros principais:
+    - codori: origem do produto
+    - codfam: família do produto
+    - codpro: código do produto
+    - despro: descrição do produto
+    - tippro: tipo do produto
+    - somente_ativos: por padrão busca apenas produtos ativos
+    - incluir_derivacoes: se true, retorna derivações ativas da E075DER
+    """
+
+    if pagina < 1:
+        pagina = 1
+
+    if tamanho_pagina < 1:
+        tamanho_pagina = 100
+
+    if tamanho_pagina > 500:
+        tamanho_pagina = 500
+
+    offset = (pagina - 1) * tamanho_pagina
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    params = [codemp]
+
+    where_sql = """
+        WHERE P.CODEMP = ?
+    """
+
+    if somente_ativos:
+        where_sql += " AND COALESCE(P.SITPRO, 'A') = 'A'"
+
+    if codori:
+        where_sql += " AND P.CODORI = ?"
+        params.append(codori.strip())
+
+    if codfam:
+        where_sql += " AND P.CODFAM = ?"
+        params.append(codfam.strip())
+
+    if codpro:
+        where_sql += " AND P.CODPRO LIKE ?"
+        params.append(f"%{codpro.strip()}%")
+
+    if despro:
+        where_sql += " AND P.DESPRO LIKE ?"
+        params.append(f"%{despro.strip()}%")
+
+    if tippro:
+        where_sql += " AND P.TIPPRO = ?"
+        params.append(tippro.strip())
+
+    if incluir_derivacoes:
+        from_sql = f"""
+            FROM E075PRO P
+            LEFT JOIN E075DER D
+                ON D.CODEMP = P.CODEMP
+               AND D.CODPRO = P.CODPRO
+               AND COALESCE(D.SITDER, 'A') = 'A'
+            LEFT JOIN E012FAM F
+                ON F.CODEMP = P.CODEMP
+               AND F.CODFAM = P.CODFAM
+            LEFT JOIN E083ORI O
+                ON O.CODEMP = P.CODEMP
+               AND O.CODORI = P.CODORI
+            {where_sql}
+        """
+
+        select_sql = """
+            SELECT
+                P.CODEMP AS codigo_empresa,
+                P.CODPRO AS codigo_produto,
+                P.DESPRO AS descricao_produto,
+                P.CODFAM AS codigo_familia,
+                COALESCE(F.DESFAM, '') AS descricao_familia,
+                P.CODORI AS codigo_origem,
+                COALESCE(O.DESORI, '') AS descricao_origem,
+                P.UNIMED AS unidade_medida,
+                P.TIPPRO AS tipo_produto,
+                P.SITPRO AS situacao_produto,
+                COALESCE(D.CODDER, '') AS codigo_derivacao,
+                COALESCE(D.DESDER, '') AS descricao_derivacao,
+                COALESCE(D.SITDER, '') AS situacao_derivacao
+        """
+    else:
+        from_sql = f"""
+            FROM E075PRO P
+            LEFT JOIN E012FAM F
+                ON F.CODEMP = P.CODEMP
+               AND F.CODFAM = P.CODFAM
+            LEFT JOIN E083ORI O
+                ON O.CODEMP = P.CODEMP
+               AND O.CODORI = P.CODORI
+            {where_sql}
+        """
+
+        select_sql = """
+            SELECT
+                P.CODEMP AS codigo_empresa,
+                P.CODPRO AS codigo_produto,
+                P.DESPRO AS descricao_produto,
+                P.CODFAM AS codigo_familia,
+                COALESCE(F.DESFAM, '') AS descricao_familia,
+                P.CODORI AS codigo_origem,
+                COALESCE(O.DESORI, '') AS descricao_origem,
+                P.UNIMED AS unidade_medida,
+                P.TIPPRO AS tipo_produto,
+                P.SITPRO AS situacao_produto,
+                (
+                    SELECT COUNT(1)
+                    FROM E075DER DX
+                    WHERE DX.CODEMP = P.CODEMP
+                      AND DX.CODPRO = P.CODPRO
+                      AND COALESCE(DX.SITDER, 'A') = 'A'
+                ) AS qtd_derivacoes_ativas
+        """
+
+    sql_total = f"""
+        SELECT COUNT(1)
+        {from_sql}
+    """
+
+    cursor.execute(sql_total, params)
+    total_registros = int(cursor.fetchone()[0] or 0)
+
+    sql_dados = f"""
+        {select_sql}
+        {from_sql}
+        ORDER BY P.CODORI, P.CODFAM, P.CODPRO
+        OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+    """
+
+    params_dados = params + [offset, tamanho_pagina]
+    cursor.execute(sql_dados, params_dados)
+
+    columns = [col[0] for col in cursor.description]
+    rows = cursor.fetchall()
+
+    dados = []
+    for row in rows:
+        item = {}
+        for i, col in enumerate(columns):
+            valor = row[i]
+            if isinstance(valor, str):
+                valor = valor.strip()
+            item[col] = valor
+        dados.append(item)
+
+    conn.close()
+
+    total_paginas = (
+        (total_registros + tamanho_pagina - 1) // tamanho_pagina
+        if total_registros > 0 else 1
+    )
+
+    return {
+        "pagina": pagina,
+        "tamanho_pagina": tamanho_pagina,
+        "total_registros": total_registros,
+        "total_paginas": total_paginas,
+        "filtros": {
+            "codemp": codemp,
+            "codori": codori,
+            "codfam": codfam,
+            "codpro": codpro,
+            "despro": despro,
+            "tippro": tippro,
+            "somente_ativos": somente_ativos,
+            "incluir_derivacoes": incluir_derivacoes,
+        },
+        "dados": dados,
+    }
+
+
+@app.get("/api/cadastros/produtos/origens")
+def listar_origens_produtos(
+    codemp: int = EMPRESA_PADRAO,
+    somente_com_produtos_ativos: bool = True,
+    usuario=Depends(validar_token),
+):
+    """
+    Lista origens para combo/filtro do módulo de produtos.
+    """
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    where_prod = ""
+    if somente_com_produtos_ativos:
+        where_prod = " AND COALESCE(P.SITPRO, 'A') = 'A'"
+
+    sql = f"""
+        SELECT
+            P.CODORI AS codigo_origem,
+            COALESCE(MAX(O.DESORI), '') AS descricao_origem,
+            COUNT(1) AS quantidade_produtos
+        FROM E075PRO P
+        LEFT JOIN E083ORI O
+            ON O.CODEMP = P.CODEMP
+           AND O.CODORI = P.CODORI
+        WHERE P.CODEMP = ?
+          AND COALESCE(P.CODORI, '') <> ''
+          {where_prod}
+        GROUP BY P.CODORI
+        ORDER BY P.CODORI
+    """
+
+    cursor.execute(sql, [codemp])
+    rows = cursor.fetchall()
+    conn.close()
+
+    return {
+        "dados": [
+            {
+                "codigo_origem": (row[0] or "").strip(),
+                "descricao_origem": (row[1] or "").strip(),
+                "quantidade_produtos": int(row[2] or 0),
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.get("/api/cadastros/produtos/familias")
+def listar_familias_produtos(
+    codemp: int = EMPRESA_PADRAO,
+    codori: Optional[str] = None,
+    somente_com_produtos_ativos: bool = True,
+    usuario=Depends(validar_token),
+):
+    """
+    Lista famílias para combo/filtro do módulo de produtos.
+    Pode filtrar pela origem selecionada.
+    """
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    params = [codemp]
+
+    where_sql = """
+        WHERE P.CODEMP = ?
+          AND COALESCE(P.CODFAM, '') <> ''
+    """
+
+    if somente_com_produtos_ativos:
+        where_sql += " AND COALESCE(P.SITPRO, 'A') = 'A'"
+
+    if codori:
+        where_sql += " AND P.CODORI = ?"
+        params.append(codori.strip())
+
+    sql = f"""
+        SELECT
+            P.CODFAM AS codigo_familia,
+            COALESCE(MAX(F.DESFAM), '') AS descricao_familia,
+            COUNT(1) AS quantidade_produtos
+        FROM E075PRO P
+        LEFT JOIN E012FAM F
+            ON F.CODEMP = P.CODEMP
+           AND F.CODFAM = P.CODFAM
+        {where_sql}
+        GROUP BY P.CODFAM
+        ORDER BY P.CODFAM
+    """
+
+    cursor.execute(sql, params)
+    rows = cursor.fetchall()
+    conn.close()
+
+    return {
+        "dados": [
+            {
+                "codigo_familia": (row[0] or "").strip(),
+                "descricao_familia": (row[1] or "").strip(),
+                "quantidade_produtos": int(row[2] or 0),
+            }
+            for row in rows
+        ]
+    }
+
+
 @app.get("/api/familias")
 def listar_familias(
     q: Optional[str] = None,
