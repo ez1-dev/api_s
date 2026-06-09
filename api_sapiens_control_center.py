@@ -14577,22 +14577,18 @@ def _normalizar_pdf_para_a4(caminho: Path):
 
             transform = Transformation()
             if deve_rotacionar:
-                # 1) rotaciona 90deg (conteudo vai para x negativo)
-                # 2) translata por src_h para trazer de volta ao 1o quadrante
-                # 3) escala
-                # 4) translata para posicionar centralizado na A4
                 transform = (
-                    transform
-                    .rotate(90)
-                    .translate(tx=src_h, ty=0)
-                    .scale(escala)
-                    .translate(tx=offset_x, ty=offset_y)
+                    Transformation()
+                    .translate(tx=offset_x, ty=offset_y)  # 4º: centraliza na A4
+                    .scale(escala)                          # 3º: escala
+                    .translate(tx=src_h, ty=0)             # 2º: corrige pós-rotação
+                    .rotate(90)                             # 1º: rotaciona (executado primeiro)
                 )
             else:
                 transform = (
-                    transform
-                    .scale(escala)
-                    .translate(tx=offset_x, ty=offset_y)
+                    Transformation()
+                    .translate(tx=offset_x, ty=offset_y)  # 2º: centraliza
+                    .scale(escala)                          # 1º: escala (executado primeiro)
                 )
 
             pagina_original.add_transformation(transform)
