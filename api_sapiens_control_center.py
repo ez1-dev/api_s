@@ -14514,7 +14514,7 @@ def _normalizar_imagem_para_a4(caminho: Path):
         )
 
 
-def _normalizar_pdf_para_a4(caminho: Path):
+# def _normalizar_pdf_para_a4(caminho: Path):
     """Gera um PDF A4 retrato com cada pagina do PDF original encaixada.
 
     Para cada pagina:
@@ -14622,6 +14622,74 @@ def _normalizar_pdf_para_a4(caminho: Path):
             detail=f"Erro ao normalizar PDF para A4: {str(exc)}",
         )
 
+def _normalizar_pdf_para_a4(caminho: Path):
+    if PdfReader is None or PdfWriter is None or Transformation is None:
+        raise HTTPException(
+            status_code=500,
+            detail="pypdf nao esta instalado. Instale pypdf para normalizar PDFs.",
+        )
+
+    try:
+        reader = PdfReader(str(caminho))
+        writer = PdfWriter()
+
+        for pagina_original in reader.pages:
+            src_w = float(pagina_original.mediabox.width)
+            src_h = float(pagina_original.mediabox.height)
+
+            if src_w <= 0 or src_h <= 0:
+                writer.add_page(pagina_original)
+                continue
+
+            if src_w > src_h:
+                page_w = A4_HEIGHT_PT  # paisagem
+                page_h = A4_WIDTH_PT
+            else:
+                page_w = A4_WIDTH_PT   # retrato
+                page_h = A4_HEIGHT_PT
+
+            area_w = page_w - (A4_MARGIN_PT * 2)
+            area_h = page_h - (A4_MARGIN_PT * 2)
+
+            escala = min(area_w / src_w, area_h / src_h)
+            if escala > 1.0:
+                escala = 1.0
+
+            offset_x = (page_w - (src_w * escala)) / 2.0
+            offset_y = (page_h - (src_h * escala)) / 2.0
+
+            pagina_a4 = writer.add_blank_page(width=page_w, height=page_h)
+
+            transform = (
+                Transformation()
+                .scale(escala)
+                .translate(tx=offset_x / escala, ty=offset_y / escala)
+            )
+
+            pagina_original.add_transformation(transform)
+            pagina_a4.merge_page(pagina_original)
+
+        saida = io.BytesIO()
+        writer.write(saida)
+        saida.seek(0)
+
+        return StreamingResponse(
+            saida,
+            media_type="application/pdf",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Original-File": caminho.name,
+                "X-A4-Normalized": "S",
+                "X-Total-Pages": str(len(reader.pages)),
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao normalizar PDF para A4: {str(exc)}",
+        )
 
 @app.get("/api/producao/ordem-producao/desenho/impressao-a4")
 def obter_desenho_ordem_producao_impressao_a4(
