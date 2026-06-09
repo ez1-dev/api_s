@@ -14514,119 +14514,17 @@ def _normalizar_imagem_para_a4(caminho: Path):
         )
 
 
-# def _normalizar_pdf_para_a4(caminho: Path):
-#     """Gera um PDF A4 retrato com cada pagina do PDF original encaixada.
-
-#     Para cada pagina:
-#     - Detecta se eh paisagem (largura > altura).
-#     - Rotaciona 90deg se necessario.
-#     - Escala proporcionalmente para caber dentro da area util.
-#     - Centraliza sobre uma pagina A4 retrato em branco.
-
-#     O resultado final eh um PDF com a mesma quantidade de paginas do original,
-#     todas em A4 retrato.
-#     """
-#     if PdfReader is None or PdfWriter is None or Transformation is None:
-#         raise HTTPException(
-#             status_code=500,
-#             detail="pypdf nao esta instalado. Instale pypdf para normalizar PDFs.",
-#         )
-
-#     try:
-#         reader = PdfReader(str(caminho))
-#         writer = PdfWriter()
-
-#         area_w = A4_WIDTH_PT - (A4_MARGIN_PT * 2)
-#         area_h = A4_HEIGHT_PT - (A4_MARGIN_PT * 2)
-
-#         paginas_rotacionadas = 0
-
-#         for pagina_original in reader.pages:
-#             src_w = float(pagina_original.mediabox.width)
-#             src_h = float(pagina_original.mediabox.height)
-#             if src_w <= 0 or src_h <= 0:
-#                 # Pagina degenerada — copia sem transformacao
-#                 writer.add_page(pagina_original)
-#                 continue
-
-#             deve_rotacionar = src_w > src_h
-
-#             if deve_rotacionar:
-#                 content_w = src_h
-#                 content_h = src_w
-#                 paginas_rotacionadas += 1
-#             else:
-#                 content_w = src_w
-#                 content_h = src_h
-
-#             escala = min(area_w / content_w, area_h / content_h)
-#             # Nao ampliar conteudo pequeno acima do tamanho real
-#             if escala > 1.0:
-#                 escala = 1.0
-
-#             final_w = content_w * escala
-#             final_h = content_h * escala
-#             offset_x = (A4_WIDTH_PT - final_w) / 2.0
-#             offset_y = (A4_HEIGHT_PT - final_h) / 2.0
-
-#             # Cria pagina A4 retrato em branco
-#             pagina_a4 = writer.add_blank_page(
-#                 width=A4_WIDTH_PT,
-#                 height=A4_HEIGHT_PT,
-#             )
-
-#             transform = Transformation()
-#             if deve_rotacionar:
-#                 # 1) rotaciona 90deg (conteudo vai para x negativo)
-#                 # 2) translata por src_h para trazer de volta ao 1o quadrante
-#                 # 3) escala
-#                 # 4) translata para posicionar centralizado na A4
-#                 transform = (
-#                     transform
-#                     .rotate(90)
-#                     .translate(tx=src_h, ty=0)
-#                     .scale(escala)
-#                     .translate(tx=offset_x, ty=offset_y)
-#                 )
-#             else:
-#                 transform = (
-#                     transform
-#                     .scale(escala)
-#                     .translate(tx=offset_x, ty=offset_y)
-#                 )
-
-#             pagina_original.add_transformation(transform)
-#             pagina_a4.merge_page(pagina_original)
-
-#         saida = io.BytesIO()
-#         writer.write(saida)
-#         saida.seek(0)
-
-#         return StreamingResponse(
-#             saida,
-#             media_type="application/pdf",
-#             headers={
-#                 "Cache-Control": "no-store",
-#                 "X-Original-File": caminho.name,
-#                 "X-A4-Normalized": "S",
-#                 "X-A4-Orientation": "PORTRAIT",
-#                 "X-Pages-Rotated": str(paginas_rotacionadas),
-#                 "X-Total-Pages": str(len(reader.pages)),
-#             },
-#         )
-#     except HTTPException:
-#         raise
-#     except Exception as exc:
-#         raise HTTPException(
-#             status_code=500,
-#             detail=f"Erro ao normalizar PDF para A4: {str(exc)}",
-#         )
 def _normalizar_pdf_para_a4(caminho: Path):
-    """Gera um PDF A4 com cada pagina encaixada respeitando sua orientacao.
+    """Gera um PDF A4 retrato com cada pagina do PDF original encaixada.
 
-    - Pagina paisagem (largura > altura) -> folha A4 paisagem
-    - Pagina retrato (altura > largura)  -> folha A4 retrato
-    - Sem rotacao: o conteudo e apenas escalado e centralizado.
+    Para cada pagina:
+    - Detecta se eh paisagem (largura > altura).
+    - Rotaciona 90deg se necessario.
+    - Escala proporcionalmente para caber dentro da area util.
+    - Centraliza sobre uma pagina A4 retrato em branco.
+
+    O resultado final eh um PDF com a mesma quantidade de paginas do original,
+    todas em A4 retrato.
     """
     if PdfReader is None or PdfWriter is None or Transformation is None:
         raise HTTPException(
@@ -14638,41 +14536,64 @@ def _normalizar_pdf_para_a4(caminho: Path):
         reader = PdfReader(str(caminho))
         writer = PdfWriter()
 
+        area_w = A4_WIDTH_PT - (A4_MARGIN_PT * 2)
+        area_h = A4_HEIGHT_PT - (A4_MARGIN_PT * 2)
+
+        paginas_rotacionadas = 0
+
         for pagina_original in reader.pages:
             src_w = float(pagina_original.mediabox.width)
             src_h = float(pagina_original.mediabox.height)
-
             if src_w <= 0 or src_h <= 0:
+                # Pagina degenerada — copia sem transformacao
                 writer.add_page(pagina_original)
                 continue
 
-            # Folha A4 na mesma orientacao do conteudo
-            if src_w > src_h:
-                page_w = A4_HEIGHT_PT  # 841 — paisagem
-                page_h = A4_WIDTH_PT   # 595
+            deve_rotacionar = src_w > src_h
+
+            if deve_rotacionar:
+                content_w = src_h
+                content_h = src_w
+                paginas_rotacionadas += 1
             else:
-                page_w = A4_WIDTH_PT   # 595 — retrato
-                page_h = A4_HEIGHT_PT  # 841
+                content_w = src_w
+                content_h = src_h
 
-            area_w = page_w - (A4_MARGIN_PT * 2)
-            area_h = page_h - (A4_MARGIN_PT * 2)
-
-            escala = min(area_w / src_w, area_h / src_h)
+            escala = min(area_w / content_w, area_h / content_h)
+            # Nao ampliar conteudo pequeno acima do tamanho real
             if escala > 1.0:
                 escala = 1.0
 
-            final_w = src_w * escala
-            final_h = src_h * escala
-            offset_x = (page_w - final_w) / 2.0
-            offset_y = (page_h - final_h) / 2.0
+            final_w = content_w * escala
+            final_h = content_h * escala
+            offset_x = (A4_WIDTH_PT - final_w) / 2.0
+            offset_y = (A4_HEIGHT_PT - final_h) / 2.0
 
-            pagina_a4 = writer.add_blank_page(width=page_w, height=page_h)
-
-            transform = (
-                Transformation()
-                .translate(tx=offset_x, ty=offset_y)
-                .scale(escala)
+            # Cria pagina A4 retrato em branco
+            pagina_a4 = writer.add_blank_page(
+                width=A4_WIDTH_PT,
+                height=A4_HEIGHT_PT,
             )
+
+            transform = Transformation()
+            if deve_rotacionar:
+                # 1) rotaciona 90deg (conteudo vai para x negativo)
+                # 2) translata por src_h para trazer de volta ao 1o quadrante
+                # 3) escala
+                # 4) translata para posicionar centralizado na A4
+                transform = (
+                    transform
+                    .rotate(90)
+                    .translate(tx=src_h, ty=0)
+                    .scale(escala)
+                    .translate(tx=offset_x, ty=offset_y)
+                )
+            else:
+                transform = (
+                    transform
+                    .scale(escala)
+                    .translate(tx=offset_x, ty=offset_y)
+                )
 
             pagina_original.add_transformation(transform)
             pagina_a4.merge_page(pagina_original)
@@ -14688,6 +14609,8 @@ def _normalizar_pdf_para_a4(caminho: Path):
                 "Cache-Control": "no-store",
                 "X-Original-File": caminho.name,
                 "X-A4-Normalized": "S",
+                "X-A4-Orientation": "PORTRAIT",
+                "X-Pages-Rotated": str(paginas_rotacionadas),
                 "X-Total-Pages": str(len(reader.pages)),
             },
         )
@@ -14698,6 +14621,7 @@ def _normalizar_pdf_para_a4(caminho: Path):
             status_code=500,
             detail=f"Erro ao normalizar PDF para A4: {str(exc)}",
         )
+
 
 @app.get("/api/producao/ordem-producao/desenho/impressao-a4")
 def obter_desenho_ordem_producao_impressao_a4(
