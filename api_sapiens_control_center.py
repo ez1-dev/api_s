@@ -14936,14 +14936,14 @@ def _normalizar_pdf_para_a4(caminho: Path):
                     transform
                     .translate(tx=src_h, ty=0)
                     .rotate(90)
-                    .scale(escala)
                     .translate(tx=offset_x, ty=offset_y)
+                    .scale(escala)
                 )
             else:
                 transform = (
                     transform
-                    .scale(escala)
                     .translate(tx=offset_x, ty=offset_y)
+                    .scale(escala)
                 )
 
             pagina_original.add_transformation(transform)
