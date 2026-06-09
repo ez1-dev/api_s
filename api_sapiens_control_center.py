@@ -14934,8 +14934,8 @@ def _normalizar_pdf_para_a4(caminho: Path):
                 # 4) translata para posicionar centralizado na A4
                 transform = (
                     transform
-                    .rotate(90)
                     .translate(tx=src_h, ty=0)
+                    .rotate(90)
                     .scale(escala)
                     .translate(tx=offset_x, ty=offset_y)
                 )
