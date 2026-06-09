@@ -14637,9 +14637,11 @@ def _normalizar_pdf_para_a4(caminho: Path):
             src_w = float(pagina_original.mediabox.width)
             src_h = float(pagina_original.mediabox.height)
 
-            if src_w <= 0 or src_h <= 0:
-                writer.add_page(pagina_original)
-                continue
+            # Verifica se a pagina tem rotacao definida no PDF
+            rotate = pagina_original.get("/Rotate") or 0
+            if rotate in (90, 270):
+                # Troca largura e altura para refletir a orientacao real
+                src_w, src_h = src_h, src_w
 
             if src_w > src_h:
                 page_w = A4_HEIGHT_PT  # paisagem
