@@ -14609,7 +14609,7 @@ def _normalizar_pdf_para_a4(caminho: Path):
                 "Cache-Control": "no-store",
                 "X-Original-File": caminho.name,
                 "X-A4-Normalized": "S",
-                "X-A4-Orientation": "LANDSCAPE",
+                "X-A4-Orientation": "PORTRAIT",
                 "X-Pages-Rotated": str(paginas_rotacionadas),
                 "X-Total-Pages": str(len(reader.pages)),
             },
