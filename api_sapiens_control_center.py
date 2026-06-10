@@ -17036,7 +17036,7 @@ def listar_opcoes_impressao_ordem_producao(
     num_ped = _to_int_or_none(num_ped, "num_ped", default=None)
     cod_etg = _to_int_or_none(cod_etg, "cod_etg", default=None)
     limite_ops_int = _to_int_or_none(limite_ops, "limite_ops", default=80) or 80
-    limite_ops = max(1, min(limite_ops_int, 200))
+    limite_ops = max(1, min(limite_ops_int, 500))
 
     if cod_ori is not None:
         cod_ori = str(cod_ori).strip() or None
