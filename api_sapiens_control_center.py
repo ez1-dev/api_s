@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Body, Query, Request
+from fastapi import FastAPI, HTTPException, Depends, Body, Query, Request, Header
 from fastapi.responses import HTMLResponse, StreamingResponse, Response, FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,7 +8,7 @@ from jose.exceptions import ExpiredSignatureError, JWTError
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Any, List, Dict
-from pydantic import BaseModel, Field, AliasChoices, ConfigDict
+from pydantic import BaseModel, Field, AliasChoices, ConfigDict, model_validator
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
@@ -59,11 +59,67 @@ import xml.etree.ElementTree as ET
 SECRET_KEY = "ERP_SECRET"
 ALGORITHM = "HS256"
 
-SQL_SERVER = "172.16.137.100"
-SQL_DATABASE = "sapiens"
-SQL_USER = "sapiens"
-SQL_PASSWORD = "0n%lV'g0F94"
+# Defaults de banco = valores que funcionam hoje (on-prem Senior). Servem
+# de FALLBACK quando a variável correspondente não estiver no .env.
+# A SENHA NÃO tem fallback no código — vem somente de *_DB_PASSWORD (.env).
+_ONPREM_DB_DEFAULTS = {
+    "driver":   "ODBC Driver 17 for SQL Server",
+    "host":     "172.16.137.100",
+    "port":     "1433",
+    "database": "sapiens",
+    "user":     "sapiens",
+    "trust":    "yes",
+}
+_CLOUD_DB_DEFAULTS = {
+    "driver":   "ODBC Driver 18 for SQL Server",
+    "host":     "",
+    "port":     "1433",
+    "database": "",
+    "user":     "",
+    "trust":    "yes",
+}
 EMPRESA_PADRAO = 1
+
+# =========================================
+# CARREGAMENTO DO .env
+# O app lê configs via os.getenv(...). Sem este loader, o arquivo .env ao
+# lado do app NÃO é lido (não havia load_dotenv). Usa python-dotenv se
+# estiver disponível; caso contrário, um parser interno sem dependência.
+# override=False: variáveis já definidas no ambiente do processo (ex.: em
+# produção) têm prioridade sobre o .env.
+# =========================================
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_ENV_PATH = os.path.join(_BASE_DIR, ".env")
+
+
+def _carregar_env(env_path: str) -> None:
+    if not os.path.exists(env_path):
+        print(f"[ENV] .env não encontrado em {env_path}")
+        return
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(env_path, override=False)
+        print(f"[ENV] .env carregado via python-dotenv: {env_path}")
+        return
+    except Exception:
+        pass  # sem python-dotenv: usa parser interno abaixo
+    try:
+        with open(env_path, "r", encoding="utf-8") as fh:
+            for raw in fh:
+                linha = raw.strip()
+                if not linha or linha.startswith("#") or "=" not in linha:
+                    continue
+                chave, _, valor = linha.partition("=")
+                chave = chave.strip()
+                valor = valor.strip().strip('"').strip("'")
+                if chave and chave not in os.environ:
+                    os.environ[chave] = valor
+        print(f"[ENV] .env carregado via parser interno: {env_path}")
+    except Exception as exc:
+        print(f"[ENV] falha ao ler .env: {exc}")
+
+
+_carregar_env(_ENV_PATH)
 
 # =========================================
 # CONFIGURAÇÕES SUPABASE (opcional)
@@ -72,6 +128,14 @@ EMPRESA_PADRAO = 1
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_NAVEGACAO_TABLE = os.getenv("SUPABASE_NAVEGACAO_TABLE", "usu_log_navegacao_erp")
+
+# =========================================
+# CRON_SECRET — usado por jobs externos (ex.: pg_cron do Lovable Cloud)
+# para autenticar em endpoints que normalmente exigem JWT de usuario.
+# Se ficar vazio, o caminho alternativo de autenticacao por header
+# x-cron-secret fica desativado (apenas JWT funciona).
+# =========================================
+CRON_SECRET = os.getenv("CRON_SECRET", "")
 
 # =========================================
 # Pasta de desenhos da OP (MCAP700)
@@ -293,21 +357,78 @@ def _persistir_request_log(*, method, path, query, status, dur_ms,
 # CONEXÃO BANCO
 # =========================================
 
-def get_connection():
-    try:
-        conn = pyodbc.connect(
-            "DRIVER={ODBC Driver 17 for SQL Server};"
-            "SERVER=172.16.137.100,1433;"
-            "DATABASE=sapiens;"
-            f"UID={SQL_USER};"
-            f"PWD={SQL_PASSWORD};"
-            "Encrypt=no;"
-            "TrustServerCertificate=yes;",
-            timeout=10
+def _db_env(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return v if v not in (None, "") else default
+
+
+def _db_bool(name: str, default: bool = True) -> bool:
+    v = os.getenv(name)
+    if v is None or v == "":
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on", "y", "s", "sim")
+
+
+def _build_db_conn_str(prefix: str, defaults: dict) -> str:
+    """Monta a connection string a partir do .env ({prefix}_DB_*), com
+    fallback nos defaults (exceto a senha, que só vem do ambiente)."""
+    driver   = _db_env(f"{prefix}_DB_DRIVER",   defaults["driver"])
+    host     = _db_env(f"{prefix}_DB_HOST",     defaults["host"])
+    port     = _db_env(f"{prefix}_DB_PORT",     defaults["port"])
+    database = _db_env(f"{prefix}_DB_DATABASE", defaults["database"])
+    user     = _db_env(f"{prefix}_DB_USER",     defaults["user"])
+    senha    = _db_env(f"{prefix}_DB_PASSWORD", "")   # sem fallback no código
+    trust    = "yes" if _db_bool(f"{prefix}_DB_TRUST_CERTIFICATE",
+                                 defaults["trust"] == "yes") else "no"
+
+    if not host or not database or not user:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Config de banco {prefix} incompleta (host/database/user).",
         )
-        return conn
+    if not senha:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Senha do banco {prefix} ausente. Defina {prefix}_DB_PASSWORD no .env.",
+        )
+
+    porta = f",{port}" if port else ""
+    return (
+        f"DRIVER={{{driver}}};"
+        f"SERVER={host}{porta};"
+        f"DATABASE={database};"
+        f"UID={user};"
+        f"PWD={senha};"
+        "Encrypt=no;"
+        f"TrustServerCertificate={trust};"
+    )
+
+
+def _db_target(target: Optional[str] = None) -> str:
+    """Resolve o alvo da conexão. target explícito vence; senão usa
+    DB_MODE/APP_MODE (cloud só se =='cloud'; hybrid/onprem -> on-prem,
+    pois o ERP Senior é on-premise)."""
+    if target:
+        return target.strip().lower()
+    mode = (os.getenv("DB_MODE") or os.getenv("APP_MODE") or "onprem").strip().lower()
+    return "cloud" if mode == "cloud" else "onprem"
+
+
+def get_connection(target: Optional[str] = None):
+    """Conexão pyodbc com o SQL Server. Lê config do .env ({ONPREM|CLOUD}_DB_*)
+    com fallback nos valores atuais. `target` opcional ('onprem'/'cloud');
+    quando omitido, segue DB_MODE/APP_MODE (default on-prem)."""
+    alvo = _db_target(target)
+    try:
+        if alvo == "cloud":
+            conn_str = _build_db_conn_str("CLOUD", _CLOUD_DB_DEFAULTS)
+        else:
+            conn_str = _build_db_conn_str("ONPREM", _ONPREM_DB_DEFAULTS)
+        return pyodbc.connect(conn_str, timeout=10)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro conexão SQL: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro conexão SQL ({alvo}): {e}")
 
 
 def criar_tabelas_requisicao():
@@ -1123,6 +1244,44 @@ def validar_token_download(
         _raise_token_invalido()
 
 
+def validar_token_ou_cron_secret(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
+    x_cron_secret: Optional[str] = Header(default=None, alias="x-cron-secret"),
+):
+    """Aceita dois caminhos de autenticacao:
+
+    1) JWT de usuario via header `Authorization: Bearer <token>` — fluxo
+       normal disparado pela UI (Lovable, botao manual).
+    2) Header `x-cron-secret: <CRON_SECRET>` — fluxo de job/cron externo
+       (ex.: pg_cron do Lovable Cloud), que nao tem usuario logado.
+
+    Se CRON_SECRET nao estiver definido no ambiente, o caminho 2 fica
+    desativado (apenas JWT funciona). Usa comparacao por igualdade
+    direta — para reforcar, basta trocar por hmac.compare_digest.
+
+    Retorna o `sub` do JWT quando autenticado via token, ou a string
+    `"cron-job"` quando autenticado via secret.
+    """
+    # Caminho 1: JWT
+    token = credentials.credentials if credentials else None
+    if token:
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            return payload["sub"]
+        except ExpiredSignatureError:
+            _raise_token_expirado()
+        except JWTError:
+            _raise_token_invalido()
+        except Exception:
+            _raise_token_invalido()
+
+    # Caminho 2: x-cron-secret
+    if x_cron_secret and CRON_SECRET and x_cron_secret == CRON_SECRET:
+        return "cron-job"
+
+    _raise_token_ausente()
+
+
 class LoginRequest(BaseModel):
     """Aceita aliases comuns para reduzir fricção com clientes que usam
     convenções diferentes (Lovable, integrações, etc). Aliases aceitos:
@@ -1545,6 +1704,431 @@ def pagina_estoque_min_max():
 </html>
     """
     return html_content
+
+
+# ============================================================
+# CADASTROS - PRODUTOS
+# Consulta de produtos ativos por origem/família
+# ============================================================
+
+@app.get("/api/cadastros/produtos")
+def consultar_cadastros_produtos(
+    codemp: int = EMPRESA_PADRAO,
+    codori: Optional[str] = None,
+    codfam: Optional[str] = None,
+    codpro: Optional[str] = None,
+    despro: Optional[str] = None,
+    tippro: Optional[str] = None,
+    somente_ativos: bool = True,
+    incluir_derivacoes: bool = False,
+    pagina: int = 1,
+    tamanho_pagina: int = 100,
+    usuario=Depends(validar_token),
+):
+    """
+    Consulta produtos cadastrados no ERP Senior.
+
+    Filtros principais:
+    - codori: origem do produto
+    - codfam: família do produto
+    - codpro: código do produto
+    - despro: descrição do produto
+    - tippro: tipo do produto
+    - somente_ativos: por padrão busca apenas produtos ativos
+    - incluir_derivacoes: se true, retorna derivações ativas da E075DER
+    """
+
+    if pagina < 1:
+        pagina = 1
+
+    if tamanho_pagina < 1:
+        tamanho_pagina = 100
+
+    if tamanho_pagina > 500:
+        tamanho_pagina = 500
+
+    offset = (pagina - 1) * tamanho_pagina
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    params = [codemp]
+
+    where_sql = """
+        WHERE P.CODEMP = ?
+    """
+
+    if somente_ativos:
+        where_sql += " AND COALESCE(P.SITPRO, 'A') = 'A'"
+
+    if codori:
+        where_sql += " AND P.CODORI = ?"
+        params.append(codori.strip())
+
+    if codfam:
+        where_sql += " AND P.CODFAM = ?"
+        params.append(codfam.strip())
+
+    if codpro:
+        where_sql += " AND P.CODPRO LIKE ?"
+        params.append(f"%{codpro.strip()}%")
+
+    if despro:
+        where_sql += " AND P.DESPRO LIKE ?"
+        params.append(f"%{despro.strip()}%")
+
+    if tippro:
+        where_sql += " AND P.TIPPRO = ?"
+        params.append(tippro.strip())
+
+    if incluir_derivacoes:
+        from_sql = f"""
+            FROM E075PRO P
+            LEFT JOIN E075DER D
+                ON D.CODEMP = P.CODEMP
+               AND D.CODPRO = P.CODPRO
+               AND COALESCE(D.SITDER, 'A') = 'A'
+            LEFT JOIN E012FAM F
+                ON F.CODEMP = P.CODEMP
+               AND F.CODFAM = P.CODFAM
+            LEFT JOIN E083ORI O
+                ON O.CODEMP = P.CODEMP
+               AND O.CODORI = P.CODORI
+            {where_sql}
+        """
+
+        select_sql = """
+            SELECT
+                P.CODEMP AS codigo_empresa,
+                P.CODPRO AS codigo_produto,
+                P.DESPRO AS descricao_produto,
+                P.CODFAM AS codigo_familia,
+                COALESCE(F.DESFAM, '') AS descricao_familia,
+                P.CODORI AS codigo_origem,
+                COALESCE(O.DESORI, '') AS descricao_origem,
+                P.UNIMED AS unidade_medida,
+                P.TIPPRO AS tipo_produto,
+                P.SITPRO AS situacao_produto,
+                COALESCE(D.CODDER, '') AS codigo_derivacao,
+                COALESCE(D.DESDER, '') AS descricao_derivacao,
+                COALESCE(D.SITDER, '') AS situacao_derivacao
+        """
+    else:
+        from_sql = f"""
+            FROM E075PRO P
+            LEFT JOIN E012FAM F
+                ON F.CODEMP = P.CODEMP
+               AND F.CODFAM = P.CODFAM
+            LEFT JOIN E083ORI O
+                ON O.CODEMP = P.CODEMP
+               AND O.CODORI = P.CODORI
+            {where_sql}
+        """
+
+        select_sql = """
+            SELECT
+                P.CODEMP AS codigo_empresa,
+                P.CODPRO AS codigo_produto,
+                P.DESPRO AS descricao_produto,
+                P.CODFAM AS codigo_familia,
+                COALESCE(F.DESFAM, '') AS descricao_familia,
+                P.CODORI AS codigo_origem,
+                COALESCE(O.DESORI, '') AS descricao_origem,
+                P.UNIMED AS unidade_medida,
+                P.TIPPRO AS tipo_produto,
+                P.SITPRO AS situacao_produto,
+                (
+                    SELECT COUNT(1)
+                    FROM E075DER DX
+                    WHERE DX.CODEMP = P.CODEMP
+                      AND DX.CODPRO = P.CODPRO
+                      AND COALESCE(DX.SITDER, 'A') = 'A'
+                ) AS qtd_derivacoes_ativas
+        """
+
+    sql_total = f"""
+        SELECT COUNT(1)
+        {from_sql}
+    """
+
+    cursor.execute(sql_total, params)
+    total_registros = int(cursor.fetchone()[0] or 0)
+
+    sql_dados = f"""
+        {select_sql}
+        {from_sql}
+        ORDER BY P.CODORI, P.CODFAM, P.CODPRO
+        OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+    """
+
+    params_dados = params + [offset, tamanho_pagina]
+    cursor.execute(sql_dados, params_dados)
+
+    columns = [col[0] for col in cursor.description]
+    rows = cursor.fetchall()
+
+    dados = []
+    for row in rows:
+        item = {}
+        for i, col in enumerate(columns):
+            valor = row[i]
+            if isinstance(valor, str):
+                valor = valor.strip()
+            item[col] = valor
+        dados.append(item)
+
+    conn.close()
+
+    total_paginas = (
+        (total_registros + tamanho_pagina - 1) // tamanho_pagina
+        if total_registros > 0 else 1
+    )
+
+    return {
+        "pagina": pagina,
+        "tamanho_pagina": tamanho_pagina,
+        "total_registros": total_registros,
+        "total_paginas": total_paginas,
+        "filtros": {
+            "codemp": codemp,
+            "codori": codori,
+            "codfam": codfam,
+            "codpro": codpro,
+            "despro": despro,
+            "tippro": tippro,
+            "somente_ativos": somente_ativos,
+            "incluir_derivacoes": incluir_derivacoes,
+        },
+        "dados": dados,
+    }
+
+
+@app.get("/api/cadastros/produtos/origens")
+def listar_origens_produtos(
+    codemp: int = EMPRESA_PADRAO,
+    somente_com_produtos_ativos: bool = True,
+    usuario=Depends(validar_token),
+):
+    """
+    Lista origens para combo/filtro do módulo de produtos.
+    """
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    where_prod = ""
+    if somente_com_produtos_ativos:
+        where_prod = " AND COALESCE(P.SITPRO, 'A') = 'A'"
+
+    sql = f"""
+        SELECT
+            P.CODORI AS codigo_origem,
+            COALESCE(MAX(O.DESORI), '') AS descricao_origem,
+            COUNT(1) AS quantidade_produtos
+        FROM E075PRO P
+        LEFT JOIN E083ORI O
+            ON O.CODEMP = P.CODEMP
+           AND O.CODORI = P.CODORI
+        WHERE P.CODEMP = ?
+          AND COALESCE(P.CODORI, '') <> ''
+          {where_prod}
+        GROUP BY P.CODORI
+        ORDER BY P.CODORI
+    """
+
+    cursor.execute(sql, [codemp])
+    rows = cursor.fetchall()
+    conn.close()
+
+    return {
+        "dados": [
+            {
+                "codigo_origem": (row[0] or "").strip(),
+                "descricao_origem": (row[1] or "").strip(),
+                "quantidade_produtos": int(row[2] or 0),
+            }
+            for row in rows
+        ]
+    }
+
+
+# ============================================================
+# CADASTROS - PRODUTOS - FILTROS PRE-CARREGADOS
+# ============================================================
+
+@app.get("/api/cadastros/produtos/filtros")
+def carregar_filtros_produtos(
+    codemp: int = EMPRESA_PADRAO,
+    somente_ativos: bool = True,
+    usuario=Depends(validar_token),
+):
+    """
+    Carrega os combos iniciais da tela Consulta de Produtos:
+    - Origens com produtos cadastrados
+    - Famílias com produtos cadastrados
+
+    Usado pelo Lovable ao abrir a tela.
+    """
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    filtro_ativo = ""
+    if somente_ativos:
+        filtro_ativo = " AND COALESCE(P.SITPRO, 'A') = 'A'"
+
+    # Origens
+    sql_origens = f"""
+        SELECT
+            P.CODORI AS codigo_origem,
+            COALESCE(MAX(O.DESORI), '') AS descricao_origem,
+            COUNT(1) AS quantidade_produtos
+        FROM E075PRO P
+        LEFT JOIN E083ORI O
+            ON O.CODEMP = P.CODEMP
+           AND O.CODORI = P.CODORI
+        WHERE P.CODEMP = ?
+          AND COALESCE(P.CODORI, '') <> ''
+          {filtro_ativo}
+        GROUP BY P.CODORI
+        ORDER BY P.CODORI
+    """
+
+    cursor.execute(sql_origens, [codemp])
+    rows_origens = cursor.fetchall()
+
+    origens = []
+    for row in rows_origens:
+        codigo = (row[0] or "").strip()
+        descricao = (row[1] or "").strip()
+
+        label = codigo
+        if descricao:
+            label = f"{codigo} - {descricao}"
+
+        origens.append({
+            "codigo_origem": codigo,
+            "descricao_origem": descricao,
+            "quantidade_produtos": int(row[2] or 0),
+            "value": codigo,
+            "label": label,
+        })
+
+    # Famílias
+    sql_familias = f"""
+        SELECT
+            P.CODFAM AS codigo_familia,
+            COALESCE(MAX(F.DESFAM), '') AS descricao_familia,
+            COUNT(1) AS quantidade_produtos
+        FROM E075PRO P
+        LEFT JOIN E012FAM F
+            ON F.CODEMP = P.CODEMP
+           AND F.CODFAM = P.CODFAM
+        WHERE P.CODEMP = ?
+          AND COALESCE(P.CODFAM, '') <> ''
+          {filtro_ativo}
+        GROUP BY P.CODFAM
+        ORDER BY P.CODFAM
+    """
+
+    cursor.execute(sql_familias, [codemp])
+    rows_familias = cursor.fetchall()
+
+    familias = []
+    for row in rows_familias:
+        codigo = (row[0] or "").strip()
+        descricao = (row[1] or "").strip()
+
+        label = codigo
+        if descricao:
+            label = f"{codigo} - {descricao}"
+
+        familias.append({
+            "codigo_familia": codigo,
+            "descricao_familia": descricao,
+            "quantidade_produtos": int(row[2] or 0),
+            "value": codigo,
+            "label": label,
+        })
+
+    conn.close()
+
+    return {
+        "codemp": codemp,
+        "somente_ativos": somente_ativos,
+        "origens": origens,
+        "familias": familias,
+    }
+
+
+@app.get("/api/cadastros/produtos/familias")
+def listar_familias_produtos(
+    codemp: int = EMPRESA_PADRAO,
+    codori: Optional[str] = None,
+    somente_ativos: bool = True,
+    usuario=Depends(validar_token),
+):
+    """
+    Lista famílias para combo/filtro do módulo de produtos.
+    Pode filtrar pela origem selecionada.
+    """
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    params = [codemp]
+
+    where_sql = """
+        WHERE P.CODEMP = ?
+          AND COALESCE(P.CODFAM, '') <> ''
+    """
+
+    if somente_ativos:
+        where_sql += " AND COALESCE(P.SITPRO, 'A') = 'A'"
+
+    if codori:
+        where_sql += " AND P.CODORI = ?"
+        params.append(codori.strip())
+
+    sql = f"""
+        SELECT
+            P.CODFAM AS codigo_familia,
+            COALESCE(MAX(F.DESFAM), '') AS descricao_familia,
+            COUNT(1) AS quantidade_produtos
+        FROM E075PRO P
+        LEFT JOIN E012FAM F
+            ON F.CODEMP = P.CODEMP
+           AND F.CODFAM = P.CODFAM
+        {where_sql}
+        GROUP BY P.CODFAM
+        ORDER BY P.CODFAM
+    """
+
+    cursor.execute(sql, params)
+    rows = cursor.fetchall()
+    conn.close()
+
+    dados = []
+
+    for row in rows:
+        codigo = (row[0] or "").strip()
+        descricao = (row[1] or "").strip()
+
+        label = codigo
+        if descricao:
+            label = f"{codigo} - {descricao}"
+
+        dados.append({
+            "codigo_familia": codigo,
+            "descricao_familia": descricao,
+            "quantidade_produtos": int(row[2] or 0),
+            "value": codigo,
+            "label": label,
+        })
+
+    return {
+        "dados": dados
+    }
 
 
 @app.get("/api/familias")
@@ -4623,6 +5207,7 @@ def consultar_painel_compras(
     agrupar_por_fornecedor: bool = False,
     pagina: int = 1,
     tamanho_pagina: int = 100,
+    todos: bool = False,
     usuario=Depends(validar_token)
 ):
     if pagina < 1:
@@ -4631,8 +5216,14 @@ def consultar_painel_compras(
     if tamanho_pagina < 1:
         tamanho_pagina = 100
 
-    if tamanho_pagina > 100:
-        tamanho_pagina = 100
+    # Cap elevado de 100 -> 1000 por página. Com todos=True a paginação
+    # é ignorada e a resposta traz TODOS os registros filtrados de uma vez
+    # (o tamanho efetivo da busca é definido após contar total_registros).
+    if tamanho_pagina > 1000:
+        tamanho_pagina = 1000
+
+    if todos:
+        pagina = 1
 
     offset = (pagina - 1) * tamanho_pagina
 
@@ -5353,7 +5944,9 @@ def consultar_painel_compras(
 
         cursor.execute(sql_total, params_where)
         total_registros = cursor.fetchone()[0]
-        cursor.execute(sql_dados, params_where + [offset, tamanho_pagina])
+        fetch_offset = 0 if todos else offset
+        fetch_size = (total_registros if todos else tamanho_pagina) or 1
+        cursor.execute(sql_dados, params_where + [fetch_offset, fetch_size])
     else:
         sql_total = cte_sql + f"SELECT COUNT(*) FROM Q WHERE {where_sql}"
         sql_dados = cte_sql + f"""
@@ -5368,7 +5961,9 @@ def consultar_painel_compras(
 
         cursor.execute(sql_total, params_where)
         total_registros = cursor.fetchone()[0]
-        cursor.execute(sql_dados, params_where + [offset, tamanho_pagina])
+        fetch_offset = 0 if todos else offset
+        fetch_size = (total_registros if todos else tamanho_pagina) or 1
+        cursor.execute(sql_dados, params_where + [fetch_offset, fetch_size])
 
     rows = cursor.fetchall()
     columns = [col[0] for col in cursor.description]
@@ -5416,9 +6011,30 @@ def consultar_painel_compras(
                 else:
                     totais[col] = v
     except Exception as exc:
-        # Best-effort: nunca derruba a request por causa dos cards
+        # Best-effort: nunca derruba a request por causa dos cards.
+        # Em vez de devolver {} (que faz o frontend tratar como
+        # "sem agregados"), devolve a estrutura padrão zerada com as
+        # MESMAS chaves do caminho de sucesso + chave de diagnóstico,
+        # preservando o total_registros já calculado.
         print(f"[painel_compras] falha ao calcular totais: {exc}")
-        totais = {}
+        totais = {
+            'qtd_registros': total_registros,
+            'total_registros': total_registros,
+            'total_linhas': total_registros,
+            'qtd_fornecedores': 0,
+            'qtd_itens': 0,
+            'qtd_ocs': 0,
+            'valor_total_oc': 0,
+            'valor_bruto_total': 0,
+            'valor_desconto_total': 0,
+            'valor_impostos_total': 0,
+            'valor_pendente': 0,
+            'valor_atendido': 0,
+            'itens_pendentes': 0,
+            'itens_atrasados': 0,
+            'maior_atraso_dias': 0,
+            'erro_totais': str(exc)[:500],
+        }
 
     conn.close()
 
@@ -5440,14 +6056,21 @@ def consultar_painel_compras(
 
         dados.append(item)
 
-    total_paginas = (total_registros + tamanho_pagina - 1) // tamanho_pagina if total_registros > 0 else 1
+    if todos:
+        # Tudo numa página só: reporta consistência para o frontend.
+        total_paginas = 1
+        tamanho_pagina_resp = total_registros or len(dados)
+    else:
+        total_paginas = (total_registros + tamanho_pagina - 1) // tamanho_pagina if total_registros > 0 else 1
+        tamanho_pagina_resp = tamanho_pagina
 
     return {
         'pagina': pagina,
-        'tamanho_pagina': tamanho_pagina,
+        'tamanho_pagina': tamanho_pagina_resp,
         'total_registros': total_registros,
         'total_paginas': total_paginas,
         'agrupar_por_fornecedor': agrupar_por_fornecedor,
+        'todos': todos,
         'dados': dados,
         'totais': totais,
     }
@@ -18547,6 +19170,7 @@ def pagina_principal():
           <div class="checkbox-box"><input type="checkbox" id="somentePendentesPainelCompras" checked /><label for="somentePendentesPainelCompras">Somente pendentes</label></div>
           <div class="checkbox-box"><input type="checkbox" id="agruparFornecedorPainelCompras" /><label for="agruparFornecedorPainelCompras">Agrupar por fornecedor</label></div>
           <div class="checkbox-box"><input type="checkbox" id="mostrarValorTotalOcPainelCompras" /><label for="mostrarValorTotalOcPainelCompras">Mostrar valor total da OC</label></div>
+          <div class="field"><label for="registrosPainelCompras">Registros</label><select id="registrosPainelCompras"><option value="100">100 por página</option><option value="500">500 por página</option><option value="1000">1000 por página</option><option value="TODOS">Todos (sem paginação)</option></select></div>
           <div style="display:flex; gap:12px; flex-wrap:wrap;"><button class="btn btn-primary" onclick="buscarPainelCompras(1)">Consultar</button><button class="btn btn-secondary" onclick="exportarPainelComprasExcel()">Exportar Excel</button><button class="btn btn-secondary" onclick="limparTelaPainelCompras()">Limpar</button></div>
         </div>
         <div class="msg" id="mensagemBuscaPainelCompras">Painel para compras de produtos e serviços, com visão analítica, dashboard, agrupamento por fornecedor e filtro específico por código de produto.</div>
@@ -19654,6 +20278,7 @@ def pagina_principal():
     const somentePendentesPainelCompras = document.getElementById('somentePendentesPainelCompras');
     const agruparFornecedorPainelCompras = document.getElementById('agruparFornecedorPainelCompras');
     const mostrarValorTotalOcPainelCompras = document.getElementById('mostrarValorTotalOcPainelCompras');
+    const registrosPainelCompras = document.getElementById('registrosPainelCompras');
 
     const fornecedorNotasRec = document.getElementById('fornecedorNotasRec');
     const numeroNfNotasRec = document.getElementById('numeroNfNotasRec');
@@ -20937,6 +21562,7 @@ const dashGraficoEntregasPainelCompras = document.getElementById('dashGraficoEnt
       somentePendentesPainelCompras.checked = true;
       agruparFornecedorPainelCompras.checked = false;
       mostrarValorTotalOcPainelCompras.checked = false;
+      if (registrosPainelCompras) registrosPainelCompras.value = '100';
       paginaAtualPainelCompras = 1;
       totalPaginasPainelCompras = 1;
       painelComprasAgrupado = false;
@@ -21632,7 +22258,16 @@ const dashGraficoEntregasPainelCompras = document.getElementById('dashGraficoEnt
       params.append('somente_pendentes', considerarSomentePendentes ? 'true' : 'false');
       params.append('agrupar_por_fornecedor', agruparFornecedorPainelCompras.checked ? 'true' : 'false');
       params.append('pagina', String(pagina));
-      params.append('tamanho_pagina', String(TAMANHO_PAGINA));
+      const selRegistros = (registrosPainelCompras && registrosPainelCompras.value) || String(TAMANHO_PAGINA);
+      if (selRegistros === 'TODOS') {
+        // Modo "Todos": backend ignora paginação e retorna tudo de uma vez.
+        // tamanho_pagina vai como base (1000) só por compatibilidade.
+        params.append('tamanho_pagina', '1000');
+        params.append('todos', 'true');
+      } else {
+        params.append('tamanho_pagina', selRegistros);
+        params.append('todos', 'false');
+      }
       return params.toString();
     }
 
@@ -21765,9 +22400,58 @@ function renderDashboardPainelCompras(dashboard) {
     // KPIs do Painel de Compras agora vêm dos endpoints agregados
     // (sem paginação). Trocar de página NUNCA recalcula esses valores.
     function atualizarKpisPainelComprasGlobais(totais = {}, dashboard = {}) {
-      const kpisDash = (dashboard && dashboard.kpis) ? dashboard.kpis : {};
-      // Prioriza dashboard (mais rico). Cai em totais se dashboard ausente.
-      const base = Object.keys(kpisDash).length ? kpisDash : (totais || {});
+      // Aceita os três formatos, em ordem de prioridade:
+      //  1) dashboard.kpis_dashboard (shape novo V2)
+      //  2) dashboard.kpis          (shape legado)
+      //  3) totais                  (agregados da própria lista)
+      const kpisV2 = (dashboard && dashboard.kpis_dashboard) ? dashboard.kpis_dashboard : {};
+      const kpisLegado = (dashboard && dashboard.kpis) ? dashboard.kpis : {};
+      const totaisLista = totais || {};
+
+      let base = {};
+      if (Object.keys(kpisV2).length) {
+        // V2 não traz impostos/desconto — completa com a lista.
+        base = {
+          total_registros: kpisV2.quantidade_itens || 0,
+          total_linhas: kpisV2.quantidade_itens || 0,
+          total_fornecedores: kpisV2.quantidade_fornecedores || 0,
+          valor_liquido_total: kpisV2.valor_comprado || 0,
+          valor_pendente_total: kpisV2.valor_pendente || 0,
+          valor_recebido: kpisV2.valor_recebido || 0,
+          quantidade_ocs: kpisV2.quantidade_ocs || 0,
+          quantidade_itens: kpisV2.quantidade_itens || 0,
+          quantidade_fornecedores: kpisV2.quantidade_fornecedores || 0,
+          ticket_medio_oc: kpisV2.ticket_medio_oc || 0,
+          percentual_recebido: kpisV2.percentual_recebido || 0,
+          valor_impostos_total: totaisLista.valor_impostos_total || 0,
+          valor_desconto_total: totaisLista.valor_desconto_total || 0,
+        };
+      } else if (Object.keys(kpisLegado).length) {
+        base = kpisLegado;
+      } else {
+        base = totaisLista;
+      }
+
+      const temAgregado =
+        Object.keys(base).length > 0 &&
+        (
+          Number(base.total_registros || base.total_linhas
+            || base.quantidade_itens || base.qtd_registros || 0) > 0 ||
+          Number(base.valor_liquido_total || base.valor_comprado
+            || base.valor_total_oc || 0) !== 0 ||
+          Number(base.valor_pendente_total || base.valor_pendente || 0) !== 0
+        );
+
+      if (!temAgregado) {
+        kpiRegistrosPainelCompras.textContent = '0';
+        kpiRegistrosPainelComprasSub.textContent = 'Sem agregados para os filtros atuais';
+        kpiFornecedoresPainelCompras.textContent = '0';
+        kpiValorLiquidoPainelCompras.textContent = formatarNumero(0, 2);
+        kpiValorPendentePainelCompras.textContent = formatarNumero(0, 2);
+        kpiImpostosPainelCompras.textContent = formatarNumero(0, 2);
+        kpiDescontoPainelCompras.textContent = formatarNumero(0, 2);
+        return;
+      }
 
       kpiRegistrosPainelCompras.textContent = formatarNumero(
         base.total_registros || base.total_linhas
@@ -21783,7 +22467,8 @@ function renderDashboardPainelCompras(dashboard) {
       );
 
       kpiValorLiquidoPainelCompras.textContent = formatarNumero(
-        base.valor_liquido_total || base.valor_comprado || 0, 2
+        base.valor_liquido_total || base.valor_comprado
+        || base.valor_total_oc || 0, 2
       );
       kpiValorPendentePainelCompras.textContent = formatarNumero(
         base.valor_pendente_total || base.valor_pendente || 0, 2
@@ -21797,17 +22482,27 @@ function renderDashboardPainelCompras(dashboard) {
       );
     }
 
-    function atualizarPaginacaoPainelCompras(totalRegs, pagina, totalPags) {
+    function atualizarPaginacaoPainelCompras(totalRegs, pagina, totalPags, opcoes = {}) {
       paginaAtualPainelCompras = pagina || 1;
       totalPaginasPainelCompras = totalPags || 1;
-      if (totalRegs > 0) {
-        paginacaoPainelCompras.style.display = 'flex';
-        infoPaginacaoPainelCompras.textContent = `Página ${paginaAtualPainelCompras} de ${totalPaginasPainelCompras} | ${totalRegs} registro(s)`;
-        btnAnteriorPainelCompras.disabled = paginaAtualPainelCompras <= 1;
-        btnProximaPainelCompras.disabled = paginaAtualPainelCompras >= totalPaginasPainelCompras;
-      } else {
+      if (totalRegs <= 0) {
         paginacaoPainelCompras.style.display = 'none';
+        return;
       }
+      if (opcoes.todos) {
+        // Modo "Todos": sem navegação de páginas; mostra o quanto foi carregado.
+        const exibidos = Number(opcoes.exibidos || 0);
+        paginacaoPainelCompras.style.display = 'flex';
+        infoPaginacaoPainelCompras.textContent =
+          `Exibindo ${formatarNumero(exibidos, 0)} de ${formatarNumero(totalRegs, 0)} registros filtrados`;
+        btnAnteriorPainelCompras.disabled = true;
+        btnProximaPainelCompras.disabled = true;
+        return;
+      }
+      paginacaoPainelCompras.style.display = 'flex';
+      infoPaginacaoPainelCompras.textContent = `Página ${paginaAtualPainelCompras} de ${totalPaginasPainelCompras} | ${totalRegs} registro(s)`;
+      btnAnteriorPainelCompras.disabled = paginaAtualPainelCompras <= 1;
+      btnProximaPainelCompras.disabled = paginaAtualPainelCompras >= totalPaginasPainelCompras;
     }
 
     function irParaPaginaPainelCompras(pagina) {
@@ -21949,7 +22644,12 @@ function renderDashboardPainelCompras(dashboard) {
         // KPIs vêm SEMPRE dos agregados, nunca da página atual.
         atualizarKpisPainelComprasGlobais(retorno.totais || {}, dashboard || {});
         aplicarFiltroListaPainelCompras();
-        atualizarPaginacaoPainelCompras(retorno.total_registros || 0, retorno.pagina || 1, retorno.total_paginas || 1);
+        atualizarPaginacaoPainelCompras(
+          retorno.total_registros || 0,
+          retorno.pagina || 1,
+          retorno.total_paginas || 1,
+          { todos: Boolean(retorno.todos), exibidos: dadosPainelComprasPagina.length }
+        );
         mensagemBuscaPainelCompras.textContent = painelComprasAgrupado ? 'Consulta agrupada por fornecedor e dashboard realizada com sucesso.' : 'Consulta analítica e dashboard de compras realizada com sucesso.';
       } catch (erro) {
         painelComprasAgrupado = Boolean(agruparFornecedorPainelCompras.checked);
@@ -25160,7 +25860,7 @@ def _where_faturamento_genius(
     where = f"""
         WHERE NFV.CODEMP = ?
           AND COALESCE(NFV.SITNFV, '') <> '3'
-          AND FORMAT(NFV.DATEMI, 'yyyyMM') BETWEEN ? AND ?
+          AND FORMAT(NFV.DATEMI, 'yyyyMM') BETWEEN $[ANOMES_INI] AND $[ANOMES_FIM]
           AND (
                 TNS.VENFAT = 'S'
                 OR IPV.TNSPRO IN ({GENIUS_TNS_DEVOLUCAO_SQL})
@@ -29727,6 +30427,4666 @@ def etl_listar_execucoes(
 
 
 # ============================================================
+# ETL V2 — CAMADA DINÂMICA (tarefas / ações / logs) tipo UpQuery
+# ------------------------------------------------------------
+# NÃO substitui o V1 acima (ATU_COMPRAS/ATU_RECEBIMENTOS continuam
+# valendo via /api/etl/executar). Esta camada lê a estrutura dinâmica
+# (etl_tarefas -> etl_acoes) do Supabase e executa as ações em ordem.
+#
+# Pré-requisito de banco (rodar o DDL fornecido junto desta entrega):
+#   - tabelas novas: etl_tarefas, etl_acoes, etl_acao_execucoes, bi_faturamento
+#   - colunas V2 adicionadas em etl_execucoes: tarefa_id, nome_tarefa,
+#     parametros (jsonb), finalizado_em, total_linhas, mensagem, erro
+#   - etl_logs reaproveitado (ordenação por data_hora, coluna já existente)
+# ============================================================
+
+# Alias de compatibilidade: o desenho V2 referencia _etl_log; o logger
+# real (V1) é _supabase_log. Mantemos um único ponto de gravação.
+def _etl_log(execucao_id, mensagem: str, nivel: str = "INFO",
+             detalhe: Optional[Any] = None):
+    return _supabase_log(execucao_id, mensagem, nivel, detalhe)
+
+
+def _ts() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
+class EtlExecutarPeriodoPayload(BaseModel):
+    anomes_ini: Optional[int] = None
+    anomes_fim: Optional[int] = None
+    data_ini: Optional[str] = None
+    data_fim: Optional[str] = None
+    acionado_por: Optional[str] = "MANUAL"
+    parametros: Dict[str, Any] = Field(default_factory=dict)
+
+
+# ----- Helpers REST genéricos do Supabase -----------------------------
+
+def _sb_get(table: str, params: dict = None):
+    _supabase_required()
+    resp = requests.get(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        params=params or {},
+        headers=_supabase_headers("return=representation"),
+        timeout=30,
+    )
+    if resp.status_code not in (200, 206):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase GET {table}: {resp.status_code} {(resp.text or '')[:500]}",
+        )
+    return resp.json()
+
+
+def _sb_post(table: str, payload, prefer: str = "return=representation"):
+    _supabase_required()
+    resp = requests.post(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        json=payload,
+        headers=_supabase_headers(prefer),
+        timeout=60,
+    )
+    if resp.status_code not in (200, 201, 204):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase POST {table}: {resp.status_code} {(resp.text or '')[:500]}",
+        )
+    return resp.json() if resp.text else []
+
+
+def _sb_patch(table: str, filters: dict, payload: dict,
+              prefer: str = "return=minimal"):
+    _supabase_required()
+    resp = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        params=filters,
+        json=payload,
+        headers=_supabase_headers(prefer),
+        timeout=60,
+    )
+    if resp.status_code not in (200, 204):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase PATCH {table}: {resp.status_code} {(resp.text or '')[:500]}",
+        )
+    return resp.json() if resp.text else []
+
+
+def _sb_delete(table: str, params):
+    """DELETE no Supabase. `params` deve trazer SEMPRE um filtro (lista de
+    tuplas (coluna, 'op.valor') ou dict) — sem filtro o PostgREST apagaria
+    a tabela inteira. Usado na carga por período (DELETE + INSERT)."""
+    _supabase_required()
+    if not params:
+        raise HTTPException(status_code=400, detail="DELETE sem filtro bloqueado.")
+    resp = requests.delete(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        params=params,
+        headers=_supabase_headers("return=minimal"),
+        timeout=120,
+    )
+    if resp.status_code not in (200, 204):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase DELETE {table}: {resp.status_code} {(resp.text or '')[:500]}",
+        )
+    return True
+
+
+def _sb_rpc(fn: str, payload: dict):
+    """Chama uma função (RPC) do Postgres via PostgREST: /rest/v1/rpc/<fn>.
+    Usado para a carga transacional (delete+insert numa só transação)."""
+    _supabase_required()
+    resp = requests.post(
+        f"{SUPABASE_URL}/rest/v1/rpc/{fn}",
+        json=payload,
+        headers=_supabase_headers("return=representation"),
+        timeout=300,
+    )
+    if resp.status_code not in (200, 201, 204):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase RPC {fn}: {resp.status_code} {(resp.text or '')[:500]}",
+        )
+    return resp.json() if resp.text else None
+
+
+def _etl_single_row(retorno):
+    """Normaliza retorno do Supabase: dict | list[dict] | None -> dict."""
+    if retorno is None:
+        return {}
+    if isinstance(retorno, list):
+        return (retorno[0] or {}) if retorno else {}
+    if isinstance(retorno, dict):
+        return retorno
+    return {"valor": retorno}
+
+
+def _etl_extrair_execucao_id(retorno):
+    """Extrai o id da execução criada (tolerante ao formato do retorno).
+    Mantém o tipo original (bigint OU uuid) — não força int, pois é usado
+    em filtros eq.{id} que aceitam ambos."""
+    row = _etl_single_row(retorno)
+    valor = row.get("id") or row.get("id_execucao") or row.get("execucao_id")
+    if valor is None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Execução criada, mas sem ID retornado: {row}",
+        )
+    return valor
+
+
+def _etl_normalizar_resultado_rpc_carga(retorno):
+    """Normaliza o retorno da RPC etl_carga_periodo. Aceita:
+      - {"ok": true, "inseridos": N, "deletados": M}
+      - [{"etl_carga_periodo": {...}}]  (alguns formatos do PostgREST)
+      - inteiro puro (compat) -> {"inseridos": N}"""
+    if isinstance(retorno, int):
+        return {"ok": True, "inseridos": retorno, "deletados": 0}
+    row = _etl_single_row(retorno)
+    if isinstance(row, dict) and "etl_carga_periodo" in row:
+        row = row.get("etl_carga_periodo") or {}
+    if isinstance(row, int):
+        return {"ok": True, "inseridos": row, "deletados": 0}
+    if not isinstance(row, dict):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Retorno inválido da RPC etl_carga_periodo: {retorno}",
+        )
+    return row
+
+
+# ----- Acesso à estrutura dinâmica ------------------------------------
+
+def _etl_buscar_tarefa(nome_tarefa: str):
+    nome = (nome_tarefa or "").upper().strip()
+    rows = _sb_get("etl_tarefas", {
+        "select": "*",
+        "nome_tarefa": f"eq.{nome}",
+        "limit": "1",
+    })
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Tarefa não encontrada: {nome}")
+    return rows[0]
+
+
+def _etl_buscar_acoes(tarefa_id, somente_ativas: bool = True):
+    params = {
+        "select": "*",
+        "tarefa_id": f"eq.{tarefa_id}",
+        "order": "ordem.asc",
+    }
+    if somente_ativas:
+        params["ativa"] = "eq.true"
+    return _sb_get("etl_acoes", params)
+
+
+# ----- Endpoints de consulta ------------------------------------------
+
+@app.get("/api/etl/tarefas")
+def etl_tarefas(usuario=Depends(validar_token)):
+    # Ordena por coluna existente na tabela publicada (não tem grupo/ordem).
+    dados = _sb_get("etl_tarefas", {
+        "select": "*",
+        "order": "nome_tarefa.asc",
+    })
+    return {"dados": dados}
+
+
+@app.get("/api/etl/tarefas/{nome_tarefa}/detalhe")
+def etl_tarefa_detalhe(nome_tarefa: str, usuario=Depends(validar_token)):
+    tarefa = _etl_buscar_tarefa(nome_tarefa)
+    acoes = _etl_buscar_acoes(tarefa["id"], somente_ativas=False)
+    execucoes = _sb_get("etl_execucoes", {
+        "select": "*",
+        "nome_tarefa": f"eq.{tarefa['nome_tarefa']}",
+        "order": "iniciado_em.desc",
+        "limit": "20",
+    })
+    return {"tarefa": tarefa, "acoes": acoes, "execucoes": execucoes}
+
+
+@app.get("/api/etl/tarefas/{nome_tarefa}/acoes")
+def etl_tarefa_acoes(nome_tarefa: str, usuario=Depends(validar_token)):
+    tarefa = _etl_buscar_tarefa(nome_tarefa)
+    acoes = _etl_buscar_acoes(tarefa["id"], somente_ativas=False)
+    return {"tarefa": tarefa["nome_tarefa"], "dados": acoes}
+
+
+@app.get("/api/etl/execucoes/{execucao_id}/logs")
+def etl_execucao_logs(execucao_id: str, usuario=Depends(validar_token)):
+    acoes = _sb_get("etl_acao_execucoes", {
+        "select": "*",
+        "execucao_id": f"eq.{execucao_id}",
+        "order": "ordem.asc",
+    })
+    # etl_logs reaproveitado do V1: coluna de tempo é data_hora.
+    logs = _sb_get("etl_logs", {
+        "select": "*",
+        "execucao_id": f"eq.{execucao_id}",
+        "order": "data_hora.asc",
+    })
+    return {"acoes": acoes, "logs": logs}
+
+
+# ----- Placeholders seguros para SQL de ações ($[NOME]) ---------------
+# Fonte única: os templates SQL usam $[NOME]; tanto a execução quanto o
+# preview (/testar-sql) renderizam para ? + binds posicionais validados.
+
+ETL_PLACEHOLDER_SPECS = {
+    "ANOMES_INI": {"regex": r"^\d{6}$",          "tipo": "str", "exemplo": "202605"},
+    "ANOMES_FIM": {"regex": r"^\d{6}$",          "tipo": "str", "exemplo": "202605"},
+    "DATA_INI":   {"regex": r"^\d{4}-\d{2}-\d{2}$", "tipo": "str", "exemplo": "2026-05-01"},
+    "DATA_FIM":   {"regex": r"^\d{4}-\d{2}-\d{2}$", "tipo": "str", "exemplo": "2026-05-31"},
+    "CODEMP":     {"regex": r"^\d+$",            "tipo": "int", "exemplo": 1},
+    "CODFIL":     {"regex": r"^\d+$",            "tipo": "int", "exemplo": 1},
+    "CODEMP_LIST": {"regex": r"^\d+(,\d+)*$", "tipo": "list_int", "exemplo": [1, 2]},
+    "CODFIL_LIST": {"regex": r"^\d+(,\d+)*$", "tipo": "list_int", "exemplo": [1, 2]},
+}
+
+ETL_PLACEHOLDER_RE = re.compile(r"\$\[([A-Z0-9_]+)\]")
+
+ETL_DANGEROUS_SQL_RE = re.compile(
+    r"\b("
+    r"INSERT|UPDATE|DELETE|MERGE|DROP|ALTER|TRUNCATE|CREATE|"
+    r"EXEC|EXECUTE|CALL|GRANT|REVOKE|COMMIT|ROLLBACK|"
+    r"BACKUP|RESTORE|KILL|SHUTDOWN|USE"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _etl_sql_sem_comentarios(sql: str) -> str:
+    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+    sql = re.sub(r"--.*?$", " ", sql, flags=re.MULTILINE)
+    return sql
+
+
+def _etl_sql_normalizar(sql: str) -> str:
+    sql = (sql or "").strip()
+    while sql.endswith(";"):
+        sql = sql[:-1].strip()
+    return sql
+
+
+def _etl_validar_select(sql: str) -> None:
+    limpo = _etl_sql_normalizar(_etl_sql_sem_comentarios(sql).strip())
+    if not limpo:
+        raise HTTPException(status_code=400, detail="SQL vazio.")
+    if ";" in limpo:
+        raise HTTPException(status_code=400,
+                            detail="SQL de teste não pode conter múltiplos comandos.")
+    if ETL_BLOCK_DML_DDL and ETL_DANGEROUS_SQL_RE.search(limpo):
+        raise HTTPException(status_code=400,
+                            detail="SQL de teste bloqueado: comandos DML/DDL não são permitidos.")
+    if not re.match(r"^\s*(SELECT|WITH)\b", limpo, flags=re.IGNORECASE):
+        raise HTTPException(status_code=400,
+                            detail="Somente comandos SELECT são permitidos no teste de SQL.")
+
+
+def _etl_normalizar_placeholder(nome: str, valor):
+    spec = ETL_PLACEHOLDER_SPECS.get(nome)
+    if not spec:
+        raise HTTPException(status_code=400, detail=f"Placeholder desconhecido: $[{nome}]")
+    if valor is None or valor == "":
+        raise HTTPException(status_code=400,
+                            detail=f"Valor obrigatório não informado para $[{nome}]")
+    tipo, regex = spec["tipo"], spec["regex"]
+    if tipo == "int":
+        if not re.match(regex, str(valor)):
+            raise HTTPException(status_code=400,
+                                detail=f"Valor inválido para $[{nome}]. Exemplo: {spec['exemplo']}")
+        return int(str(valor))
+    if tipo == "str":
+        if not re.match(regex, str(valor)):
+            raise HTTPException(status_code=400,
+                                detail=f"Valor inválido para $[{nome}]. Exemplo: {spec['exemplo']}")
+        return str(valor)
+    if tipo == "list_int":
+        valores = valor if isinstance(valor, list) else str(valor).split(",")
+        out = []
+        for item in valores:
+            s = str(item).strip()
+            if not re.match(r"^\d+$", s):
+                raise HTTPException(status_code=400,
+                                    detail=f"Lista inválida para $[{nome}]. Exemplo: {spec['exemplo']}")
+            out.append(int(s))
+        if not out:
+            raise HTTPException(status_code=400, detail=f"Lista vazia para $[{nome}]")
+        return out
+    raise HTTPException(status_code=400, detail=f"Tipo de placeholder não suportado: {tipo}")
+
+
+def _etl_render_sql(sql_template: str, parametros: dict):
+    """Substitui $[NOME] por ? (binds posicionais validados). Retorna
+    (sql_renderizado, valores). Usado pela execução e pelo /testar-sql."""
+    parametros = parametros or {}
+    presentes = sorted(set(ETL_PLACEHOLDER_RE.findall(sql_template or "")))
+    for nome in presentes:
+        if nome not in ETL_PLACEHOLDER_SPECS:
+            raise HTTPException(status_code=400,
+                                detail=f"Placeholder desconhecido no SQL: $[{nome}]")
+        if nome not in parametros:
+            raise HTTPException(status_code=400,
+                                detail=f"Parâmetro obrigatório ausente: {nome}")
+    valores: list = []
+
+    def substituir(m):
+        nome = m.group(1)
+        v = _etl_normalizar_placeholder(nome, parametros.get(nome))
+        if isinstance(v, list):
+            valores.extend(v)
+            return ", ".join(["?"] * len(v))
+        valores.append(v)
+        return "?"
+
+    return ETL_PLACEHOLDER_RE.sub(substituir, sql_template), valores
+
+
+def _etl_montar_preview(sql_select: str, limite: int) -> str:
+    sql_select = _etl_sql_normalizar(sql_select)
+    if re.match(r"^\s*WITH\b", sql_select, flags=re.IGNORECASE):
+        return f"SET ROWCOUNT {limite};\n{sql_select};\nSET ROWCOUNT 0;"
+    return f"SELECT TOP ({limite}) *\nFROM (\n{sql_select}\n) AS preview_sql"
+
+
+def _etl_serializar_valor(valor):
+    if isinstance(valor, (datetime, date)):
+        return valor.isoformat()
+    if isinstance(valor, Decimal):
+        return float(valor)
+    if isinstance(valor, bytes):
+        return valor.decode("utf-8", errors="replace")
+    return valor
+
+
+def _etl_rows_to_dict(cursor, rows):
+    """Converte o resultado do pyodbc preservando EXATAMENTE os nomes das
+    colunas como chaves das linhas (sem lower() no preview). Trata nome de
+    coluna vazio e duplicado para não colidir/perder valores."""
+    if not cursor.description:
+        return [], []
+    colunas = []
+    usados = {}
+    for idx, col in enumerate(cursor.description):
+        nome = str(col[0] or "").strip() or f"COLUNA_{idx + 1}"
+        if nome in usados:
+            usados[nome] += 1
+            nome = f"{nome}_{usados[nome]}"
+        else:
+            usados[nome] = 1
+        colunas.append(nome)
+    linhas = []
+    for row in rows:
+        linhas.append({colunas[i]: _etl_serializar_valor(row[i])
+                       for i in range(len(colunas))})
+    return colunas, linhas
+
+
+# ----- Carga VM_FATURAMENTO -------------------------------------------
+# SQL canônico da VM_FATURAMENTO (3 UNION ALL: SERVIÇOS, PRODUTOS, DEVOLUÇÃO).
+# Mantém os placeholders $[ANOMES_INI]/$[ANOMES_FIM] (6 ocorrências). A execução
+# e o /testar-sql renderizam via _etl_render_sql para ? + binds validados.
+# As 57 colunas do SELECT (56 + cd_seq_item) batem com bi_faturamento.
+SQL_VM_FATURAMENTO = """
+SELECT 			'SERVIÇOS'                                 						 				AS CD_TP_MOVIMENTO,
+               'SERVIÇOS'                       									 		    AS CD_ORIGEM,
+               CONVERT(VARCHAR,E140NFV.CODEMP)													AS CD_EMPRESA,
+			   CONVERT(VARCHAR,E140NFV.CODEMP)+'-'+CONVERT(VARCHAR,E140NFV.CODFIL)				AS CD_FILIAL,
+			   CAST(E140NFV.CODEMP AS NVARCHAR) + '-' + CAST(E140NFV.CODFIL AS NVARCHAR) + '-' +
+			   CAST(E140NFV.CODSNF AS NVARCHAR) + '-' + CAST(E140NFV.NUMNFV AS NVARCHAR) 		AS ID_NF,
+			   CONVERT(VARCHAR,E140NFV.NUMNFV) 													AS CD_NF,
+			   CONVERT(VARCHAR,E140NFV.CODSNF) 													AS CD_SERIE,
+			   CAST(CONVERT(DATE, E140NFV.DATEMI) AS DATE) 							 			AS DT_EMISSAO,
+			   CAST(YEAR(E140NFV.DATEMI) AS NVARCHAR) 								 			AS ANO_EMISSAO,
+			   CAST(YEAR(E140NFV.DATEMI) * 100 + MONTH(E140NFV.DATEMI) AS NVARCHAR)  			AS ANOMES_EMISSAO,
+			   RIGHT('0' + CAST(MONTH(E140NFV.DATEMI) AS NVARCHAR), 2) 				 			AS MES_EMISSAO,
+			   RIGHT('0' + CAST(DAY(E140NFV.DATEMI) AS NVARCHAR), 2) 				 			AS DIA_EMISSAO,
+               CASE
+                 WHEN COALESCE(E085CLI.ESTENT, ' ') = ' ' THEN
+                 COALESCE(E085CLI.SIGUFS, ' ')
+                 ELSE COALESCE(E085CLI.ESTENT, ' ')
+               END                                 								 	 AS CD_ESTADO,
+    		   COALESCE(CONVERT(VARCHAR,CEP.CODIBG),UPPER(E085CLI.CIDCLI))			 AS CD_CIDADE,
+               E001TNS.COMNAT                      									 AS CD_NATUREZA,
+               E140ISV.TNSSER                      									 AS CD_TNS,
+               E140NFV.CODREP                      									 AS CD_REPRESENTANTE,
+			   CASE WHEN E085CLI.CODGRE = 0 THEN CONCAT('C-',CAST(E140NFV.CODCLI AS NVARCHAR))
+			   ELSE CAST(E085CLI.CODGRE AS NVARCHAR)  END                            AS CD_GRUPO_CLIENTE,
+               'OUTROS'                    				 							 AS CD_REV_PEDIDO,
+               E140NFV.CODCLI                      									 AS CD_CLIENTE,
+               E044CCU.CLACCU                      									 AS CD_CENTRO_CUSTOS,
+               SUBSTRING(E044CCU.CLACCU, 1, 1)										 AS CD_CENTRO_CUSTOS_1,
+               SUBSTRING(E044CCU.CLACCU, 1, 2)										 AS CD_CENTRO_CUSTOS_2,
+               SUBSTRING(E044CCU.CLACCU, 1, 3)										 AS CD_CENTRO_CUSTOS_3,
+               E615PRJ.NUMPRJ                      									 AS CD_PRJ,
+               CAST(E615PRJ.NUMPRJ AS VARCHAR(100))
+           	   + ' - '
+               + E615PRJ.ABRPRJ                      								 AS DS_ABR_PRJ,
+               E615FPJ.CODFPJ                      									 AS CD_FPJ,
+               E615FPJ.ABRFPJ                      									 AS DS_ABR_FPJ,
+               E140ISV.NUMPED                      									 AS CD_PEDIDO,
+               E140NFV.CIFFOB                      									 AS CD_CIF_FOB,
+    	       CAST(E140NFV.CODTRA AS NVARCHAR)									   	 AS CD_TRANSPORTADORA,
+               CONVERT(VARCHAR,E140NFV.CODEMP)+'-'+E080SER.CODFAM                    AS CD_FAMILIA,
+               '99999'                                 							 	 AS CD_AGRUPAMENTO,
+               CONVERT(VARCHAR,E140NFV.CODEMP)+'-'+E140ISV.CODSER                    AS CD_PRODUTO,
+               '0'                                 									 AS CD_DERIVACAO,
+               CONVERT(VARCHAR,E140ISV.SEQISV)                                       AS CD_SEQ_ITEM,
+               E080SER.UNIMED                      									 AS CD_UNIDADE_MEDIDA,
+               0                                   									 AS VL_PESO_BRUTO,
+               0                                   									 AS VL_PESO_LIQUIDO,
+               E140ISV.QTDFAT                      									 AS QTD_PRODUTOS,
+               E140ISV.VLRBRU + E140ISV.VLRIPI
+               - (E140ISV.VLRDSC + E140ISV.VLRDS1+ E140ISV.VLRDS2 +
+               	  E140ISV.VLRDS3 + E140ISV.VLRDS4 ) + E140ISV.VLROUI
+               +E140ISV.VLRICS      												 AS VL_BRUTO,
+               E140ISV.VLRBRU - ( E140ISV.VLRDSC + E140ISV.VLRDS1
+                                 + E140ISV.VLRDS2 + E140ISV.VLRDS3
+                                 + E140ISV.VLRDS4 ) + E140ISV.VLRIPI
+                                 + E140ISV.VLRICS + E140ISV.VLROUI                   AS VL_TOTAL,
+               ( E140ISV.VLRCOM )             									 	 AS VL_COMISSAO,
+               ( E140ISV.VLRDSC + E140ISV.VLRDS1
+                 + E140ISV.VLRDS2 + E140ISV.VLRDS3
+                 + E140ISV.VLRDS4 )           									     AS VL_DESCONTO,
+               CASE
+				  WHEN (E001TNS.CODTNS) IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+				        OR (E001TNS.COMNAT) IN ( '6910', '5910', '6912', '5912' ) THEN 0
+				  ELSE (E140ISV.VLRICM )*-1
+				END            									   	 				 AS VL_ICMS,
+               ( E140ISV.VLRDFA ) *-1            									 	 AS VL_DIFAL,
+               CASE
+				  WHEN (E001TNS.CODTNS) IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+				        OR (E001TNS.COMNAT) IN ( '6910', '5910', '6912', '5912' ) THEN 0
+				  ELSE (E140ISV.VLRIPI )*-1
+				END            						 								 AS VL_IPI,
+				CASE
+				  WHEN (E001TNS.CODTNS) IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+				        OR (E001TNS.COMNAT) IN ( '6910', '5910', '6912', '5912' ) THEN 0
+				  ELSE (E140ISV.VLRCFF )*-1
+				END           									 	 				 AS VL_COFINS,
+				CASE
+				  WHEN (E001TNS.CODTNS) IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+				        OR (E001TNS.COMNAT) IN ( '6910', '5910', '6912', '5912' ) THEN 0
+				  ELSE (E140ISV.VLRPIF )*-1
+				END           									 	 				 AS VL_PIS,
+               ( E140ISV.VLRISS )*-1             									 	 AS VL_ISS,
+               0                                   									 AS VL_AMOSTRA,
+               0                                   									 AS VL_BONIFICACAO,
+               0                                   									 AS VL_FRETE,
+               0                 									 	             AS VL_ISMSST,
+               0                                   								     AS VL_CUSTO,
+               0                                   									 AS VL_DEVOLUCAO,
+               0                                                                     AS VL_META
+        FROM   E140ISV
+               INNER JOIN E140NFV
+                       ON E140NFV.CODEMP = E140ISV.CODEMP
+                          AND E140NFV.CODFIL = E140ISV.CODFIL
+                          AND E140NFV.NUMNFV = E140ISV.NUMNFV
+                          AND E140NFV.CODSNF = E140ISV.CODSNF
+                          AND E140NFV.TIPNFS <> 0
+               INNER JOIN E001TNS
+                       ON E140ISV.CODEMP = E001TNS.CODEMP
+                      AND E140ISV.TNSSER = E001TNS.CODTNS
+                      AND E001TNS.VENFAT = 'S'
+               INNER JOIN E080SER
+                       ON E140ISV.CODEMP = E080SER.CODEMP
+                      AND E140ISV.CODSER = E080SER.CODSER
+               INNER JOIN E085CLI
+                       ON E085CLI.CODCLI = E140NFV.CODCLI
+			   LEFT JOIN E008CEP CEP
+    				   ON CEP.CEPINI 	  = E085CLI.CEPINI
+               LEFT JOIN E140RAT
+                      ON E140RAT.CODEMP = E140ISV.CODEMP
+                         AND E140RAT.CODFIL = E140ISV.CODFIL
+                         AND E140RAT.CODSNF = E140ISV.CODSNF
+                         AND E140RAT.NUMNFV = E140ISV.NUMNFV
+                         AND E140RAT.SEQISV = E140ISV.SEQISV
+               LEFT JOIN E044CCU
+                      ON ( E044CCU.CODEMP = E140RAT.CODEMP
+                           AND E044CCU.CODCCU = E140RAT.CODCCU )
+                          OR ( E044CCU.CODEMP = E140ISV.CODEMP
+                               AND E044CCU.CODCCU = E140ISV.CODCCU )
+               LEFT JOIN E615PRJ
+                      ON ( E615PRJ.CODEMP 	  = COALESCE(E140RAT.CODEMP, E140ISV.CODEMP)
+                           AND E615PRJ.NUMPRJ = COALESCE(E140RAT.NUMPRJ,E140ISV.NUMPRJ))
+               LEFT JOIN E615FPJ
+                      ON (     E615FPJ.NUMPRJ = COALESCE(E140RAT.NUMPRJ,E140ISV.NUMPRJ)
+                           AND E615FPJ.CODFPJ = COALESCE(E140RAT.CODFPJ, E140ISV.CODFPJ)
+                           AND E615FPJ.CODEMP = COALESCE(E140RAT.CODEMP, E140ISV.CODEMP))
+               LEFT JOIN (SELECT DISTINCT Max(A.DATBAS) DATBAS,
+                                          A.CODEMP,
+                                          A.CODTNS
+                          FROM   E054PFL A
+                          GROUP  BY A.CODEMP,
+                                    A.CODTNS) E054PFL
+                      ON E054PFL.CODTNS = E140ISV.TNSSER
+                         AND E054PFL.CODEMP = E140ISV.CODEMP
+               LEFT JOIN (SELECT DISTINCT Max(A.DATBAS) DATBAS,
+                                          A.CODEMP,
+                                          A.CODTNS
+                          FROM   E053FFB A
+                          GROUP  BY A.CODEMP,
+                                    A.CODTNS) E053FFB
+                      ON E053FFB.CODTNS = E140ISV.TNSSER
+                         AND E053FFB.CODEMP = E140ISV.CODEMP
+        WHERE  E140NFV.SITNFV = 2
+               AND ( E140NFV.VLRFIN <> 0
+                      OR E001TNS.VENFAT = 'S'
+                      OR E001TNS.VENTCF = 'S'
+                      OR COALESCE(E054PFL.CODTNS, 'N') <> 'N'
+                      OR COALESCE(E053FFB.CODTNS, 'N') <> 'N' )
+         AND SUBSTRING(E044CCU.CLACCU, 1, 3) IN ('503','502') AND E140NFV.CODCLI <> '1'
+         AND CAST(YEAR(E140NFV.DATEMI) * 100 + MONTH(E140NFV.DATEMI) AS NVARCHAR)  BETWEEN $[ANOMES_INI] AND $[ANOMES_FIM]
+          AND E001TNS.CODTNS NOT IN ('5933O','6933O','5101A','6101A')
+UNION ALL
+
+SELECT		   'PRODUTOS'                                 						 				AS CD_TP_MOVIMENTO,
+                CASE WHEN E075PRO.CODORI = '250' THEN 'MÁQUINAS' ELSE 'PEÇAS' END               AS CD_ORIGEM,
+               CONVERT(VARCHAR,E140NFV.CODEMP)													AS CD_EMPRESA,
+			   CAST(E140NFV.CODEMP AS NVARCHAR) + '-' + CONVERT(VARCHAR,E140NFV.CODFIL)			AS CD_FILIAL,
+			   CAST(E140NFV.CODEMP AS NVARCHAR) + '-' + CAST(E140NFV.CODFIL AS NVARCHAR) + '-' +
+			   CAST(E140NFV.CODSNF AS NVARCHAR) + '-' + CAST(E140NFV.NUMNFV AS NVARCHAR) 		AS ID_NF,
+			   CONVERT(VARCHAR,E140NFV.NUMNFV) 													AS CD_NF,
+			   CONVERT(VARCHAR,E140NFV.CODSNF) 													AS CD_SERIE,
+			   CAST(CONVERT(DATE, E140NFV.DATEMI) AS DATE) 							 			AS DT_EMISSAO,
+			   CAST(YEAR(E140NFV.DATEMI) AS NVARCHAR) 								 			AS ANO_EMISSAO,
+			   CAST(YEAR(E140NFV.DATEMI) * 100 + MONTH(E140NFV.DATEMI) AS NVARCHAR)  			AS ANOMES_EMISSAO,
+			   RIGHT('0' + CAST(MONTH(E140NFV.DATEMI) AS NVARCHAR), 2) 				 			AS MES_EMISSAO,
+			   RIGHT('0' + CAST(DAY(E140NFV.DATEMI) AS NVARCHAR), 2) 				 			AS DIA_EMISSAO,
+               CASE
+                 WHEN COALESCE(E085CLI.ESTENT, ' ') = ' ' THEN
+                 COALESCE(E085CLI.SIGUFS, ' ')
+                 ELSE COALESCE(E085CLI.ESTENT, ' ')
+               END                                 								 	 AS CD_ESTADO,
+    		   COALESCE(CONVERT(VARCHAR,CEP.CODIBG),UPPER(E085CLI.CIDCLI))			 AS CD_CIDADE,
+               E001TNS.COMNAT                      									 AS CD_NATUREZA,
+               E140IPV.TNSPRO                       							     AS CD_TNS,
+               E140NFV.CODREP                      									 AS CD_REPRESENTANTE,
+			   CASE WHEN E085CLI.CODGRE = 0 THEN CONCAT('C-',CAST(E140NFV.CODCLI AS NVARCHAR))
+			   ELSE CAST(E085CLI.CODGRE AS NVARCHAR)  END                            AS CD_GRUPO_CLIENTE,
+               COALESCE(NULLIF(TRIM(E120IPD.USU_REVPED), ''), 'OUTROS')              AS CD_REV_PEDIDO,
+               E140NFV.CODCLI                      									 AS CD_CLIENTE,
+               E044CCU.CLACCU                      									 AS CD_CENTRO_CUSTOS,
+               SUBSTRING(E044CCU.CLACCU, 1, 1)										 AS CD_CENTRO_CUSTOS_1,
+               SUBSTRING(E044CCU.CLACCU, 1, 2)										 AS CD_CENTRO_CUSTOS_2,
+               SUBSTRING(E044CCU.CLACCU, 1, 3)										 AS CD_CENTRO_CUSTOS_3,
+               E615PRJ.NUMPRJ                      									 AS CD_PRJ,
+               CAST(E615PRJ.NUMPRJ AS VARCHAR(100))
+           	   + ' - '
+               + E615PRJ.ABRPRJ                      								 AS DS_ABR_PRJ,
+               E615FPJ.CODFPJ                      									 AS CD_FPJ,
+               E615FPJ.ABRFPJ                      									 AS DS_ABR_FPJ,
+               E140IPV.NUMPED                      									 AS CD_PEDIDO,
+               E140NFV.CIFFOB                      									 AS CD_CIF_FOB,
+    	       CAST(E140NFV.CODTRA AS NVARCHAR)									   	 AS CD_TRANSPORTADORA,
+               CAST(E140NFV.CODEMP AS NVARCHAR) + '-' + E075PRO.CODFAM               AS CD_FAMILIA,
+               E013AGP.CODAGP                                 						 AS CD_AGRUPAMENTO,
+               CONVERT(VARCHAR,E140NFV.CODEMP)+'-'+E140IPV.CODPRO                    AS CD_PRODUTO,
+               COALESCE(E140IPV.CODDER, '0')                                		 AS CD_DERIVACAO,
+               CONVERT(VARCHAR,E140IPV.SEQIPV)                                       AS CD_SEQ_ITEM,
+               E140IPV.UNIMED                      									 AS CD_UNIDADE_MEDIDA,
+               E140IPV.PESBRU                                   					 AS VL_PESO_BRUTO,
+               E140IPV.PESLIQ                                  						 AS VL_PESO_LIQUIDO,
+               E140IPV.QTDFAT                      									 AS QTD_PRODUTOS,
+               E140IPV.VLRBRU + E140IPV.VLRIPI
+               - (E140IPV.VLRDSC + E140IPV.VLRDS1+ E140IPV.VLRDS2 +
+               	  E140IPV.VLRDS3 + E140IPV.VLRDS4 ) + E140IPV.VLROUI
+               +E140IPV.VLRICS      												 AS VL_BRUTO,
+               E140IPV.VLRBRU - ( E140IPV.VLRDSC + E140IPV.VLRDS1
+                                 + E140IPV.VLRDS2 + E140IPV.VLRDS3
+                                 + E140IPV.VLRDS4 ) + E140IPV.VLRIPI
+                                 + E140IPV.VLRICS + E140IPV.VLROUI                   AS VL_TOTAL,
+               ( E140IPV.VLRCOM )             									 	 AS VL_COMISSAO,
+               ( E140IPV.VLRDSC + E140IPV.VLRDS1
+                 + E140IPV.VLRDS2 + E140IPV.VLRDS3
+                 + E140IPV.VLRDS4 )           									     AS VL_DESCONTO,
+               CASE
+				  WHEN (E001TNS.CODTNS) IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+				        OR (E001TNS.COMNAT) IN ( '6910', '5910', '6912', '5912' ) THEN 0
+				  ELSE (E140IPV.VLRICM )*-1
+				END            									   	 				 AS VL_ICMS,
+               ( E140IPV.VLRDFA )*-1             									 	 AS VL_DIFAL,
+               CASE
+				  WHEN (E001TNS.CODTNS) IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+				        OR (E001TNS.COMNAT) IN ( '6910', '5910', '6912', '5912' ) THEN 0
+				  ELSE (E140IPV.VLRIPI )*-1
+				END            						 								 AS VL_IPI,
+				CASE
+				  WHEN (E001TNS.CODTNS) IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+				        OR (E001TNS.COMNAT) IN ( '6910', '5910', '6912', '5912' ) THEN 0
+				  ELSE (E140IPV.VLRCFF )*-1
+				END           									 	 				 AS VL_COFINS,
+				CASE
+				  WHEN (E001TNS.CODTNS) IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+				        OR (E001TNS.COMNAT) IN ( '6910', '5910', '6912', '5912' ) THEN 0
+				  ELSE (E140IPV.VLRPIF )*-1
+				END           									 	 				 AS VL_PIS,
+               0                             									 	 AS VL_ICSS,
+               0                                   									 AS VL_AMOSTRA,
+               0                                   									 AS VL_BONIFICACAO,
+               E140IPV.VLRFRE                                    					 AS VL_FRETE,
+               0                 									 	             AS VL_ISMSST,
+               COALESCE(E210MVP.VLRMOV, 0)                                   		 AS VL_CUSTO,
+               0                                   									 AS VL_DEVOLUCAO,
+               0                                                                     AS VL_META
+FROM   E140IPV
+               INNER JOIN E140NFV
+                       ON E140NFV.CODEMP = E140IPV.CODEMP
+                          AND E140NFV.CODFIL = E140IPV.CODFIL
+                          AND E140NFV.NUMNFV = E140IPV.NUMNFV
+                          AND E140NFV.CODSNF = E140IPV.CODSNF
+                          AND E140NFV.TIPNFS <> 0
+               INNER JOIN E001TNS
+                       ON E140IPV.CODEMP = E001TNS.CODEMP
+                          AND E140IPV.TNSPRO = E001TNS.CODTNS
+                      AND E001TNS.VENFAT = 'S'
+               INNER JOIN E075PRO
+                       ON E140IPV.CODEMP = E075PRO.CODEMP
+                          AND E140IPV.CODPRO = E075PRO.CODPRO
+               LEFT JOIN (SELECT Sum(VLRMOV) VLRMOV,
+                                 Sum(QTDMOV) QTDMOV,
+                                 CODEMP,
+                                 CODFIL,
+                                 NUMNFV,
+                                 SEQIPV,
+                                 CODSNF
+                          FROM   E210MVP
+                          GROUP  BY CODEMP,
+                                    CODFIL,
+                                    NUMNFV,
+                                    SEQIPV,
+                                    CODSNF) E210MVP
+                      ON E210MVP.CODEMP = E140IPV.CODEMP
+                         AND E210MVP.CODFIL = E140IPV.CODFIL
+                         AND E210MVP.NUMNFV = E140IPV.NUMNFV
+                         AND E210MVP.SEQIPV = E140IPV.SEQIPV
+                         AND E210MVP.CODSNF = E140IPV.CODSNF
+               INNER JOIN E085CLI
+                       ON E085CLI.CODCLI = E140NFV.CODCLI
+			   LEFT JOIN E008CEP CEP
+    				   ON CEP.CEPINI 	  = E085CLI.CEPINI
+               LEFT JOIN E120IPD
+                      ON E120IPD.CODEMP = E140IPV.CODEMP
+                         AND E120IPD.CODFIL = E140IPV.FILPED
+                         AND E120IPD.NUMPED = E140IPV.NUMPED
+                         AND E120IPD.SEQIPD = E140IPV.SEQIPD
+               LEFT JOIN E140RAT
+                      ON E140RAT.CODEMP = E140IPV.CODEMP
+                         AND E140RAT.CODFIL = E140IPV.CODFIL
+                         AND E140RAT.CODSNF = E140IPV.CODSNF
+                         AND E140RAT.NUMNFV = E140IPV.NUMNFV
+                         AND E140RAT.SEQIPV = E140IPV.SEQIPV
+               LEFT JOIN E044CCU
+                      ON ( E044CCU.CODEMP = E140RAT.CODEMP
+                           AND E044CCU.CODCCU = E140RAT.CODCCU )
+                          OR ( E044CCU.CODEMP = E140IPV.CODEMP
+                               AND E044CCU.CODCCU = E140IPV.CODCCU )
+               LEFT JOIN E615PRJ
+                      ON ( E615PRJ.CODEMP 	  = COALESCE(E140RAT.CODEMP, E140IPV.CODEMP)
+                           AND E615PRJ.NUMPRJ = COALESCE(E140RAT.NUMPRJ,E140IPV.NUMPRJ))
+               LEFT JOIN E615FPJ
+                      ON (     E615FPJ.NUMPRJ = COALESCE(E140RAT.NUMPRJ,E140IPV.NUMPRJ)
+                           AND E615FPJ.CODFPJ = COALESCE(E140RAT.CODFPJ, E140IPV.CODFPJ)
+                           AND E615FPJ.CODEMP = COALESCE(E140RAT.CODEMP, E140IPV.CODEMP))
+               LEFT JOIN E013AGP
+                      ON E075PRO.CODEMP = E013AGP.CODEMP
+                         AND E075PRO.CODAGP = E013AGP.CODAGP
+                         AND E013AGP.TIPAGP = 'P'
+        WHERE  E140NFV.SITNFV = 2
+         AND SUBSTRING(E044CCU.CLACCU, 1, 3) IN ('503','502') AND E140NFV.CODCLI <> '1'
+        AND CAST(YEAR(E140NFV.DATEMI) * 100 + MONTH(E140NFV.DATEMI) AS NVARCHAR) BETWEEN $[ANOMES_INI] AND $[ANOMES_FIM]
+         AND E001TNS.CODTNS NOT IN ('5933O','6933O','5101A','6101A')
+
+UNION ALL
+
+SELECT		   'DEVOLUÇÃO'                                 						 				AS CD_TP_MOVIMENTO,
+                CASE WHEN E075PRO.CODORI = '250' THEN 'MÁQUINAS' ELSE 'PEÇAS' END               AS CD_ORIGEM,
+               CONVERT(VARCHAR,E440NFC.CODEMP)													AS CD_EMPRESA,
+			   CAST(E440NFC.CODEMP AS NVARCHAR) + '-' + CONVERT(VARCHAR,E440NFC.CODFIL)			AS CD_FILIAL,
+			   CAST(E440NFC.CODEMP AS NVARCHAR) + '-' + CAST(E440NFC.CODFIL AS NVARCHAR) + '-' +
+			   CAST(E440NFC.CODSNF AS NVARCHAR) + '-' + CAST(E440NFC.NUMNFC AS NVARCHAR) 		AS ID_NF,
+			   CONVERT(VARCHAR,E440NFC.NUMNFC) 													AS CD_NF,
+			   CONVERT(VARCHAR,E440NFC.CODSNF) 													AS CD_SERIE,
+			   CAST(CONVERT(DATE, E440NFC.DATENT) AS DATE) 							 			AS DT_EMISSAO,
+			   CAST(YEAR(E440NFC.DATENT) AS NVARCHAR) 								 			AS ANO_EMISSAO,
+			   CAST(YEAR(E440NFC.DATENT) * 100 + MONTH(E440NFC.DATENT) AS NVARCHAR)  			AS ANOMES_EMISSAO,
+			   RIGHT('0' + CAST(MONTH(E440NFC.DATENT) AS NVARCHAR), 2) 				 			AS MES_EMISSAO,
+			   RIGHT('0' + CAST(DAY(E440NFC.DATENT) AS NVARCHAR), 2) 				 			AS DIA_EMISSAO,
+               CASE
+                 WHEN COALESCE(E085CLI.ESTENT, ' ') = ' ' THEN
+                 COALESCE(E085CLI.SIGUFS, ' ')
+                 ELSE COALESCE(E085CLI.ESTENT, ' ')
+               END                                 								 	 AS CD_ESTADO,
+    		   COALESCE(CONVERT(VARCHAR,CEP.CODIBG),UPPER(E085CLI.CIDCLI))			 AS CD_CIDADE,
+               E001TNS.COMNAT                      									 AS CD_NATUREZA,
+               E440IPC.TNSPRO                       							     AS CD_TNS,
+               E085HCL.CODREP                      									 AS CD_REPRESENTANTE,
+			   CASE WHEN E085CLI.CODGRE = 0 THEN CONCAT('C-',CAST(E085CLI.CODCLI AS NVARCHAR))
+			   ELSE CAST(E085CLI.CODGRE AS NVARCHAR)  END                            AS CD_GRUPO_CLIENTE,
+               'OUTROS'                   				 	 							 AS CD_REV_PEDIDO,
+               E085CLI.CODCLI                      									 AS CD_CLIENTE,
+               E044CCU.CLACCU                      									 AS CD_CENTRO_CUSTOS,
+               SUBSTRING(E044CCU.CLACCU, 1, 1)										 AS CD_CENTRO_CUSTOS_1,
+               SUBSTRING(E044CCU.CLACCU, 1, 2)										 AS CD_CENTRO_CUSTOS_2,
+               SUBSTRING(E044CCU.CLACCU, 1, 3)										 AS CD_CENTRO_CUSTOS_3,
+               E615PRJ.NUMPRJ                      									 AS CD_PRJ,
+               CAST(E615PRJ.NUMPRJ AS VARCHAR(100))
+           	   + ' - '
+               + E615PRJ.ABRPRJ                      								 AS DS_ABR_PRJ,
+               E615FPJ.CODFPJ                      									 AS CD_FPJ,
+               E615FPJ.ABRFPJ                      									 AS DS_ABR_FPJ,
+               E440IPC.NUMPED                      									 AS CD_PEDIDO,
+               E440NFC.CIFFOB                      									 AS CD_CIF_FOB,
+    	       CAST(E440NFC.CODTRA AS NVARCHAR)									   	 AS CD_TRANSPORTADORA,
+               CAST(E440NFC.CODEMP AS NVARCHAR) + '-' + E075PRO.CODFAM               AS CD_FAMILIA,
+               E013AGP.CODAGP                                 						 AS CD_AGRUPAMENTO,
+               CAST(E440NFC.CODEMP AS NVARCHAR) + '-' + E440IPC.CODPRO               AS CD_PRODUTO,
+               COALESCE(E440IPC.CODDER, '0')                                		 AS CD_DERIVACAO,
+               CONVERT(VARCHAR,E440IPC.SEQIPC)                                       AS CD_SEQ_ITEM,
+               E440IPC.UNIMED                      									 AS CD_UNIDADE_MEDIDA,
+               E440IPC.PESBRU*-1                                   					 AS VL_PESO_BRUTO,
+               E440IPC.PESLIQ*-1                                  					 AS VL_PESO_LIQUIDO,
+               E440IPC.QTDDEV*-1                      								 AS QTD_PRODUTOS,
+               ( E440IPC.VLRBRU + CASE WHEN E440IPC.VECIPI <> 0 THEN
+                 E440IPC.VECIPI
+                 ELSE
+                 0 *
+                 CASE
+                 WHEN E140IPV.QTDDEV = 0 THEN 1 ELSE E140IPV.QTDDEV /
+                 E140IPV.QTDFAT
+                 END
+                 END +
+                 CASE WHEN E440IPC.VLRICS <> 0 THEN E440IPC.VLRICS ELSE 0 * CASE
+                 WHEN
+                 E140IPV.QTDDEV = 0 THEN 1 ELSE E140IPV.QTDDEV / E140IPV.QTDFAT
+                 END END
+                 - (
+                   E440IPC.VLRDSC + E440IPC.VLRDS1
+                   +
+                   E440IPC.VLRDS2 + E440IPC.VLRDS3
+                   +
+                   E440IPC.VLRDS4 ) + E440IPC.VLROUI ) *- 1
+               AS VL_BRUTO,
+               ( E440IPC.VLRBRU + CASE WHEN E440IPC.VECIPI <> 0 THEN
+                 E440IPC.VECIPI
+                 ELSE
+                 0 *
+                 CASE
+                 WHEN E140IPV.QTDDEV = 0 THEN 1 ELSE E140IPV.QTDDEV /
+                 E140IPV.QTDFAT
+                 END
+                 END +
+                 CASE WHEN E440IPC.VLRICS <> 0 THEN E440IPC.VLRICS ELSE 0 * CASE
+                 WHEN
+                 E140IPV.QTDDEV = 0 THEN 1 ELSE E140IPV.QTDDEV / E140IPV.QTDFAT
+                 END END
+                 - (
+                   E440IPC.VLRDSC + E440IPC.VLRDS1
+                   +
+                   E440IPC.VLRDS2 + E440IPC.VLRDS3
+                   +
+                   E440IPC.VLRDS4 ) + E440IPC.VLROUI ) *- 1                          AS VL_TOTAL,
+               0            									 	 				 AS VL_COMISSAO,
+               ( E440IPC.VLRDSC + E440IPC.VLRDS1
+                 + E440IPC.VLRDS2 + E440IPC.VLRDS3
+                 + E440IPC.VLRDS4 )         									     AS VL_DESCONTO,
+                CASE
+				  WHEN (E001TNS.CODTNS) IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+				        OR (E001TNS.COMNAT) IN ( '6910', '5910', '6912', '5912' ) THEN 0
+				  ELSE (E440IPC.VECICM )
+				END            									   	 				 AS VL_ICMS,
+               ( E440IPC.VLRDFA )             									 	 AS VL_DIFAL,
+               CASE
+				  WHEN (E001TNS.CODTNS) IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+				        OR (E001TNS.COMNAT) IN ( '6910', '5910', '6912', '5912' ) THEN 0
+				  ELSE (E440IPC.VECIPI )
+				END            						 								 AS VL_IPI,
+				CASE
+				  WHEN (E001TNS.CODTNS) IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+				        OR (E001TNS.COMNAT) IN ( '6910', '5910', '6912', '5912' ) THEN 0
+				  ELSE (E440IPC.VLRCOR )
+				END           									 	 				 AS VL_COFINS,
+				CASE
+				  WHEN (E001TNS.CODTNS) IN ('5949A','6949A','5949D','6949D','5101A','5949G','6949G','5949N','6949N','5949O','6949O')
+				        OR (E001TNS.COMNAT) IN ( '6910', '5910', '6912', '5912' ) THEN 0
+				  ELSE (E440IPC.VLRPIS )
+				END           									 	 				 AS VL_PIS,
+               0                                   									 AS VL_ISS,
+               0                                   									 AS VL_AMOSTRA,
+               0                                   									 AS VL_BONIFICACAO,
+               E440IPC.VLRFRE*-1                                    			     AS VL_FRETE,
+               0                 									 	             AS VL_ISMSST,
+               COALESCE(E210MVP.VLRMOV, 0)*-1                                   	 AS VL_CUSTO,
+               ( E440IPC.VLRBRU + CASE WHEN E440IPC.VECIPI <> 0 THEN
+                 E440IPC.VECIPI
+                 ELSE
+                 0 *
+                 CASE
+                 WHEN E140IPV.QTDDEV = 0 THEN 1 ELSE E140IPV.QTDDEV /
+                 E140IPV.QTDFAT
+                 END
+                 END +
+                 CASE WHEN E440IPC.VLRICS <> 0 THEN E440IPC.VLRICS ELSE 0 * CASE
+                 WHEN
+                 E140IPV.QTDDEV = 0 THEN 1 ELSE E140IPV.QTDDEV / E140IPV.QTDFAT
+                 END END
+                 - (
+                   E440IPC.VLRDSC + E440IPC.VLRDS1
+                   +
+                   E440IPC.VLRDS2 + E440IPC.VLRDS3
+                   +
+                   E440IPC.VLRDS4 ) + E440IPC.VLROUI )                              AS VL_DEVOLUCAO,
+               0                                                                    AS VL_META
+FROM   E440IPC
+               INNER JOIN E440NFC
+                       ON E440NFC.CODEMP = E440IPC.CODEMP
+                          AND E440NFC.CODFIL = E440IPC.CODFIL
+                          AND E440NFC.NUMNFC = E440IPC.NUMNFC
+                          AND E440NFC.CODSNF = E440IPC.CODSNF
+                          AND E440NFC.CODFOR = E440IPC.CODFOR
+               INNER JOIN E001TNS
+                       ON E440IPC.CODEMP = E001TNS.CODEMP
+                          AND E440IPC.TNSPRO = E001TNS.CODTNS
+               INNER JOIN E075PRO
+                       ON E440IPC.CODEMP = E075PRO.CODEMP
+                          AND E440IPC.CODPRO = E075PRO.CODPRO
+               LEFT JOIN E095FOR
+                      ON E095FOR.CODFOR = E440NFC.CODFOR
+               LEFT JOIN E085CLI
+                      ON E085CLI.CODCLI = E095FOR.CODCLI
+               LEFT JOIN E085HCL
+                      ON E085CLI.CODCLI = E085HCL.CODCLI
+                         AND E440NFC.CODEMP = E085HCL.CODEMP
+                         AND E440NFC.CODFIL = E085HCL.CODFIL
+               LEFT JOIN E210MVP
+                      ON E210MVP.CODEMP = E440IPC.CODEMP
+                         AND E210MVP.FILNFC = E440IPC.CODFIL
+                         AND E210MVP.NUMNFC = E440IPC.NUMNFC
+                         AND E210MVP.SEQIPC = E440IPC.SEQIPC
+                         AND E210MVP.CODFOR = E440IPC.CODFOR
+                         AND E210MVP.SNFNFC = E440IPC.CODSNF
+               LEFT JOIN E440RAT
+                      ON E440RAT.CODEMP = E440IPC.CODEMP
+                         AND E440RAT.CODFIL = E440IPC.CODFIL
+                         AND E440RAT.CODSNF = E440IPC.CODSNF
+                         AND E440RAT.CODFOR = E440IPC.CODFOR
+                         AND E440RAT.NUMNFC = E440IPC.NUMNFC
+                         AND E440RAT.SEQIPC = E440IPC.SEQIPC
+               LEFT JOIN E044CCU
+                      ON ( E044CCU.CODEMP = E440RAT.CODEMP
+                           AND E044CCU.CODCCU = E440RAT.CODCCU )
+                          OR ( E044CCU.CODEMP = E440IPC.CODEMP
+                               AND E044CCU.CODCCU = E440IPC.CODCCU )
+               LEFT JOIN E615PRJ
+                      ON ( E615PRJ.CODEMP 	  = COALESCE(E440RAT.CODEMP,E440IPC.CODEMP)
+                           AND E615PRJ.NUMPRJ = COALESCE(E440RAT.NUMPRJ,E440IPC.NUMPRJ))
+               LEFT JOIN E615FPJ
+                      ON (     E615FPJ.NUMPRJ = COALESCE(E440RAT.NUMPRJ,E440IPC.NUMPRJ)
+                           AND E615FPJ.CODFPJ = COALESCE(E440RAT.CODFPJ, E440IPC.CODFPJ)
+                           AND E615FPJ.CODEMP = COALESCE(E440RAT.CODEMP, E440IPC.CODEMP))
+               LEFT JOIN E013AGP
+                      ON E075PRO.CODAGP = E013AGP.CODAGP
+                         AND E075PRO.CODEMP = E013AGP.CODEMP
+                         AND E013AGP.TIPAGP = 'P'
+               LEFT JOIN E140IPV
+                      ON E140IPV.NUMNFV = E440IPC.NUMNFV
+                         AND E140IPV.CODEMP = E440IPC.EMPNFV
+                         AND E140IPV.CODFIL = E440IPC.FILNFV
+                         AND E140IPV.SEQIPV = E440IPC.SEQIPV
+                         AND E140IPV.CODSNF = E440IPC.SNFNFV
+			   LEFT JOIN E008CEP CEP
+    				   ON CEP.CEPINI 	  = E085CLI.CEPINI
+        WHERE  E440NFC.SITNFC = 2 AND E085HCL.CODCLI <> '1'
+               AND ( E001TNS.COMNAT IN ( '3211', '3202', '3201', '2411',
+                                       '2410', '2209', '2204', '2203',
+                                       '2202', '2201', '1411', '1410',
+                                       '1204', '1203', '1202', '1201' )
+                                       OR E440IPC.TNSPRO = '1201E')
+         AND SUBSTRING(E044CCU.CLACCU, 1, 3) IN ('503','502')
+         AND CAST(YEAR(E440NFC.DATENT) *100 + MONTH(E440NFC.DATENT) AS NVARCHAR)  BETWEEN $[ANOMES_INI] AND $[ANOMES_FIM]
+""".strip()
+
+
+def _acao_carga_sql(execucao_id, parametros: dict) -> dict:
+    """Carga GENÉRICA ERP -> Supabase por PERÍODO (DELETE + INSERT), para
+    qualquer ação SQL-based (VM_FATURAMENTO, VM_LANC_CONTABIL, VM_DRE, ...).
+    Usa _sql_resolvido + tabela_destino + coluna_periodo (injetados da ação).
+    Não precisa de código novo por VM — basta cadastrar a ação + o SQL."""
+    sql_carga = parametros.get("_sql_resolvido")
+    if not sql_carga:
+        raise Exception("SQL da carga não resolvido (comando_sql/template ausente).")
+    tabela = str(parametros.get("tabela_destino") or "").strip()
+    if not tabela:
+        raise Exception("Ação sem tabela_destino configurada.")
+    col_periodo = str(parametros.get("coluna_periodo") or "anomes_emissao").strip()
+
+    # Placeholders do SQL: usa os parâmetros enviados, normalizando as chaves
+    # para MAIÚSCULO (os $[...] são sempre maiúsculos). Aceita ANOMES_INI ou
+    # anomes_ini. Remove chaves de controle que não são placeholders.
+    CTRL = {"_sql_resolvido", "tabela_destino", "coluna_periodo",
+            "_fonte_acao", "usuario_api", "acionado_por"}
+    render_params = {str(k).upper(): v for k, v in parametros.items()
+                     if k not in CTRL}
+    fonte_acao = str(parametros.get("_fonte_acao") or "").strip()
+
+    p_ini = render_params.get("ANOMES_INI")
+    p_fim = render_params.get("ANOMES_FIM")
+    if not p_ini or not p_fim:
+        raise Exception("Informe ANOMES_INI e ANOMES_FIM nos parâmetros.")
+    p_ini, p_fim = str(p_ini).strip(), str(p_fim).strip()
+
+    _etl_log(execucao_id, f"Carga {tabela} iniciada", "INFO",
+             {"ANOMES_INI": p_ini, "ANOMES_FIM": p_fim})
+
+    # 1) Executa no ERP e normaliza: colunas->minúsculo; valores por TIPO
+    #    (Decimal->float, data->ISO, texto->strip) — genérico p/ qualquer VM.
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        sql_render, valores = _etl_render_sql(sql_carga, render_params)
+        cursor.execute(sql_render, valores)
+        rows = cursor.fetchall()
+        columns = [str(c[0] or "").strip().lower() for c in cursor.description]
+
+        dados = []
+        for row in rows:
+            item = {}
+            for i, col in enumerate(columns):
+                valor = row[i]
+                if valor is None:
+                    item[col] = None
+                elif isinstance(valor, Decimal):
+                    item[col] = float(valor)
+                elif isinstance(valor, (date, datetime)):
+                    item[col] = valor.isoformat()
+                elif isinstance(valor, (int, float, bool)):
+                    item[col] = valor
+                else:
+                    item[col] = str(valor).strip()
+            item["origem_etl"] = "ERP_SAPIENS"
+            item["fonte_acao"] = fonte_acao   # qual VM/ação gerou a linha
+            # Unifica grafia do ICMS-ST: VM_FATURAMENTO emite vl_ismsst (typo);
+            # demais VMs emitem vl_icmsst. Garante vl_icmsst sempre preenchido.
+            if "vl_ismsst" in item and "vl_icmsst" not in item:
+                item["vl_icmsst"] = item.get("vl_ismsst")
+            dados.append(item)
+    finally:
+        conn.close()
+
+    _etl_log(execucao_id, f"Lidas {len(dados)} linhas do ERP", "INFO")
+
+    # 2+3) DELETE período + INSERT numa ÚNICA transação (RPC no Postgres).
+    # Se o INSERT falhar, o DELETE sofre rollback — o período nunca fica
+    # parcial/vazio. A RPC retorna {ok, inseridos, deletados}.
+    # _apagar_periodo=False quando a tarefa já limpou o período (append).
+    apagar = bool(parametros.get("_apagar_periodo", True))
+    resultado_rpc = _etl_normalizar_resultado_rpc_carga(_sb_rpc("etl_carga_periodo", {
+        "p_tabela": tabela,
+        "p_coluna_periodo": col_periodo,
+        "p_ini": p_ini,
+        "p_fim": p_fim,
+        "p_rows": dados,
+        "p_apagar": apagar,
+    }))
+    inseridos = int(resultado_rpc.get("inseridos") or 0)
+    deletados = int(resultado_rpc.get("deletados") or 0)
+    _etl_log(execucao_id,
+             f"Carga transacional {tabela} {col_periodo} {p_ini}..{p_fim}: "
+             f"inseridos={inseridos}, deletados={deletados}", "INFO")
+
+    return {
+        "mensagem": f"Carga concluída em {tabela}. "
+                    f"Inseridos: {inseridos}, deletados: {deletados}.",
+        "total_linhas": inseridos,
+        "deletados": deletados,
+        "anomes_ini": p_ini,
+        "anomes_fim": p_fim,
+        "tabela_destino": tabela,
+    }
+
+
+# ----- Templates complementares do ATU_COMERCIAL -----------------------
+# TODO: COLE o SQL real de cada um (com os placeholders $[ANOMES_INI] e
+# $[ANOMES_FIM]). Enquanto vazios, o executor retorna erro claro pedindo o
+# SQL. Todos alimentam bi_faturamento (mesmo shape de colunas).
+SQL_VM_FATURAMENTO_MANUAL = r"""
+    SELECT
+            'FATURAMENTO MAN'                          								AS CD_TP_MOVIMENTO,
+            'LANCTO MANUAL'                       								AS CD_ORIGEM,
+            CONVERT(VARCHAR,E640LCT.CODEMP)										AS CD_EMPRESA,
+            CONVERT(VARCHAR,E640LCT.CODEMP)+'-'+CONVERT(VARCHAR,E640LCT.CODFIL)	AS CD_FILIAL,
+            CAST(E140NFV.CODEMP AS NVARCHAR) + '-' + CAST(E140NFV.CODFIL AS NVARCHAR) + '-' +
+            CAST(E140NFV.CODSNF AS NVARCHAR) + '-' + CAST(E140NFV.NUMNFV AS NVARCHAR)
+                                                                                AS ID_NF,
+            COALESCE(E644LNF.NUMNFI, 0)              							AS CD_NF,
+            CONVERT(VARCHAR,E140NFV.CODSNF) 									AS CD_SERIE,
+            CAST(CONVERT(DATE, E640LCT.DATLCT) AS DATE) 						AS DT_EMISSAO,
+            CAST(YEAR(E640LCT.DATLCT) AS NVARCHAR) 								AS ANO_EMISSAO,
+            CAST(YEAR(E640LCT.DATLCT)*100+MONTH(E640LCT.DATLCT) AS NVARCHAR)    AS ANOMES_EMISSAO,
+            RIGHT('0' + CAST(MONTH(E640LCT.DATLCT) AS NVARCHAR), 2) 			AS MES_EMISSAO,
+            RIGHT('0' + CAST(DAY(E640LCT.DATLCT) AS NVARCHAR), 2) 				AS DIA_EMISSAO,
+            NULL                                 								AS CD_ESTADO,
+            NULL			                                                    AS CD_CIDADE,
+            CAST(E001TNS.COMNAT AS NVARCHAR)                      				AS CD_NATUREZA,
+            CASE
+                 WHEN COALESCE(E140NFV.TNSPRO, ' ') <> ' '
+                 THEN COALESCE(E140NFV.TNSPRO, ' ')
+                 ELSE CASE
+                          WHEN COALESCE(E140NFV.TNSSER, ' ') <> ' '
+                          THEN COALESCE(E140NFV.TNSSER, ' ')
+                          ELSE CASE
+                                   WHEN COALESCE(E440NFC.TNSPRO, ' ') <> ' '
+                                   THEN COALESCE(E440NFC.TNSPRO, ' ')
+                                   ELSE COALESCE(E440NFC.TNSSER, '0')
+                               END
+                      END
+            END                                 								AS CD_TNS,
+            'LANCTO MANUAL'                      							    AS CD_REPRESENTANTE,
+            'LANCTO MANUAL'                      								AS CD_GRUPO_CLIENTE,
+            'LANCTO MANUAL'                      								AS CD_REV_PEDIDO,
+            'LANCTO MANUAL'                      								AS CD_CLIENTE,
+            'LANCTO MANUAL'                      								AS CD_CENTRO_CUSTOS,
+            'LANCTO MANUAL'                      								AS CD_CENTRO_CUSTOS_1,
+            'LANCTO MANUAL'                      								AS CD_CENTRO_CUSTOS_2,
+            'LANCTO MANUAL'                      								AS CD_CENTRO_CUSTOS_3,
+            'LANCTO MANUAL'                      								AS CD_PRJ,
+            'LANCTO MANUAL'                      								AS DS_ABR_PRJ,
+            'LANCTO MANUAL'                      								AS CD_FPJ,
+            'LANCTO MANUAL'                      								AS DS_ABR_FPJ,
+            'LANCTO MANUAL'                      								AS CD_PEDIDO,
+            'LANCTO MANUAL'                      								AS CD_CIF_FOB,
+            'LANCTO MANUAL'                      								AS CD_TRANSPORTADORA,
+            'LANCTO MANUAL'                      								AS CD_FAMILIA,
+            '99999'                                 							AS CD_AGRUPAMENTO,
+            'LANCTO MANUAL'                      							    AS CD_PRODUTO,
+            '0'                                 							    AS CD_DERIVACAO,
+            'LANCTO MANUAL'                      							    AS CD_UNIDADE_MEDIDA,
+            0                                   								AS VL_PESO_BRUTO,
+            0                                   								AS VL_PESO_LIQUIDO,
+            0                      									            AS QTD_PRODUTOS,
+            SUM(CASE
+                    WHEN E045PLA.USU_MCTCTA IN ( '01', '02', '03' )
+                    THEN E640LCT.VLRLCT *- 1
+                    ELSE 0
+                END)                                 							AS VL_BRUTO,
+            0                                   								AS VL_TOTAL,
+            SUM(CASE
+                    WHEN E045PLA.USU_MCTCTA IN ( '18' )
+                    THEN E640LCT.VLRLCT *- 1
+                    ELSE 0
+                END)                               							    AS VL_COMISSAO,
+            SUM(CASE
+                    WHEN E045PLA.USU_MCTCTA IN ( '17' )
+                    THEN E640LCT.VLRLCT *- 1
+                    ELSE 0
+                END)                               								AS VL_DESCONTO,
+            SUM(CASE
+                    WHEN E045PLA.USU_MCTCTA IN ( '04' )
+                    THEN E640LCT.VLRLCT *- 1
+                    ELSE 0
+                END)                               							    AS VL_ICMS,
+            0                                                                   AS VL_DIFAL,
+            SUM(CASE
+                    WHEN E045PLA.USU_MCTCTA IN ( '05' )
+                    THEN E640LCT.VLRLCT *- 1
+                    ELSE 0
+                END)                               								AS VL_IPI,
+            SUM(CASE
+                    WHEN E045PLA.USU_MCTCTA IN ( '07' )
+                    THEN E640LCT.VLRLCT *- 1
+                    ELSE 0
+                END)                                							AS VL_COFINS,
+            SUM(CASE
+                    WHEN E045PLA.USU_MCTCTA IN ( '06' )
+                    THEN E640LCT.VLRLCT *- 1
+                    ELSE 0
+                END)                                							AS VL_PIS,
+            SUM(CASE
+                    WHEN E045PLA.USU_MCTCTA IN ( '08' )
+                    THEN E640LCT.VLRLCT *- 1
+                    ELSE 0
+                END)                               								AS VL_ISS,
+            SUM(CASE
+                    WHEN E045PLA.USU_MCTCTA IN ( '09' )
+                    THEN E640LCT.VLRLCT *- 1
+                    ELSE 0
+                END)                                  							AS VL_AMOSTRA,
+            SUM(CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '10' )THEN
+                 E640LCT.VLRLCT *- 1
+                 ELSE 0
+               END )                                  									 AS VL_BONIFICACAO,
+            SUM(CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '11' )THEN
+                 E640LCT.VLRLCT *- 1
+                 ELSE 0
+               END)                                   									 AS VL_FRETE,
+            SUM(CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '16' )THEN
+                 E640LCT.VLRLCT *- 1
+                 ELSE 0
+               END )                									 	             AS VL_ICMSST,
+               0                                   								     AS VL_CUSTO,
+            SUM(CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '12' )THEN
+                 E640LCT.VLRLCT *- 1
+                 ELSE 0
+               END)                                   									 AS VL_DEVOLUCAO,
+               0                                                                     AS VL_META
+      FROM  E640LCT
+INNER JOIN  E045PLA
+        ON  E640LCT.CODEMP = E045PLA.CODEMP
+       AND  E640LCT.CTADEB = E045PLA.CTARED
+ LEFT JOIN  (SELECT  DISTINCT
+                     NUMLCT,
+                     NUMNFI,
+                     CODEMP,
+                     CODSNF,
+                     CODFOR,
+                     CODFIL
+               FROM  E644LNF) E644LNF
+        ON  E640LCT.CODEMP = E644LNF.CODEMP
+       AND  E640LCT.NUMLCT = E644LNF.NUMLCT
+ LEFT JOIN  (SELECT  DISTINCT
+                     TNSPRO,
+                     TNSSER,
+                     NUMNFC,
+                     CODSNF,
+                     CODEMP,
+                     CODFOR,
+                     CODFIL
+               FROM  E440NFC) E440NFC
+        ON  E440NFC.CODEMP = E644LNF.CODEMP
+       AND  E440NFC.CODFIL = E644LNF.CODFIL
+       AND  E440NFC.CODFOR = E644LNF.CODFOR
+       AND  E440NFC.CODSNF = E644LNF.CODSNF
+       AND  E440NFC.NUMNFC = E644LNF.NUMNFI
+ LEFT JOIN  (SELECT  DISTINCT
+                              TNSPRO,
+                              TNSSER,
+                              NUMNFV,
+                              CODSNF,
+                              CODEMP,
+                              CODFIL
+                        FROM  E140NFV) E140NFV
+        ON  E140NFV.CODEMP = E644LNF.CODEMP
+       AND  E140NFV.CODFIL = E644LNF.CODFIL
+       AND  E140NFV.CODSNF = E644LNF.CODSNF
+       AND  E140NFV.NUMNFV = E644LNF.NUMNFI
+ LEFT JOIN  E001TNS
+        ON  CASE
+                WHEN COALESCE(E140NFV.TNSPRO, ' ') <> ' '
+                THEN COALESCE(E140NFV.TNSPRO, ' ')
+                ELSE CASE
+                         WHEN COALESCE(E140NFV.TNSSER, ' ') <> ' '
+                         THEN COALESCE(E140NFV.TNSSER, ' ')
+                         ELSE CASE
+                                  WHEN COALESCE(E440NFC.TNSPRO, ' ') <> ' '
+                                  THEN COALESCE(E440NFC.TNSPRO, ' ')
+                                  ELSE COALESCE(E440NFC.TNSSER, '0')
+                              END
+                     END
+             END = E001TNS.CODTNS
+       AND  E640LCT.CODEMP = E001TNS.CODEMP
+     WHERE  E640LCT.SITLCT = 2
+       AND  E640LCT.ORILCT = 'MAN'
+       AND  CAST(CASE
+                     WHEN COALESCE(E045PLA.USU_MCTCTA, ' ') = ' ' OR COALESCE(E045PLA.USU_MCTCTA, '  ') = '  '
+                     THEN '0'
+                     ELSE  E045PLA.USU_MCTCTA
+                 END AS INT) BETWEEN 1 AND 20
+       AND  CAST(YEAR(E640LCT.DATLCT)*100+MONTH(E640LCT.DATLCT) AS NVARCHAR) BETWEEN $[ANOMES_INI] AND $[ANOMES_FIM]
+  GROUP BY  CONVERT(VARCHAR,E640LCT.CODEMP),
+            CONVERT(VARCHAR,E640LCT.CODEMP)+'-'+CONVERT(VARCHAR,E640LCT.CODFIL),
+            CAST(E140NFV.CODEMP AS NVARCHAR)+'-'+CAST(E140NFV.CODFIL AS NVARCHAR)+'-'+CAST(E140NFV.CODSNF AS NVARCHAR)+'-'+CAST(E140NFV.NUMNFV AS NVARCHAR),
+            COALESCE(E644LNF.NUMNFI,0),
+            CONVERT(VARCHAR,E140NFV.CODSNF),
+            CAST(CONVERT(DATE, E640LCT.DATLCT)AS DATE),
+            CAST(YEAR(E640LCT.DATLCT) AS NVARCHAR),
+            CAST(YEAR(E640LCT.DATLCT)*100+MONTH(E640LCT.DATLCT) AS NVARCHAR),
+            RIGHT('0'+CAST(MONTH(E640LCT.DATLCT) AS NVARCHAR),2),
+            RIGHT('0'+CAST(DAY(E640LCT.DATLCT) AS NVARCHAR),2),
+            E001TNS.COMNAT,
+            CASE
+                WHEN COALESCE(E140NFV.TNSPRO, ' ') <> ' '
+                THEN COALESCE(E140NFV.TNSPRO, ' ')
+                ELSE CASE
+                         WHEN COALESCE(E140NFV.TNSSER, ' ') <> ' '
+                         THEN COALESCE(E140NFV.TNSSER, ' ')
+                         ELSE CASE
+                                  WHEN COALESCE(E440NFC.TNSPRO, ' ') <> ' '
+                                  THEN COALESCE(E440NFC.TNSPRO, ' ')
+                                  ELSE COALESCE(E440NFC.TNSSER, '0')
+                              END
+                     END
+            END
+
+ UNION ALL
+
+    SELECT
+            'FATURAMENTO MAN'                          								AS CD_TP_MOVIMENTO,
+            'LANCTO MANUAL'                       								AS CD_ORIGEM,
+            CONVERT(VARCHAR,E640LCT.CODEMP)										AS CD_EMPRESA,
+            CONVERT(VARCHAR,E640LCT.CODEMP)+'-'+CONVERT(VARCHAR,E640LCT.CODFIL)	AS CD_FILIAL,
+            CAST(E140NFV.CODEMP AS NVARCHAR)+'-'+CAST(E140NFV.CODFIL AS NVARCHAR)+'-'+
+            CAST(E140NFV.CODSNF AS NVARCHAR)+'-'+CAST(E140NFV.NUMNFV AS NVARCHAR)
+                                                                                AS ID_NF,
+            COALESCE(E644LNF.NUMNFI, 0)              							AS CD_NF,
+            CONVERT(VARCHAR,E140NFV.CODSNF) 									AS CD_SERIE,
+            CAST(CONVERT(DATE, E640LCT.DATLCT) AS DATE) 						AS DT_EMISSAO,
+            CAST(YEAR(E640LCT.DATLCT) AS NVARCHAR) 								AS ANO_EMISSAO,
+            CAST(YEAR(E640LCT.DATLCT)*100+MONTH(E640LCT.DATLCT) AS NVARCHAR)    AS ANOMES_EMISSAO,
+            RIGHT('0' + CAST(MONTH(E640LCT.DATLCT) AS NVARCHAR), 2) 			AS MES_EMISSAO,
+            RIGHT('0' + CAST(DAY(E640LCT.DATLCT) AS NVARCHAR), 2) 				AS DIA_EMISSAO,
+            NULL                                 								AS CD_ESTADO,
+            NULL			                                                    AS CD_CIDADE,
+            E001TNS.COMNAT                      								AS CD_NATUREZA,
+            CASE
+                WHEN COALESCE(E140NFV.TNSPRO, ' ') <> ' '
+                THEN COALESCE(E140NFV.TNSPRO, ' ')
+                ELSE CASE
+                         WHEN COALESCE(E140NFV.TNSSER, ' ') <> ' '
+                         THEN COALESCE(E140NFV.TNSSER, ' ')
+                         ELSE CASE
+                                  WHEN COALESCE(E440NFC.TNSPRO, ' ') <> ' '
+                                  THEN COALESCE(E440NFC.TNSPRO, ' ')
+                                  ELSE COALESCE(E440NFC.TNSSER, '0')
+                              END
+                     END
+            END                                 								AS CD_TNS,
+            'LANCTO MANUAL'                      								AS CD_REPRESENTANTE,
+            'LANCTO MANUAL'                      								AS CD_GRUPO_CLIENTE,
+            'LANCTO MANUAL'                      								AS CD_REV_PEDIDO,
+            'LANCTO MANUAL'                      								AS CD_CLIENTE,
+            'LANCTO MANUAL'                      								AS CD_CENTRO_CUSTOS,
+            'LANCTO MANUAL'                      								AS CD_CENTRO_CUSTOS_1,
+            'LANCTO MANUAL'                      								AS CD_CENTRO_CUSTOS_2,
+            'LANCTO MANUAL'                      								AS CD_CENTRO_CUSTOS_3,
+            'LANCTO MANUAL'                      								AS CD_PRJ,
+            'LANCTO MANUAL'                      								AS DS_ABR_PRJ,
+            'LANCTO MANUAL'                      								AS CD_FPJ,
+            'LANCTO MANUAL'                      								AS DS_ABR_FPJ,
+            'LANCTO MANUAL'                      								AS CD_PEDIDO,
+            'LANCTO MANUAL'                      								AS CD_CIF_FOB,
+    	    'LANCTO MANUAL'                      								AS CD_TRANSPORTADORA,
+            'LANCTO MANUAL'                      								AS CD_FAMILIA,
+            '99999'                                 							AS CD_AGRUPAMENTO,
+            'LANCTO MANUAL'                      								AS CD_PRODUTO,
+            '0'                                 								AS CD_DERIVACAO,
+            'LANCTO MANUAL'                      								AS CD_UNIDADE_MEDIDA,
+            0                                   								AS VL_PESO_BRUTO,
+            0                                   								AS VL_PESO_LIQUIDO,
+            0                      									            AS QTD_PRODUTOS,
+            SUM(CASE
+                    WHEN E045PLA.USU_MCTCTA IN ( '01', '02', '03' )
+                    THEN E640LCT.VLRLCT *- 1
+                    ELSE 0
+                END)                                 							AS VL_BRUTO,
+            0                                   								AS VL_TOTAL,
+            SUM(CASE
+                    WHEN E045PLA.USU_MCTCTA IN ( '18' )
+                    THEN E640LCT.VLRLCT *- 1
+                    ELSE 0
+                END)                                 							AS VL_COMISSAO,
+            SUM(CASE
+                    WHEN E045PLA.USU_MCTCTA IN ( '17' )
+                    THEN E640LCT.VLRLCT *- 1
+                    ELSE 0
+                END)                                 							AS VL_DESCONTO,
+            SUM(CASE
+                    WHEN E045PLA.USU_MCTCTA IN ( '04' )
+                    THEN E640LCT.VLRLCT *- 1
+                    ELSE 0
+                END)                                 							AS VL_ICMS,
+            0                                                                   AS VL_DIFAL,
+            SUM(CASE
+                    WHEN E045PLA.USU_MCTCTA IN ( '05' )
+                    THEN E640LCT.VLRLCT *- 1
+                    ELSE 0
+                END)                                 							AS VL_IPI,
+            SUM(CASE
+                    WHEN E045PLA.USU_MCTCTA IN ( '07' )
+                    THEN E640LCT.VLRLCT *- 1
+                    ELSE 0
+                END)                                 							AS VL_COFINS,
+            SUM(CASE
+                    WHEN E045PLA.USU_MCTCTA IN ( '06' )
+                    THEN E640LCT.VLRLCT *- 1
+                    ELSE 0
+                END)                                 							AS VL_PIS,
+            SUM(CASE
+                    WHEN E045PLA.USU_MCTCTA IN ( '08' )
+                    THEN E640LCT.VLRLCT *- 1
+                    ELSE 0
+                END)                                							AS VL_ISS,
+            SUM(CASE
+                    WHEN E045PLA.USU_MCTCTA IN ( '09' )
+                    THEN E640LCT.VLRLCT *- 1
+                    ELSE 0
+                END)                                  							AS VL_AMOSTRA,
+            SUM(CASE
+                    WHEN E045PLA.USU_MCTCTA IN ( '10' )
+                    THEN E640LCT.VLRLCT *- 1
+                    ELSE 0
+                END)                                   							AS VL_BONIFICACAO,
+            SUM(CASE
+                    WHEN E045PLA.USU_MCTCTA IN ( '11' )
+                    THEN E640LCT.VLRLCT *- 1
+                    ELSE 0
+                END)                                   							AS VL_FRETE,
+            SUM(CASE
+                    WHEN E045PLA.USU_MCTCTA IN ( '16' )
+                    THEN E640LCT.VLRLCT *- 1
+                    ELSE 0
+                END)                 									 	    AS VL_ICMSST,
+            0                                   								AS VL_CUSTO,
+            SUM(CASE
+                    WHEN E045PLA.USU_MCTCTA IN ( '12' )
+                    THEN E640LCT.VLRLCT *- 1
+                    ELSE 0
+                END)                                   							AS VL_DEVOLUCAO,
+            0                                                                   AS VL_META
+      FROM  E640LCT
+INNER JOIN  E045PLA
+        ON  E640LCT.CODEMP = E045PLA.CODEMP
+       AND  E640LCT.CTACRE = E045PLA.CTARED
+ LEFT JOIN  (SELECT  DISTINCT
+                     NUMLCT,
+                     NUMNFI,
+                     CODEMP,
+                     CODFOR,
+                     CODFIL,
+                     CODSNF
+               FROM  E644LNF) E644LNF
+        ON  E640LCT.CODEMP = E644LNF.CODEMP
+       AND  E640LCT.NUMLCT = E644LNF.NUMLCT
+ LEFT JOIN  (SELECT  DISTINCT
+                     TNSPRO,
+                     TNSSER,
+                     NUMNFC,
+                     CODSNF,
+                     CODEMP,
+                     CODFOR,
+                     CODFIL
+               FROM  E440NFC) E440NFC
+        ON  E440NFC.CODEMP = E644LNF.CODEMP
+       AND  E440NFC.CODFIL = E644LNF.CODFIL
+       AND  E440NFC.CODFOR = E644LNF.CODFOR
+       AND  E440NFC.CODSNF = E644LNF.CODSNF
+       AND  E440NFC.NUMNFC = E644LNF.NUMNFI
+ LEFT JOIN  (SELECT  DISTINCT
+                     TNSPRO,
+                     TNSSER,
+                     NUMNFV,
+                     CODSNF,
+                     CODEMP,
+                     CODFIL
+               FROM  E140NFV) E140NFV
+        ON  E140NFV.CODEMP = E644LNF.CODEMP
+       AND  E140NFV.CODFIL = E644LNF.CODFIL
+       AND  E140NFV.CODSNF = E644LNF.CODSNF
+       AND  E140NFV.NUMNFV = E644LNF.NUMNFI
+ LEFT JOIN  E001TNS
+        ON  CASE
+                WHEN COALESCE(E140NFV.TNSPRO, ' ') <> ' '
+                THEN COALESCE(E140NFV.TNSPRO, ' ')
+                ELSE CASE
+                         WHEN COALESCE(E140NFV.TNSSER, ' ') <> ' '
+                         THEN COALESCE(E140NFV.TNSSER, ' ')
+                         ELSE CASE
+                                  WHEN COALESCE(E440NFC.TNSPRO, ' ') <> ' '
+                                  THEN COALESCE(E440NFC.TNSPRO, ' ')
+                                  ELSE COALESCE(E440NFC.TNSSER, '0')
+                              END
+                     END
+            END = E001TNS.CODTNS
+       AND  E640LCT.CODEMP = E001TNS.CODEMP
+     WHERE  E640LCT.SITLCT = 2
+       AND  E640LCT.ORILCT = 'MAN'
+       AND  CAST(CASE
+                     WHEN COALESCE(E045PLA.USU_MCTCTA, ' ') = ' ' OR COALESCE(E045PLA.USU_MCTCTA, '  ') = '  '
+                     THEN '0'
+                     ELSE E045PLA.USU_MCTCTA
+                 END AS INT) BETWEEN 1 AND 19
+       AND  CAST(YEAR(E640LCT.DATLCT) * 100 + MONTH(E640LCT.DATLCT) AS NVARCHAR) BETWEEN $[ANOMES_INI] AND $[ANOMES_FIM]
+  GROUP BY  CONVERT(VARCHAR,E640LCT.CODEMP),
+            CONVERT(VARCHAR,E640LCT.CODEMP)+'-'+CONVERT(VARCHAR,E640LCT.CODFIL),
+            CAST(E140NFV.CODEMP AS NVARCHAR)+'-'+CAST(E140NFV.CODFIL AS NVARCHAR)+'-'+CAST(E140NFV.CODSNF AS NVARCHAR)+'-'+CAST(E140NFV.NUMNFV AS NVARCHAR),
+            COALESCE(E644LNF.NUMNFI, 0),
+            CONVERT(VARCHAR,E140NFV.CODSNF),
+            CAST(CONVERT(DATE, E640LCT.DATLCT) AS DATE),
+            CAST(YEAR(E640LCT.DATLCT) AS NVARCHAR),
+            CAST(YEAR(E640LCT.DATLCT) * 100 + MONTH(E640LCT.DATLCT) AS NVARCHAR),
+            RIGHT('0' + CAST(MONTH(E640LCT.DATLCT) AS NVARCHAR), 2),
+            RIGHT('0' + CAST(DAY(E640LCT.DATLCT) AS NVARCHAR), 2),
+            E001TNS.COMNAT,
+            CASE
+                WHEN COALESCE(E140NFV.TNSPRO, ' ') <> ' '
+                THEN COALESCE(E140NFV.TNSPRO, ' ')
+                ELSE CASE
+                         WHEN COALESCE(E140NFV.TNSSER, ' ') <> ' '
+                         THEN COALESCE(E140NFV.TNSSER, ' ')
+                         ELSE CASE
+                                  WHEN COALESCE(E440NFC.TNSPRO, ' ') <> ' '
+                                  THEN COALESCE(E440NFC.TNSPRO, ' ')
+                                  ELSE COALESCE(E440NFC.TNSSER, '0')
+                              END
+                     END
+            END
+""".strip()
+
+SQL_VM_FAT_CONTABIL = r"""
+SELECT
+               'FATURAMENTO'                          											AS CD_TP_MOVIMENTO,
+               CONVERT(VARCHAR,E640LCT.CODEMP)													AS CD_EMPRESA,
+			   CONVERT(VARCHAR,E640LCT.CODEMP)+'-'+CONVERT(VARCHAR,E640LCT.CODFIL)				AS CD_FILIAL,
+			   CAST(CONVERT(DATE, E640LCT.DATLCT) AS DATE) 							 			AS DT_EMISSAO,
+			   CAST(YEAR(E640LCT.DATLCT) AS NVARCHAR) 								 			AS ANO_EMISSAO,
+			   CAST(YEAR(E640LCT.DATLCT) * 100 + MONTH(E640LCT.DATLCT) AS NVARCHAR)  			AS ANOMES_EMISSAO,
+			   RIGHT('0' + CAST(MONTH(E640LCT.DATLCT) AS NVARCHAR), 2) 				 			AS MES_EMISSAO,
+			   RIGHT('0' + CAST(DAY(E640LCT.DATLCT) AS NVARCHAR), 2) 				 			AS DIA_EMISSAO,
+               E001TNS.COMNAT                      												AS CD_NATUREZA,
+               'XXX'                                                                            AS CD_CENTRO_CUSTOS_3,
+               'XXX'                                                                            AS CD_OBRA,
+               'XXX'                                                                            AS CD_PROJETO,
+               CASE
+                 WHEN COALESCE(E140NFV.TNSPRO, ' ') <> ' ' THEN
+                 COALESCE(E140NFV.TNSPRO, ' ')
+                 ELSE
+                   CASE
+                     WHEN COALESCE(E140NFV.TNSSER, ' ') <> ' ' THEN
+                     COALESCE(E140NFV.TNSSER, ' ')
+                     ELSE
+                       CASE
+                         WHEN COALESCE(E440NFC.TNSPRO, ' ') <> ' ' THEN
+                         COALESCE(E440NFC.TNSPRO, ' ')
+                         ELSE COALESCE(E440NFC.TNSSER, '0')
+                       END
+                   END
+               END                                 												AS CD_TNS,
+               COALESCE(E644LNF.NUMNFI, 0)              										AS CD_NF,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '01', '02', '03' ) THEN Sum(
+                 E640LCT.VLRLCT *- 1)
+                 ELSE
+                 0
+               END                             												AS VL_BRUTO,
+               0                                   												AS VL_TOTAL,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '18' ) THEN Sum(
+                 E640LCT.VLRLCT *- 1)
+                 ELSE 0
+               END                                 												AS VL_COMISSAO,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '17' ) THEN Sum(
+                 E640LCT.VLRLCT *- 1)
+                 ELSE 0
+               END                                 												AS VL_DESCONTO,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '04' ) THEN Sum(
+                 E640LCT.VLRLCT *- 1)
+                 ELSE 0
+               END                                 												AS VL_ICMS,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '05' ) THEN Sum(
+                 E640LCT.VLRLCT *- 1)
+                 ELSE 0
+               END                                 											   AS VL_IPI,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '07' )
+                 AND E001TNS.CODTNS NOT IN ('5933O','6933O','5101A','6101A')
+                 THEN Sum(
+                 E640LCT.VLRLCT *- 1)
+                 ELSE 0
+               END                                 											   AS VL_COFINS,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '06' )
+                 AND E001TNS.CODTNS NOT IN ('5933O','6933O','5101A','6101A')
+                 THEN Sum(
+                 E640LCT.VLRLCT *- 1)
+                 ELSE 0
+               END                                 											   AS VL_PIS,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '16' ) THEN Sum(
+                 E640LCT.VLRLCT *- 1)
+                 ELSE 0
+               END                                 											   AS VL_ICMSST,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '12' ) THEN Sum(
+                 E640LCT.VLRLCT *- 1)
+                 ELSE 0
+               END                                 											   AS VL_DEVOLUCAO,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '09' ) THEN Sum(
+                 E640LCT.VLRLCT *- 1)
+                 ELSE 0
+               END                                 											   AS VL_AMOSTRA,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '10' ) THEN Sum(
+                 E640LCT.VLRLCT *- 1)
+                 ELSE 0
+               END                                 											   AS VL_BONIFICACAO,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '11' ) THEN Sum(
+                 E640LCT.VLRLCT *- 1)
+                 ELSE 0
+               END                                 											   AS VL_FRETE,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '08' ) THEN Sum(
+                 E640LCT.VLRLCT *- 1)
+                 ELSE 0
+               END                                											   AS VL_ISS
+        FROM   E640LCT
+               INNER JOIN E045PLA
+                       ON E640LCT.CODEMP = E045PLA.CODEMP
+                          AND E640LCT.CTADEB = E045PLA.CTARED
+               LEFT JOIN (SELECT DISTINCT NUMLCT,
+                                          NUMNFI,
+                                          CODEMP,
+                                          CODSNF,
+                                          CODFOR,
+                                          CODFIL
+                          FROM   E644LNF) E644LNF
+                      ON E640LCT.CODEMP = E644LNF.CODEMP
+                         AND E640LCT.NUMLCT = E644LNF.NUMLCT
+               LEFT JOIN (SELECT DISTINCT TNSPRO,
+                                          TNSSER,
+                                          NUMNFC,
+                                          CODSNF,
+                                          CODEMP,
+                                          CODFOR,
+                                          CODFIL
+                          FROM   E440NFC) E440NFC
+                      ON E440NFC.CODEMP = E644LNF.CODEMP
+                         AND E440NFC.CODFIL = E644LNF.CODFIL
+                         AND E440NFC.CODFOR = E644LNF.CODFOR
+                         AND E440NFC.CODSNF = E644LNF.CODSNF
+                         AND E440NFC.NUMNFC = E644LNF.NUMNFI
+               LEFT JOIN (SELECT DISTINCT TNSPRO,
+                                          TNSSER,
+                                          NUMNFV,
+                                          CODSNF,
+                                          CODEMP,
+                                          CODFIL
+                          FROM   E140NFV) E140NFV
+                      ON E140NFV.CODEMP = E644LNF.CODEMP
+                         AND E140NFV.CODFIL = E644LNF.CODFIL
+                         AND E140NFV.CODSNF = E644LNF.CODSNF
+                         AND E140NFV.NUMNFV = E644LNF.NUMNFI
+               LEFT JOIN E001TNS
+                      ON CASE
+                           WHEN COALESCE(E140NFV.TNSPRO, ' ') <> ' ' THEN
+                           COALESCE(E140NFV.TNSPRO, ' ')
+                           ELSE
+                             CASE
+                               WHEN COALESCE(E140NFV.TNSSER, ' ') <> ' ' THEN
+                               COALESCE(E140NFV.TNSSER, ' ')
+                               ELSE
+                                 CASE
+                                   WHEN COALESCE(E440NFC.TNSPRO, ' ') <> ' ' THEN
+                                   COALESCE(E440NFC.TNSPRO, ' ')
+                                   ELSE COALESCE(E440NFC.TNSSER, '0')
+                                 END
+                             END
+                         END = E001TNS.CODTNS
+                         AND E640LCT.CODEMP = E001TNS.CODEMP
+        WHERE  E640LCT.SITLCT = 2
+               AND CAST(CASE
+                               WHEN COALESCE(E045PLA.USU_MCTCTA, ' ') = ' '
+                                     OR COALESCE(E045PLA.USU_MCTCTA, '  ') = '  '
+                             THEN '0'
+                               ELSE E045PLA.USU_MCTCTA
+                             END AS INT) BETWEEN 1 AND 20
+            AND CAST(YEAR(E640LCT.DATLCT) * 100 + MONTH(E640LCT.DATLCT) AS NVARCHAR)  BETWEEN $[ANOMES_INI] AND $[ANOMES_FIM]
+        GROUP  BY E640LCT.CODEMP,
+                  E640LCT.CODFIL,
+                  E640LCT.DATLCT,
+                  E644LNF.NUMNFI,
+                  E045PLA.USU_MCTCTA,
+                  E140NFV.TNSPRO,
+                  E140NFV.TNSSER,
+                  E440NFC.TNSPRO,
+                  E440NFC.TNSSER,
+                  E001TNS.COMNAT,
+                  E001TNS.DESTNS,
+                  E001TNS.CODTNS
+
+        UNION ALL
+
+  SELECT
+               'DEVOLUÇÃO'                          											AS CD_TP_MOVIMENTO,
+               CONVERT(VARCHAR,E640LCT.CODEMP)													AS CD_EMPRESA,
+			   CONVERT(VARCHAR,E640LCT.CODEMP)+'-'+CONVERT(VARCHAR,E640LCT.CODFIL)				AS CD_FILIAL,
+			   CAST(CONVERT(DATE, E640LCT.DATLCT) AS DATE) 							 			AS DT_EMISSAO,
+			   CAST(YEAR(E640LCT.DATLCT) AS NVARCHAR) 								 			AS ANO_EMISSAO,
+			   CAST(YEAR(E640LCT.DATLCT) * 100 + MONTH(E640LCT.DATLCT) AS NVARCHAR)  			AS ANOMES_EMISSAO,
+			   RIGHT('0' + CAST(MONTH(E640LCT.DATLCT) AS NVARCHAR), 2) 				 			AS MES_EMISSAO,
+			   RIGHT('0' + CAST(DAY(E640LCT.DATLCT) AS NVARCHAR), 2) 				 			AS DIA_EMISSAO,
+               E001TNS.COMNAT                      												AS CD_NATUREZA,
+               'XXX'                                                                            AS CD_CENTRO_CUSTOS_3,
+               'XXX'                                                                            AS CD_OBRA,
+               'XXX'                                                                            AS CD_PROJETO,
+               CASE
+                 WHEN COALESCE(E140NFV.TNSPRO, ' ') <> ' ' THEN
+                 COALESCE(E140NFV.TNSPRO, ' ')
+                 ELSE
+                   CASE
+                     WHEN COALESCE(E140NFV.TNSSER, ' ') <> ' ' THEN
+                     COALESCE(E140NFV.TNSSER, ' ')
+                     ELSE
+                       CASE
+                         WHEN COALESCE(E440NFC.TNSPRO, ' ') <> ' ' THEN
+                         COALESCE(E440NFC.TNSPRO, ' ')
+                         ELSE COALESCE(E440NFC.TNSSER, '0')
+                       END
+                   END
+               END                                 												AS CD_TNS,
+               COALESCE(E644LNF.NUMNFI, 0)              										AS CD_NF,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '01', '02', '03','12' )
+                 THEN Sum(
+                 E640LCT.VLRLCT )
+                 ELSE 0
+               END                                 												AS VL_BRUTO,
+               0                                   												AS VL_TOTAL,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '18' ) THEN Sum(
+                 E640LCT.VLRLCT )
+                 ELSE 0
+               END                                 												AS VL_COMISSAO,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '17' ) THEN Sum(
+                 E640LCT.VLRLCT )
+                 ELSE 0
+               END                                 												AS VL_DESCONTO,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '04' ) THEN Sum(
+                 E640LCT.VLRLCT)
+                 ELSE 0
+               END                                 												AS VL_ICMS,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '05' ) THEN Sum(
+                 E640LCT.VLRLCT )
+                 ELSE 0
+               END                                 											   AS VL_IPI,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '07' ) THEN Sum(
+                 E640LCT.VLRLCT )
+                 ELSE 0
+               END                                 											   AS VL_COFINS,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '06' ) THEN Sum(
+                 E640LCT.VLRLCT )
+                 ELSE 0
+               END                                 											   AS VL_PIS,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '16' ) THEN Sum(
+                 E640LCT.VLRLCT *- 1)
+                 ELSE 0
+               END                                 											   AS VL_ICMSST,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '12' ) THEN Sum(
+                 E640LCT.VLRLCT )
+                 ELSE 0
+               END
+               AS VL_DEVOLUCAO,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '09' ) THEN Sum(
+                 E640LCT.VLRLCT )
+                 ELSE 0
+               END                                 											   AS VL_AMOSTRA,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '10' ) THEN Sum(
+                 E640LCT.VLRLCT )
+                 ELSE 0
+               END                                 											   AS VL_BONIFICACAO,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '11' ) THEN Sum(
+                 E640LCT.VLRLCT )
+                 ELSE 0
+               END                                 											   AS VL_FRETE,
+               CASE
+                 WHEN E045PLA.USU_MCTCTA IN ( '08' ) THEN Sum(
+                 E640LCT.VLRLCT )
+                 ELSE 0
+               END                                											   AS VL_ISS
+        FROM   E640LCT
+               INNER JOIN E045PLA
+                       ON E640LCT.CODEMP = E045PLA.CODEMP
+                          AND E640LCT.CTACRE = E045PLA.CTARED
+               LEFT JOIN (SELECT DISTINCT NUMLCT,
+                                          NUMNFI,
+                                          CODEMP,
+                                          CODFOR,
+                                          CODFIL,
+                                          CODSNF
+                          FROM   E644LNF) E644LNF
+                      ON E640LCT.CODEMP = E644LNF.CODEMP
+                         AND E640LCT.NUMLCT = E644LNF.NUMLCT
+               LEFT JOIN (SELECT DISTINCT TNSPRO,
+                                          TNSSER,
+                                          NUMNFC,
+                                          CODSNF,
+                                          CODEMP,
+                                          CODFOR,
+                                          CODFIL
+                          FROM   E440NFC) E440NFC
+                      ON E440NFC.CODEMP = E644LNF.CODEMP
+                         AND E440NFC.CODFIL = E644LNF.CODFIL
+                         AND E440NFC.CODFOR = E644LNF.CODFOR
+                         AND E440NFC.CODSNF = E644LNF.CODSNF
+                         AND E440NFC.NUMNFC = E644LNF.NUMNFI
+               LEFT JOIN (SELECT DISTINCT TNSPRO,
+                                          TNSSER,
+                                          NUMNFV,
+                                          CODSNF,
+                                          CODEMP,
+                                          CODFIL
+                          FROM   E140NFV) E140NFV
+                      ON E140NFV.CODEMP = E644LNF.CODEMP
+                         AND E140NFV.CODFIL = E644LNF.CODFIL
+                         AND E140NFV.CODSNF = E644LNF.CODSNF
+                         AND E140NFV.NUMNFV = E644LNF.NUMNFI
+               LEFT JOIN E001TNS
+                      ON CASE
+                           WHEN COALESCE(E140NFV.TNSPRO, ' ') <> ' ' THEN
+                           COALESCE(E140NFV.TNSPRO, ' ')
+                           ELSE
+                             CASE
+                               WHEN COALESCE(E140NFV.TNSSER, ' ') <> ' ' THEN
+                               COALESCE(E140NFV.TNSSER, ' ')
+                               ELSE
+                                 CASE
+                                   WHEN COALESCE(E440NFC.TNSPRO, ' ') <> ' ' THEN
+                                   COALESCE(E440NFC.TNSPRO, ' ')
+                                   ELSE COALESCE(E440NFC.TNSSER, '0')
+                                 END
+                             END
+                         END = E001TNS.CODTNS
+                         AND E640LCT.CODEMP = E001TNS.CODEMP
+        WHERE  E640LCT.SITLCT = 2
+               AND CAST(CASE
+                               WHEN COALESCE(E045PLA.USU_MCTCTA, ' ') = ' '
+                                     OR COALESCE(E045PLA.USU_MCTCTA, '  ') = '  '
+                             THEN '0'
+                               ELSE E045PLA.USU_MCTCTA
+                             END AS INT) BETWEEN 1 AND 19
+            AND CAST(YEAR(E640LCT.DATLCT) * 100 + MONTH(E640LCT.DATLCT) AS NVARCHAR)  BETWEEN $[ANOMES_INI] AND $[ANOMES_FIM]
+	    GROUP  BY E640LCT.CODEMP,
+                  E640LCT.CODFIL,
+                  E640LCT.DATLCT,
+                  E644LNF.NUMNFI,
+                  E045PLA.USU_MCTCTA,
+                  E140NFV.TNSPRO,
+                  E140NFV.TNSSER,
+                  E440NFC.TNSPRO,
+                  E440NFC.TNSSER,
+                  E001TNS.COMNAT,
+                  E001TNS.DESTNS,
+                  E001TNS.CODTNS
+""".strip()
+
+SQL_VM_FAT_TRB = r"""
+SELECT   	  'FATURAMENTO'                                 						 			AS CD_TP_MOVIMENTO,
+               CONVERT(VARCHAR,E660NFV.CODEMP)													AS CD_EMPRESA,
+			   CAST(E660NFV.CODEMP AS NVARCHAR) + '-' + CONVERT(VARCHAR,E660NFV.CODFIL)			AS CD_FILIAL,
+			   E660INV.NUMNFI 																	AS CD_NF,
+			   CAST(CONVERT(DATE, E660NFV.DATEMI) AS DATE) 							 			AS DT_EMISSAO,
+			   CAST(YEAR(E660NFV.DATEMI) AS NVARCHAR) 								 			AS ANO_EMISSAO,
+			   CAST(YEAR(E660NFV.DATEMI) * 100 + MONTH(E660NFV.DATEMI) AS NVARCHAR)  			AS ANOMES_EMISSAO,
+			   RIGHT('0' + CAST(MONTH(E660NFV.DATEMI) AS NVARCHAR), 2) 				 			AS MES_EMISSAO,
+			   RIGHT('0' + CAST(DAY(E660NFV.DATEMI) AS NVARCHAR), 2) 				 			AS DIA_EMISSAO,
+               E001TNS.COMNAT																	AS CD_NATUREZA,
+               'XXX'                                                                            AS CD_CENTRO_CUSTOS_3,
+               'XXX'                                                                            AS CD_OBRA,
+               'XXX'                                                                            AS CD_PROJETO,
+               E660INV.CODTNS																	AS CD_TNS,
+               E660INV.VLRCTB + E660INV.VLRINS + E660INV.VLRISS									AS VL_BRUTO,
+               E660INV.VLRCTB + E660INV.VLRINS + E660INV.VLRISS									AS VL_TOTAL,
+               ( E660INV.VLRDSC ) *- 1															AS VL_DESCONTO,
+               ( E660INV.VLRICM ) *- 1															AS VL_ICMS,
+               ( E660INV.VLRIPI ) *- 1															AS VL_IPI,
+               ( E660INV.VLRCFF ) *- 1															AS VL_COFINS,
+               ( E660INV.VLRPIF ) *- 1															AS VL_PIS,
+               E660INV.VLRSIC *- 1																AS VL_ICMSST,
+               0																				AS VL_DEVOLUCAO,
+               0																			 	AS VL_AMOSTRA,
+               0	 																			AS VL_BONIFICACAO,
+               ( E660INV.VLRFRE ) *- 1											 				AS VL_FRETE,
+               ( E660INV.VLRISS ) *- 1															AS VL_ISS
+        FROM   E660INV
+               INNER JOIN E660NFV
+                       ON E660NFV.CODEMP = E660INV.CODEMP
+                          AND E660NFV.CODFIL = E660INV.CODFIL
+                          AND E660NFV.NUMNFF = E660INV.NUMNFF
+                          AND E660NFV.NUMNFI = E660INV.NUMNFI
+                          AND E660NFV.CODSNF = E660INV.CODSNF
+                          AND E660NFV.CODCLI = E660INV.CODCLI
+                          AND E660NFV.CODTNS = E660INV.CODTNS
+               INNER JOIN E001TNS
+                       ON E660INV.CODEMP = E001TNS.CODEMP
+                          AND E660INV.CODTNS = E001TNS.CODTNS
+                      	  AND E001TNS.VENFAT = 'S'
+               LEFT JOIN (SELECT DISTINCT Max(A.DATBAS) DATBAS,
+                                          A.CODEMP,
+                                          A.CODTNS
+                          FROM   E054PFL A
+                          GROUP  BY A.CODEMP,
+                                    A.CODTNS) E054PFL
+                      ON E054PFL.CODTNS = E660INV.CODTNS
+                         AND E054PFL.CODEMP = E660INV.CODEMP
+               LEFT JOIN (SELECT DISTINCT Max(A.DATBAS) DATBAS,
+                                          A.CODEMP,
+                                          A.CODTNS
+                          FROM   E053FFB A
+                          GROUP  BY A.CODEMP,
+                                    A.CODTNS) E053FFB
+                      ON E053FFB.CODTNS = E660INV.CODTNS
+                         AND E053FFB.CODEMP = E660INV.CODEMP
+                WHERE CAST(YEAR(E660NFV.DATEMI) * 100 + MONTH(E660NFV.DATEMI) AS NVARCHAR) BETWEEN $[ANOMES_INI] AND $[ANOMES_FIM]
+                                      	  AND E001TNS.CODTNS NOT IN ('5933O','6933O','5101A','6101A')
+        UNION ALL
+        SELECT
+        	   'DEVOLUÇÃO'                                 						 				AS CD_TP_MOVIMENTO,
+               CONVERT(VARCHAR,E660INC.CODEMP)													AS CD_EMPRESA,
+			   CAST(E660INC.CODEMP AS NVARCHAR) + '-' + CONVERT(VARCHAR,E660INC.CODFIL)			AS CD_FILIAL,
+			   E660INC.NUMNFI																	AS CD_NF,
+			   CAST(CONVERT(DATE, E660NFC.DATENT) AS DATE) 							 			AS DT_EMISSAO,
+			   CAST(YEAR(E660NFC.DATENT) AS NVARCHAR) 								 			AS ANO_EMISSAO,
+			   CAST(YEAR(E660NFC.DATENT) * 100 + MONTH(E660NFC.DATENT) AS NVARCHAR)  			AS ANOMES_EMISSAO,
+			   RIGHT('0' + CAST(MONTH(E660NFC.DATENT) AS NVARCHAR), 2) 				 			AS MES_EMISSAO,
+			   RIGHT('0' + CAST(DAY(E660NFC.DATENT) AS NVARCHAR), 2) 				 			AS DIA_EMISSAO,
+               E001TNS.COMNAT																	AS CD_NATUREZA,
+               'XXX'                                                                            AS CD_CENTRO_CUSTOS_3,
+               'XXX'                                                                            AS CD_OBRA,
+               'XXX'                                                                            AS CD_PROJETO,
+               E001TNS.CODTNS																	AS CD_TNS,
+               (E660INC.VLRCTB + E660INC.VLRDSC)*- 1											AS VL_BRUTO,
+               E660INC.VLRCTB*- 1																AS VL_TOTAL,
+               ( E660INC.VLRDSC ) *- 1															AS VL_DESCONTO,
+               ( E660INC.VLRICM ) 																AS VL_ICMS,
+               ( E660INC.VLRIPI ) 																AS VL_IPI,
+               ( E660INC.VLRCFF ) 																AS VL_COFINS,
+               ( E660INC.VLRPIF ) 																AS VL_PIS,
+               E660INC.VLRSIC 																	AS VL_ICMSST,
+               0																				AS VL_DEVOLUCAO,
+               0																			 	AS VL_AMOSTRA,
+               0	 																			AS VL_BONIFICACAO,
+               ( E660INC.VLRFRE ) *- 1											 				AS VL_FRETE,
+               0																				AS VL_ISS
+        FROM   E660INC
+               INNER JOIN E660NFC
+                       ON E660NFC.CODEMP = E660INC.CODEMP
+                          AND E660NFC.CODFIL = E660INC.CODFIL
+                          AND E660NFC.NUMNFF = E660INC.NUMNFF
+                          AND E660NFC.NUMNFI = E660INC.NUMNFI
+                          AND E660NFC.CODSNF = E660INC.CODSNF
+                          AND E660NFC.CODFOR = E660INC.CODFOR
+                          AND E660NFC.CODTNS = E660INC.CODTNS
+               INNER JOIN E001TNS
+                       ON E660INC.CODEMP = E001TNS.CODEMP
+                          AND E660INC.CODTNS = E001TNS.CODTNS
+               LEFT JOIN (SELECT DISTINCT Max(A.DATBAS) DATBAS,
+                                          A.CODEMP,
+                                          A.CODTNS
+                          FROM   E054PFL A
+                          GROUP  BY A.CODEMP,
+                                    A.CODTNS) E054PFL
+                      ON E054PFL.CODTNS = E660INC.CODTNS
+                         AND E054PFL.CODEMP = E660INC.CODEMP
+               LEFT JOIN (SELECT DISTINCT Max(A.DATBAS) DATBAS,
+                                          A.CODEMP,
+                                          A.CODTNS
+                          FROM   E053FFB A
+                          GROUP  BY A.CODEMP,
+                                    A.CODTNS) E053FFB
+                      ON E053FFB.CODTNS = E660INC.CODTNS
+                         AND E053FFB.CODEMP = E660INC.CODEMP
+        WHERE  E001TNS.COMNAT IN ( '3211', '3202', '3201', '2411',
+                                       '2410', '2209', '2204', '2203',
+                                       '2202', '2201', '1411', '1410',
+                                       '1204', '1203', '1202', '1201' )
+          AND CAST(YEAR(E660NFC.DATENT) * 100 + MONTH(E660NFC.DATENT) AS NVARCHAR) BETWEEN $[ANOMES_INI] AND $[ANOMES_FIM]
+""".strip()
+
+
+# ----- /testar-sql: preview seguro do SQL de uma ação -----------------
+# Registry id_acao -> template SQL (fonte única). Ações sem SQL estático
+# (ATU_COMPRAS/ATU_RECEBIMENTOS montam SQL dinâmico em Python) não têm preview.
+ETL_SQL_TEMPLATES = {
+    "VM_FATURAMENTO": SQL_VM_FATURAMENTO,
+    "SQL_VM_FATURAMENTO": SQL_VM_FATURAMENTO,   # aceita ponteiro STATIC:SQL_VM_FATURAMENTO
+
+    "VM_FATURAMENTO_MANUAL": SQL_VM_FATURAMENTO_MANUAL,
+    "SQL_VM_FATURAMENTO_MANUAL": SQL_VM_FATURAMENTO_MANUAL,
+
+    "VM_FAT_CONTABIL": SQL_VM_FAT_CONTABIL,
+    "SQL_VM_FAT_CONTABIL": SQL_VM_FAT_CONTABIL,
+
+    "VM_FAT_TRB": SQL_VM_FAT_TRB,
+    "SQL_VM_FAT_TRB": SQL_VM_FAT_TRB,
+}
+
+# Parâmetros do preview vindos do .env (com defaults seguros).
+ETL_PREVIEW_TIMEOUT = int(os.getenv("ETL_SQL_PREVIEW_TIMEOUT_SECONDS", "15") or 15)
+ETL_PREVIEW_MAX_ROWS = int(os.getenv("ETL_SQL_PREVIEW_MAX_ROWS", "500") or 500)
+ETL_PREVIEW_DEFAULT_ROWS = int(os.getenv("ETL_SQL_PREVIEW_DEFAULT_ROWS", "100") or 100)
+ETL_BLOCK_DML_DDL = (os.getenv("ETL_BLOCK_DML_DDL", "true") or "true").strip().lower() \
+    in ("1", "true", "yes", "on")
+
+
+class TestarSqlRequest(BaseModel):
+    parametros: Dict[str, Any] = Field(default_factory=dict)
+    limite: int = Field(default=ETL_PREVIEW_DEFAULT_ROWS, ge=1, le=ETL_PREVIEW_MAX_ROWS)
+
+
+def _etl_executar_preview_sql(sql_template: str, parametros: dict, limite: int) -> dict:
+    limite = max(1, min(int(limite or ETL_PREVIEW_DEFAULT_ROWS), ETL_PREVIEW_MAX_ROWS))
+    sql_param, valores = _etl_render_sql(sql_template, parametros)
+    _etl_validar_select(sql_param)
+    sql_preview = _etl_montar_preview(sql_param, limite)
+
+    inicio = _time_mod.perf_counter()
+    conn = get_connection()
+    try:
+        try:
+            conn.timeout = ETL_PREVIEW_TIMEOUT
+        except Exception:
+            pass
+        cursor = conn.cursor()
+        try:
+            cursor.timeout = ETL_PREVIEW_TIMEOUT
+        except Exception:
+            pass
+
+        cursor.execute(sql_preview, valores)
+        # SET ROWCOUNT (CTE) pode devolver resultsets vazios antes do SELECT.
+        while cursor.description is None:
+            if not cursor.nextset():
+                break
+        rows = cursor.fetchall() if cursor.description else []
+        colunas, linhas = _etl_rows_to_dict(cursor, rows)
+        tempo_ms = int((_time_mod.perf_counter() - inicio) * 1000)
+        return {
+            "sucesso": True,
+            "qtd_linhas": len(linhas),
+            "tempo_ms": tempo_ms,
+            "limite": limite,
+            "truncado": len(linhas) >= limite,
+            "colunas": colunas,
+            "linhas": linhas,
+            "sql_preview": sql_preview,
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _etl_codigo_acao(acao: dict) -> str:
+    """Código textual da ação para despacho (ex.: 'VM_FATURAMENTO').
+    Depende de codigo_acao (ou nome) — NUNCA de id_acao, que é bigint no
+    schema novo (retornaria '1' em vez do código)."""
+    codigo = str(acao.get("codigo_acao") or acao.get("nome") or "").upper().strip()
+    if not codigo:
+        raise HTTPException(
+            status_code=400,
+            detail="Ação ETL sem codigo_acao configurado.",
+        )
+    return codigo
+
+
+def _etl_buscar_acao_ref(acao_ref: str) -> dict:
+    """Resolve ação ETL por referência flexível.
+
+    Regras (id_acao é bigint no schema novo — NUNCA filtrar id_acao com texto):
+      - uuid    -> coluna id
+      - número  -> id_acao, depois id
+      - texto   -> codigo_acao, depois nome (jamais id_acao)
+    Não filtra por ativo/ativa: preview deve funcionar até em rascunho."""
+    ref = str(acao_ref or "").strip()
+    if not ref:
+        raise HTTPException(status_code=400, detail="Referência de ação vazia.")
+
+    # UUID: só faz sentido se etl_acoes.id for uuid. Tenta por id; se não achar
+    # ou falhar (id é bigint neste ambiente), devolve 400 claro orientando o
+    # frontend a enviar codigo_acao em vez de acao.id. Nunca consulta id_acao.
+    if re.match(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", ref):
+        try:
+            rows = _sb_get("etl_acoes", {"select": "*", "id": f"eq.{ref}", "limit": "1"})
+            if rows:
+                return rows[0]
+        except HTTPException:
+            pass
+        raise HTTPException(status_code=400, detail=(
+            f"Referência da ação veio como UUID ({ref}), mas etl_acoes.id não é "
+            "UUID neste ambiente. Envie codigo_acao (ex.: VM_FATURAMENTO) ou id numérico."
+        ))
+
+    if ref.isdigit():
+        tentativas = [{"id_acao": f"eq.{int(ref)}"}, {"id": f"eq.{int(ref)}"}]
+    else:
+        codigo = ref.upper()
+        tentativas = [{"codigo_acao": f"eq.{codigo}"}, {"nome": f"eq.{codigo}"}]
+
+    ultimo_erro = None
+    for filtro in tentativas:
+        try:
+            rows = _sb_get("etl_acoes", {"select": "*", **filtro, "limit": "1"})
+        except HTTPException as exc:
+            ultimo_erro = exc          # coluna pode não existir -> próximo candidato
+            continue
+        if rows:
+            return rows[0]
+
+    detalhe = f"Ação ETL não encontrada: {ref}"
+    if ultimo_erro:
+        detalhe += f" | Último erro Supabase: {ultimo_erro.detail}"
+    raise HTTPException(status_code=404, detail=detalhe)
+
+
+# Códigos de ação tratados internamente em Python (carga/finalização montadas
+# no backend) — não precisam de linha em etl_acoes nem de SQL/template salvo.
+_ETL_ACOES_INTERNAS = {"ATU_COMPRAS", "ATU_RECEBIMENTOS", "ATU_COMERCIAL"}
+
+
+def _etl_resolver_acao_ou_interna(acao_ref: str) -> dict:
+    """Resolve a ação em etl_acoes; se não existir mas o ref for um código
+    interno conhecido (ATU_*), sintetiza uma ação mínima para o despacho em
+    _etl_executar_acao_interna. Mantém o 404 original p/ refs desconhecidos."""
+    try:
+        return _etl_buscar_acao_ref(acao_ref)
+    except HTTPException as exc:
+        cod = str(acao_ref or "").strip().upper()
+        if exc.status_code == 404 and cod in _ETL_ACOES_INTERNAS:
+            return {"codigo_acao": cod, "nome": cod, "id": None,
+                    "tarefa_id": None, "ordem": 0}
+        raise
+
+
+def _etl_lookup_template(key: str):
+    """Busca um template no ETL_SQL_TEMPLATES por chave exata ou, se vier com
+    prefixo SQL_, pela versão sem o prefixo. Retorna None se não existir."""
+    key = str(key or "").strip().upper()
+    if key in ETL_SQL_TEMPLATES:
+        return ETL_SQL_TEMPLATES[key]
+    if key.startswith("SQL_") and key[4:] in ETL_SQL_TEMPLATES:
+        return ETL_SQL_TEMPLATES[key[4:]]
+    return None
+
+
+def _etl_resolver_sql_acao(acao: dict) -> str:
+    """Resolve o SQL real da ação, em ordem de prioridade:
+      1. comando_sql salvo no Supabase (SQL real, não-STATIC)
+      2. comando_sql no formato STATIC:<TEMPLATE> -> ETL_SQL_TEMPLATES
+         (aceita também STATIC:SQL_<NOME> caindo em <NOME>)
+      3. fallback pelo codigo_acao em ETL_SQL_TEMPLATES
+    O SQL resultante ainda passa por _etl_validar_select (só SELECT/WITH)."""
+    codigo = _etl_codigo_acao(acao)
+    comando_sql = str(acao.get("comando_sql") or "").strip()
+
+    def _checar_vazio(tpl, nome):
+        if not str(tpl or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail=(f"Template {nome} está registrado mas VAZIO — cole o SQL real "
+                        f"na constante SQL_... em app_unico.py (ETL_SQL_TEMPLATES) "
+                        f"ou salve o SQL em comando_sql no Supabase."),
+            )
+        return tpl
+
+    # 1) SQL real salvo no Supabase (não-STATIC)
+    if comando_sql and not comando_sql.upper().startswith("STATIC:"):
+        return comando_sql
+
+    # 2) STATIC:<TEMPLATE>  (aceita STATIC:SQL_<NOME> caindo em <NOME>)
+    if comando_sql.upper().startswith("STATIC:"):
+        template_key = comando_sql.split(":", 1)[1].strip().upper()
+        tpl = _etl_lookup_template(template_key)
+        if tpl is None:
+            raise HTTPException(status_code=400,
+                                detail=f"Template estático não encontrado: {template_key}")
+        return _checar_vazio(tpl, template_key)
+
+    # 3) fallback pelo codigo_acao
+    tpl = _etl_lookup_template(codigo)
+    if tpl is not None:
+        return _checar_vazio(tpl, codigo)
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"Ação {codigo} não possui comando_sql nem template estático.",
+    )
+
+
+@app.post("/api/etl/acoes/{acao_ref}/testar-sql")
+def etl_testar_sql_acao(
+    acao_ref: str,
+    body: TestarSqlRequest,
+    usuario=Depends(validar_token),
+):
+    """Preview seguro (SELECT, TOP {limite}, timeout do .env) do SQL da ação.
+    Aceita o uuid da ação OU o código (ex.: VM_FATURAMENTO). Resolve o SQL via
+    comando_sql/STATIC/template, substitui $[PLACEHOLDERS] por binds validados
+    e bloqueia DML/DDL."""
+    acao = _etl_buscar_acao_ref(acao_ref)
+    sql_template = _etl_resolver_sql_acao(acao)
+    try:
+        return _etl_executar_preview_sql(sql_template, body.parametros, body.limite)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Erro ao testar SQL: {exc}")
+
+
+@app.get("/api/etl/acoes/{acao_ref}/comando-sql")
+def etl_obter_comando_sql(
+    acao_ref: str,
+    usuario=Depends(validar_token),
+):
+    """Devolve os metadados da ação + o SQL resolvido e os placeholders
+    ($[NOME]) detectados, para o frontend montar os campos de parâmetro.
+    Tolerante: se a ação não tiver SQL, retorna sql_resolvido=null + motivo."""
+    acao = _etl_buscar_acao_ref(acao_ref)
+    sql_real, erro_sql = None, None
+    try:
+        sql_real = _etl_resolver_sql_acao(acao)
+    except HTTPException as exc:
+        erro_sql = exc.detail
+
+    placeholders = sorted(set(re.findall(r"\$\[([A-Z0-9_]+)\]", sql_real or "")))
+    return {
+        "id": acao.get("id"),
+        "id_acao": acao.get("id_acao"),
+        "codigo_acao": acao.get("codigo_acao"),
+        "nome": acao.get("nome"),
+        "tabela_destino": acao.get("tabela_destino"),
+        "coluna_periodo": acao.get("coluna_periodo"),
+        "comando_sql": acao.get("comando_sql"),
+        "sql_resolvido": sql_real,
+        "placeholders": placeholders,
+        "erro_sql": erro_sql,
+    }
+
+
+# ----- Motor de execução por ação -------------------------------------
+
+def _etl_executar_acao_interna(execucao_id, acao: dict, parametros: dict) -> dict:
+    codigo = _etl_codigo_acao(acao)   # despacho pelo código textual
+
+    # Injeta config da ação nos parâmetros (destino/coluna de período/SQL real/
+    # fonte da linha), sem mutar o dict do chamador.
+    parametros = dict(parametros or {})
+    parametros.setdefault("_fonte_acao", codigo)
+    if acao.get("tabela_destino"):
+        parametros.setdefault("tabela_destino", acao.get("tabela_destino"))
+    if acao.get("coluna_periodo"):
+        parametros.setdefault("coluna_periodo", acao.get("coluna_periodo"))
+    try:
+        parametros.setdefault("_sql_resolvido", _etl_resolver_sql_acao(acao))
+    except HTTPException:
+        pass  # ações sem SQL (ATU_COMERCIAL/ATU_COMPRAS) seguem sem template
+
+    acao_exec = _sb_post("etl_acao_execucoes", {
+        "execucao_id": execucao_id,
+        "acao_id": acao.get("id"),
+        "codigo_acao": codigo,
+        "id_acao": codigo,
+        "ordem": int(acao.get("ordem") or 0),
+        "status": "EXECUTANDO",
+        "iniciado_em": _ts(),
+    })
+    acao_execucao_id = _etl_extrair_execucao_id(acao_exec)
+
+    try:
+        # ATU_* (V1): montam SQL dinâmico em Python e gravam bi_compras/bi_recebimentos
+        if codigo == "ATU_COMPRAS":
+            r = _executar_atu_compras(
+                execucao_id,
+                parametros.get("usuario_api", "ETL"),
+                parametros.get("data_ini"),
+                parametros.get("data_fim"),
+            )
+            resultado = {"total_linhas": int(r.get("linhas_inseridas") or 0),
+                         "mensagem": "ATU_COMPRAS concluída.", **r}
+        elif codigo == "ATU_RECEBIMENTOS":
+            r = _executar_atu_recebimentos(
+                execucao_id,
+                parametros.get("usuario_api", "ETL"),
+                parametros.get("data_ini"),
+                parametros.get("data_fim"),
+            )
+            resultado = {"total_linhas": int(r.get("linhas_inseridas") or 0),
+                         "mensagem": "ATU_RECEBIMENTOS concluída.", **r}
+        elif codigo == "ATU_COMERCIAL":
+            resultado = {"total_linhas": 0,
+                         "mensagem": "Finalização ATU_COMERCIAL executada."}
+        # Carga genérica SQL -> Supabase (VM_FATURAMENTO, VM_LANC_CONTABIL, ...):
+        # qualquer ação com SQL resolvido + tabela_destino.
+        elif parametros.get("_sql_resolvido") and parametros.get("tabela_destino"):
+            resultado = _acao_carga_sql(execucao_id, parametros)
+        else:
+            resultado = {"total_linhas": 0,
+                         "mensagem": f"Ação {codigo} sem SQL/tabela_destino — nada a executar."}
+
+        _sb_patch("etl_acao_execucoes", {"id": f"eq.{acao_execucao_id}"}, {
+            "status": "CONCLUIDO",
+            "finalizado_em": _ts(),
+            "total_linhas": int(resultado.get("total_linhas") or 0),
+            "mensagem": resultado.get("mensagem", "Ação concluída."),
+        })
+        return resultado
+
+    except Exception as exc:
+        _sb_patch("etl_acao_execucoes", {"id": f"eq.{acao_execucao_id}"}, {
+            "status": "ERRO",
+            "finalizado_em": _ts(),
+            "erro": str(exc)[:2000],
+            "mensagem": "Ação finalizada com erro.",
+        })
+        raise
+
+
+# ----- Execução de tarefa dinâmica ------------------------------------
+
+@app.post("/api/etl/tarefas/{nome_tarefa}/executar")
+def etl_executar_tarefa_dinamica(
+    nome_tarefa: str,
+    body: EtlExecutarPeriodoPayload,
+    usuario=Depends(validar_token_ou_cron_secret),
+):
+    tarefa = _etl_buscar_tarefa(nome_tarefa)
+    if not tarefa.get("ativa"):
+        raise HTTPException(status_code=400, detail="Tarefa inativa.")
+
+    parametros = dict(body.parametros or {})
+    if body.anomes_ini:
+        parametros["anomes_ini"] = int(body.anomes_ini)
+    if body.anomes_fim:
+        parametros["anomes_fim"] = int(body.anomes_fim)
+    if body.data_ini:
+        parametros["data_ini"] = body.data_ini
+    if body.data_fim:
+        parametros["data_fim"] = body.data_fim
+    parametros.setdefault("usuario_api", str(usuario or "ETL").upper().strip())
+
+    execucao = _sb_post("etl_execucoes", {
+        "tarefa_id": tarefa["id"],
+        "nome_tarefa": tarefa["nome_tarefa"],
+        "status": "EXECUTANDO",
+        "acionado_por": body.acionado_por or str(usuario or "MANUAL"),
+        "parametros": parametros,
+        "iniciado_em": _ts(),
+    })
+    execucao_id = _etl_extrair_execucao_id(execucao)
+    total_linhas = 0
+
+    try:
+        acoes = _etl_buscar_acoes(tarefa["id"], somente_ativas=True)
+
+        # Limpeza do período UMA vez por (tabela_destino, coluna_periodo) ANTES
+        # de inserir — senão uma ação apaga os dados que outra inseriu na mesma
+        # tabela (padrão UpQuery: DELETE 1x, depois INSERT de todas as ações).
+        p_ini = parametros.get("ANOMES_INI") or parametros.get("anomes_ini")
+        p_fim = parametros.get("ANOMES_FIM") or parametros.get("anomes_fim")
+        if p_ini and p_fim:
+            alvos = {}
+            for acao in acoes:
+                td = str(acao.get("tabela_destino") or "").strip()
+                if td:
+                    cp = str(acao.get("coluna_periodo") or "anomes_emissao").strip()
+                    alvos[(td, cp)] = True
+            for (td, cp) in alvos:
+                _sb_rpc("etl_carga_periodo", {
+                    "p_tabela": td, "p_coluna_periodo": cp,
+                    "p_ini": str(p_ini).strip(), "p_fim": str(p_fim).strip(),
+                    "p_rows": [], "p_apagar": True,
+                })
+                _etl_log(execucao_id,
+                         f"Limpeza única {td} {cp} {p_ini}..{p_fim} OK", "INFO")
+
+        # Daqui em diante, cada ação SÓ INSERE (append) — não apaga de novo.
+        parametros_acoes = {**parametros, "_apagar_periodo": False}
+
+        for acao in acoes:
+            try:
+                resultado = _etl_executar_acao_interna(execucao_id, acao, parametros_acoes)
+                total_linhas += int(resultado.get("total_linhas") or 0)
+            except Exception as exc:
+                if (acao.get("caso_erro") or "PARAR").upper() == "PARAR":
+                    raise
+                _etl_log(execucao_id,
+                         f"Ação {acao.get('id_acao')} ignorada após erro: {exc}",
+                         "WARN")
+
+        _sb_patch("etl_execucoes", {"id": f"eq.{execucao_id}"}, {
+            "status": "CONCLUIDO",
+            "finalizado_em": _ts(),
+            "total_linhas": total_linhas,
+            "mensagem": "Tarefa concluída com sucesso.",
+        })
+        _sb_patch("etl_tarefas", {"id": f"eq.{tarefa['id']}"}, {
+            "status_atual": "CONCLUIDO",
+            "ultima_execucao_em": _ts(),
+            "atualizado_em": _ts(),
+        })
+
+        # Pós-carga ATU_COMERCIAL: sincroniza metas da UpQuery (best-effort —
+        # só se o Oracle estiver configurado; nunca derruba a tarefa).
+        meta_sync = None
+        if (str(tarefa.get("nome_tarefa") or "").upper() == "ATU_COMERCIAL"
+                and os.getenv("UPQUERY_ORACLE_DSN")):
+            ini = parametros.get("ANOMES_INI") or parametros.get("anomes_ini")
+            fim = parametros.get("ANOMES_FIM") or parametros.get("anomes_fim")
+            if ini and fim:
+                try:
+                    meta_sync = _sincronizar_metas_upquery(str(ini), str(fim))
+                    _etl_log(execucao_id,
+                             f"Metas UpQuery sincronizadas: {meta_sync.get('linhas_resumo')} "
+                             f"resumo / {meta_sync.get('linhas_detalhe')} detalhe", "INFO")
+                except Exception as exc:
+                    _etl_log(execucao_id,
+                             f"Falha ao sincronizar metas UpQuery: {exc}", "WARN")
+
+        return {
+            "execucao_id": execucao_id,
+            "tarefa": tarefa["nome_tarefa"],
+            "status": "CONCLUIDO",
+            "total_linhas": total_linhas,
+            "meta_sync": meta_sync,
+        }
+
+    except Exception as exc:
+        erro = str(exc)
+        _sb_patch("etl_execucoes", {"id": f"eq.{execucao_id}"}, {
+            "status": "ERRO",
+            "finalizado_em": _ts(),
+            "erro": erro[:2000],
+            "mensagem": "Tarefa finalizada com erro.",
+        })
+        _sb_patch("etl_tarefas", {"id": f"eq.{tarefa['id']}"}, {
+            "status_atual": "ERRO",
+            "ultima_execucao_em": _ts(),
+            "atualizado_em": _ts(),
+        })
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail=f"Erro ao executar tarefa: {erro}")
+
+
+@app.post("/api/etl/acoes/{acao_ref}/executar")
+def etl_executar_acao_avulsa(
+    acao_ref: str,
+    body: EtlExecutarPeriodoPayload,
+    usuario=Depends(validar_token_ou_cron_secret),
+):
+    """Executa uma única ação fora do fluxo da tarefa. Aceita o uuid da ação,
+    o código (ex.: VM_FATURAMENTO) ou um código interno (ATU_COMPRAS/
+    ATU_RECEBIMENTOS/ATU_COMERCIAL) mesmo sem linha em etl_acoes.
+    Cria uma execução própria p/ logs/status."""
+    acao = _etl_resolver_acao_ou_interna(acao_ref)
+    id_acao_norm = _etl_codigo_acao(acao)
+
+    parametros = dict(body.parametros or {})
+    if body.anomes_ini:
+        parametros["anomes_ini"] = int(body.anomes_ini)
+    if body.anomes_fim:
+        parametros["anomes_fim"] = int(body.anomes_fim)
+    if body.data_ini:
+        parametros["data_ini"] = body.data_ini
+    if body.data_fim:
+        parametros["data_fim"] = body.data_fim
+    parametros.setdefault("usuario_api", str(usuario or "ETL").upper().strip())
+
+    execucao = _sb_post("etl_execucoes", {
+        "tarefa_id": acao.get("tarefa_id"),
+        "nome_tarefa": id_acao_norm,
+        "status": "EXECUTANDO",
+        "acionado_por": body.acionado_por or str(usuario or "MANUAL"),
+        "parametros": parametros,
+        "iniciado_em": _ts(),
+    })
+    execucao_id = _etl_extrair_execucao_id(execucao)
+
+    try:
+        resultado = _etl_executar_acao_interna(execucao_id, acao, parametros)
+        _sb_patch("etl_execucoes", {"id": f"eq.{execucao_id}"}, {
+            "status": "CONCLUIDO",
+            "finalizado_em": _ts(),
+            "total_linhas": int(resultado.get("total_linhas") or 0),
+            "mensagem": resultado.get("mensagem"),
+        })
+        return {"execucao_id": execucao_id, "status": "CONCLUIDO", **resultado}
+    except Exception as exc:
+        erro = str(exc)
+        _sb_patch("etl_execucoes", {"id": f"eq.{execucao_id}"}, {
+            "status": "ERRO",
+            "finalizado_em": _ts(),
+            "erro": erro[:2000],
+            "mensagem": "Ação finalizada com erro.",
+        })
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail=f"Erro ao executar ação: {erro}")
+
+
+@app.post("/api/etl/comercial/faturamento")
+def etl_comercial_faturamento(
+    body: EtlExecutarPeriodoPayload,
+    usuario=Depends(validar_token_ou_cron_secret),
+):
+    """Atalho direto para testar a carga VM_FATURAMENTO sem depender da
+    estrutura etl_tarefas/etl_acoes."""
+    parametros = dict(body.parametros or {})
+    if body.anomes_ini:
+        parametros["anomes_ini"] = int(body.anomes_ini)
+    if body.anomes_fim:
+        parametros["anomes_fim"] = int(body.anomes_fim)
+    # Atalho: resolve o template VM_FATURAMENTO e aponta o destino.
+    parametros.setdefault("_sql_resolvido", SQL_VM_FATURAMENTO)
+    parametros.setdefault("tabela_destino", "bi_faturamento")
+    parametros.setdefault("coluna_periodo", "anomes_emissao")
+    parametros.setdefault("_fonte_acao", "VM_FATURAMENTO")
+
+    execucao = _sb_post("etl_execucoes", {
+        "nome_tarefa": "VM_FATURAMENTO",
+        "status": "EXECUTANDO",
+        "acionado_por": body.acionado_por or str(usuario or "MANUAL"),
+        "parametros": parametros,
+        "iniciado_em": _ts(),
+    })
+    execucao_id = _etl_extrair_execucao_id(execucao)
+
+    try:
+        resultado = _acao_carga_sql(execucao_id, parametros)
+
+        # Sincroniza a META junto com o faturamento (orçamento V_FATURAMENTO_META).
+        # Falha aqui NÃO derruba a carga já concluída — vai no campo 'meta'.
+        meta_resultado = None
+        if parametros.get("sincronizar_meta", True):
+            try:
+                meta_resultado = _sincronizar_metas_upquery(
+                    str(parametros.get("anomes_ini") or body.anomes_ini or ""),
+                    str(parametros.get("anomes_fim") or body.anomes_fim or ""),
+                    "UPQUERY_V_FATURAMENTO_META",
+                )
+            except HTTPException as exc:
+                meta_resultado = {"ok": False, "erro": str(getattr(exc, "detail", exc))}
+            except Exception as exc:  # noqa
+                meta_resultado = {"ok": False, "erro": str(exc)}
+
+        _sb_patch("etl_execucoes", {"id": f"eq.{execucao_id}"}, {
+            "status": "CONCLUIDO",
+            "finalizado_em": _ts(),
+            "total_linhas": int(resultado.get("total_linhas") or 0),
+            "mensagem": resultado.get("mensagem"),
+        })
+        return {"execucao_id": execucao_id, "status": "CONCLUIDO",
+                **resultado, "meta": meta_resultado}
+    except Exception as exc:
+        erro = str(exc)
+        _sb_patch("etl_execucoes", {"id": f"eq.{execucao_id}"}, {
+            "status": "ERRO",
+            "finalizado_em": _ts(),
+            "erro": erro[:2000],
+            "mensagem": "Erro na carga VM_FATURAMENTO.",
+        })
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail=f"Erro VM_FATURAMENTO: {erro}")
+
+
+# ============================================================
+# BI — CONSULTA (somente leitura) de public.bi_faturamento
+# Endpoints de validação visual da importação ERP->Supabase.
+# NÃO consultam o ERP; leem só o Supabase (service role no backend).
+# Agregações via RPC (GROUP BY/SUM no Postgres); detalhes via GET paginado.
+# ============================================================
+
+def _bi_fat_filtros(anomes_ini, anomes_fim, cd_tp_movimento, cd_origem,
+                    cd_empresa, cd_filial, cd_tns, cd_centro_custos_3, cd_nf,
+                    fonte_acao=None):
+    """Lista de tuplas (coluna, 'op.valor') para o PostgREST (detalhes)."""
+    f = []
+    if anomes_ini:
+        f.append(("anomes_emissao", f"gte.{str(anomes_ini).strip()}"))
+    if anomes_fim:
+        f.append(("anomes_emissao", f"lte.{str(anomes_fim).strip()}"))
+    for col, val in (
+        ("cd_tp_movimento", cd_tp_movimento), ("cd_origem", cd_origem),
+        ("cd_empresa", cd_empresa), ("cd_filial", cd_filial), ("cd_tns", cd_tns),
+        ("cd_centro_custos_3", cd_centro_custos_3), ("cd_nf", cd_nf),
+    ):
+        if val not in (None, ""):
+            f.append((col, f"eq.{str(val).strip()}"))
+    # fonte_acao: 'SEM_FONTE' representa linhas com fonte_acao NULL
+    if fonte_acao not in (None, ""):
+        fa = str(fonte_acao).strip()
+        f.append(("fonte_acao", "is.null" if fa.upper() == "SEM_FONTE" else f"eq.{fa}"))
+    return f
+
+
+def _bi_fat_rpc_args(anomes_ini, anomes_fim, cd_tp_movimento, cd_origem,
+                     cd_empresa, cd_filial, cd_tns, cd_centro_custos_3, cd_nf,
+                     fonte_acao=None):
+    """Args nomeados (p_*) para as RPCs de agregação. None = sem filtro."""
+    def n(v):
+        return str(v).strip() if v not in (None, "") else None
+    return {
+        "p_anomes_ini": n(anomes_ini), "p_anomes_fim": n(anomes_fim),
+        "p_cd_tp_movimento": n(cd_tp_movimento), "p_cd_origem": n(cd_origem),
+        "p_cd_empresa": n(cd_empresa), "p_cd_filial": n(cd_filial),
+        "p_cd_tns": n(cd_tns), "p_cd_centro_custos_3": n(cd_centro_custos_3),
+        "p_cd_nf": n(cd_nf), "p_fonte_acao": n(fonte_acao),
+    }
+
+
+def _sb_select_count(table: str, filtros: list, select: str, order: str,
+                     limit: int, offset: int):
+    """GET paginado no PostgREST com Prefer: count=exact. Retorna (rows, total)."""
+    _supabase_required()
+    params = list(filtros) + [
+        ("select", select), ("order", order),
+        ("limit", str(limit)), ("offset", str(offset)),
+    ]
+    resp = requests.get(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        params=params, headers=_supabase_headers("count=exact"), timeout=60,
+    )
+    if resp.status_code not in (200, 206):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase GET {table}: {resp.status_code} {(resp.text or '')[:500]}",
+        )
+    total = None
+    cr = resp.headers.get("Content-Range") or ""
+    if "/" in cr:
+        cauda = cr.split("/")[-1].strip()
+        total = int(cauda) if cauda.isdigit() else None
+    return (resp.json() if resp.text else []), total
+
+
+def _bi_unwrap_rpc(retorno, nome_funcao: str):
+    """Desembrulha o retorno de uma RPC. PostgREST normalmente devolve o jsonb
+    direto (lista/obj), mas em alguns formatos vem como [{nome_funcao: [...]}]
+    ou {nome_funcao: [...]}. Aqui retornamos sempre o conteúdo interno."""
+    if retorno is None:
+        return None
+    if isinstance(retorno, list):
+        if not retorno:
+            return []
+        primeiro = retorno[0]
+        if isinstance(primeiro, dict) and nome_funcao in primeiro:
+            return primeiro[nome_funcao]
+        return retorno
+    if isinstance(retorno, dict) and nome_funcao in retorno:
+        return retorno[nome_funcao]
+    return retorno
+
+
+_BI_FAT_RESUMO_ZERO = {
+    "qtd_linhas": 0, "vl_bruto": 0, "vl_total": 0, "vl_devolucao": 0,
+    "vl_icms": 0, "vl_pis": 0, "vl_cofins": 0, "vl_custo": 0,
+}
+
+
+@app.get("/api/bi/faturamento/resumo")
+def bi_faturamento_resumo(
+    anomes_ini: Optional[str] = None, anomes_fim: Optional[str] = None,
+    cd_tp_movimento: Optional[str] = None, cd_origem: Optional[str] = None,
+    cd_empresa: Optional[str] = None, cd_filial: Optional[str] = None,
+    cd_tns: Optional[str] = None, cd_centro_custos_3: Optional[str] = None,
+    cd_nf: Optional[str] = None, fonte_acao: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    args = _bi_fat_rpc_args(anomes_ini, anomes_fim, cd_tp_movimento, cd_origem,
+                            cd_empresa, cd_filial, cd_tns, cd_centro_custos_3, cd_nf,
+                            fonte_acao)
+    data = _bi_unwrap_rpc(_sb_rpc("bi_faturamento_resumo", args), "bi_faturamento_resumo")
+    return data or dict(_BI_FAT_RESUMO_ZERO)
+
+
+@app.get("/api/bi/faturamento/por-movimento")
+def bi_faturamento_por_movimento(
+    anomes_ini: Optional[str] = None, anomes_fim: Optional[str] = None,
+    cd_tp_movimento: Optional[str] = None, cd_origem: Optional[str] = None,
+    cd_empresa: Optional[str] = None, cd_filial: Optional[str] = None,
+    cd_tns: Optional[str] = None, cd_centro_custos_3: Optional[str] = None,
+    cd_nf: Optional[str] = None, fonte_acao: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    args = _bi_fat_rpc_args(anomes_ini, anomes_fim, cd_tp_movimento, cd_origem,
+                            cd_empresa, cd_filial, cd_tns, cd_centro_custos_3, cd_nf,
+                            fonte_acao)
+    return _bi_unwrap_rpc(_sb_rpc("bi_faturamento_por_movimento", args),
+                          "bi_faturamento_por_movimento") or []
+
+
+@app.get("/api/bi/faturamento/por-tns")
+def bi_faturamento_por_tns(
+    anomes_ini: Optional[str] = None, anomes_fim: Optional[str] = None,
+    cd_tp_movimento: Optional[str] = None, cd_origem: Optional[str] = None,
+    cd_empresa: Optional[str] = None, cd_filial: Optional[str] = None,
+    cd_tns: Optional[str] = None, cd_centro_custos_3: Optional[str] = None,
+    cd_nf: Optional[str] = None, fonte_acao: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    args = _bi_fat_rpc_args(anomes_ini, anomes_fim, cd_tp_movimento, cd_origem,
+                            cd_empresa, cd_filial, cd_tns, cd_centro_custos_3, cd_nf,
+                            fonte_acao)
+    return _bi_unwrap_rpc(_sb_rpc("bi_faturamento_por_tns", args),
+                          "bi_faturamento_por_tns") or []
+
+
+@app.get("/api/bi/faturamento/detalhes")
+def bi_faturamento_detalhes(
+    anomes_ini: Optional[str] = None, anomes_fim: Optional[str] = None,
+    cd_tp_movimento: Optional[str] = None, cd_origem: Optional[str] = None,
+    cd_empresa: Optional[str] = None, cd_filial: Optional[str] = None,
+    cd_tns: Optional[str] = None, cd_centro_custos_3: Optional[str] = None,
+    cd_nf: Optional[str] = None, fonte_acao: Optional[str] = None,
+    page: int = 1, page_size: int = 100,
+    usuario=Depends(validar_token),
+):
+    page = max(1, int(page or 1))
+    page_size = max(1, min(int(page_size or 100), 1000))
+    filtros = _bi_fat_filtros(anomes_ini, anomes_fim, cd_tp_movimento, cd_origem,
+                              cd_empresa, cd_filial, cd_tns, cd_centro_custos_3, cd_nf,
+                              fonte_acao)
+    select = ("id,cd_tp_movimento,cd_origem,cd_empresa,cd_filial,id_nf,cd_nf,"
+              "cd_serie,dt_emissao,anomes_emissao,cd_tns,cd_natureza,cd_cliente,"
+              "cd_centro_custos,cd_centro_custos_3,fonte_acao,vl_bruto,vl_total,"
+              "vl_devolucao,vl_icms,vl_pis,vl_cofins,vl_custo,origem_etl,created_at")
+    items, total = _sb_select_count(
+        "bi_faturamento", filtros, select,
+        "dt_emissao.desc,cd_nf.desc", page_size, (page - 1) * page_size,
+    )
+    return {"items": items, "page": page, "page_size": page_size, "total": total}
+
+
+def _bi_fat_unidade_args(anomes_ini, anomes_fim, unidade_negocio, fonte_acao):
+    """Args (p_*) para as RPCs de unidade comercial/técnica."""
+    def n(v):
+        return str(v).strip() if v not in (None, "") else None
+    return {
+        "p_anomes_ini": n(anomes_ini), "p_anomes_fim": n(anomes_fim),
+        "p_unidade_negocio": n(unidade_negocio), "p_fonte_acao": n(fonte_acao),
+    }
+
+
+@app.get("/api/bi/faturamento/unidade-comercial")
+def bi_faturamento_unidade_comercial(
+    anomes_ini: Optional[str] = None, anomes_fim: Optional[str] = None,
+    unidade_negocio: Optional[str] = None, fonte_acao: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    """Visão COMERCIAL por unidade (GENIUS / ESTRUTURAL ZORTEA + CONSOLIDADO).
+    Usa SOMENTE as fontes VM_FATURAMENTO e VM_FATURAMENTO_MANUAL (que têm
+    cd_prj). Regra: cd_prj='12' -> GENIUS; demais -> ESTRUTURAL ZORTEA."""
+    args = _bi_fat_unidade_args(anomes_ini, anomes_fim, unidade_negocio, fonte_acao)
+    return _bi_unwrap_rpc(_sb_rpc("bi_faturamento_unidade_comercial", args),
+                          "bi_faturamento_unidade_comercial") or []
+
+
+@app.get("/api/bi/faturamento/unidade-tecnica")
+def bi_faturamento_unidade_tecnica(
+    anomes_ini: Optional[str] = None, anomes_fim: Optional[str] = None,
+    unidade_negocio: Optional[str] = None, fonte_acao: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    """Visão TÉCNICA/conciliação por fonte. TODAS as fontes, agrupando por
+    anomes_emissao, unidade_negocio, fonte_acao, cd_tp_movimento, cd_origem."""
+    args = _bi_fat_unidade_args(anomes_ini, anomes_fim, unidade_negocio, fonte_acao)
+    return _bi_unwrap_rpc(_sb_rpc("bi_faturamento_unidade_tecnica", args),
+                          "bi_faturamento_unidade_tecnica") or []
+
+
+# ------------------------------------------------------------
+# BI COMERCIAL — dashboard + DRILL. Fonte: view v_bi_faturamento_comercial
+# (somente VM_FATURAMENTO). unidade: cd_prj='12' -> GENIUS; demais -> ESTRUTURAL
+# ZORTEA; CONSOLIDADO = sem filtro de unidade.
+# ------------------------------------------------------------
+
+_BI_COMERCIAL_KPIS_ZERO = {
+    "faturamento": 0, "faturamento_liquido": 0, "impostos": 0, "devolucao": 0,
+    "qtd_vendas": 0, "qtd_clientes": 0, "qtd_estados": 0, "quantidade": 0,
+    "meta": 0, "diferenca": 0, "percentual_meta": 0, "percentual_atingimento": 0,
+}
+
+
+def _bi_comercial_args(anomes_ini, anomes_fim, unidade_negocio=None,
+                       anomes_emissao=None, cd_estado=None, cd_cliente=None,
+                       cd_prj=None, cd_rev_pedido=None, cd_origem=None,
+                       cd_tp_movimento=None, cd_tns=None, cd_nf=None):
+    def n(v):
+        return str(v).strip() if v not in (None, "") else None
+    return {
+        "p_anomes_ini": n(anomes_ini), "p_anomes_fim": n(anomes_fim),
+        "p_unidade_negocio": n(unidade_negocio), "p_anomes_emissao": n(anomes_emissao),
+        "p_cd_estado": n(cd_estado), "p_cd_cliente": n(cd_cliente),
+        "p_cd_prj": n(cd_prj), "p_cd_rev_pedido": n(cd_rev_pedido),
+        "p_cd_origem": n(cd_origem), "p_cd_tp_movimento": n(cd_tp_movimento),
+        "p_cd_tns": n(cd_tns), "p_cd_nf": n(cd_nf),
+    }
+
+
+class ComercialFiltros:
+    """Dependência FastAPI: lê os filtros de drill da query string e monta os
+    args p_* das RPCs comerciais."""
+    def __init__(
+        self,
+        anomes_ini: Optional[str] = None, anomes_fim: Optional[str] = None,
+        unidade_negocio: Optional[str] = None, anomes_emissao: Optional[str] = None,
+        cd_estado: Optional[str] = None, cd_cliente: Optional[str] = None,
+        cd_prj: Optional[str] = None, cd_rev_pedido: Optional[str] = None,
+        cd_origem: Optional[str] = None, cd_tp_movimento: Optional[str] = None,
+        cd_tns: Optional[str] = None, cd_nf: Optional[str] = None,
+    ):
+        self.args = _bi_comercial_args(
+            anomes_ini, anomes_fim, unidade_negocio, anomes_emissao, cd_estado,
+            cd_cliente, cd_prj, cd_rev_pedido, cd_origem, cd_tp_movimento,
+            cd_tns, cd_nf)
+
+
+# Campo técnico (p/ filtros_drill) de cada dimensão dos endpoints chave/rotulo.
+_DIM_TECH = {
+    "cliente": "cd_cliente", "estado": "cd_estado", "revenda": "cd_rev_pedido",
+    "obras": "cd_prj", "mix": "cd_origem", "tns": "cd_tns",
+    "mensal": "anomes_emissao", "unidade": "unidade_negocio",
+}
+
+
+def _bi_dim_codigo_bruto(dim, tech, r):
+    """Lê o código técnico bruto da linha, compatível com a RPC publicada
+    (usa 'label'/'dimensao'), o repo ('chave') e a mensal ('anomes_emissao')."""
+    if dim == "mensal":
+        ordem = ("anomes_emissao", "chave", tech, "dimensao", "label")
+    else:
+        ordem = (tech, "chave", "dimensao", "label")
+    for k in ordem:
+        v = r.get(k)
+        if v not in (None, "", "SEM_INFO"):
+            return str(v).strip()
+    return ""
+
+
+def _bi_dim_set_tech(dimensao, rows):
+    """Garante o campo técnico (cd_cliente/cd_estado/...) preenchido a partir
+    do que a RPC devolveu — para os safety-nets acharem o código."""
+    dim = str(dimensao or "").lower().strip()
+    tech = _DIM_TECH.get(dim, "cd_origem")
+    if not isinstance(rows, list):
+        return rows
+    for r in rows:
+        if isinstance(r, dict) and r.get(tech) in (None, "", "SEM_INFO"):
+            cod = _bi_dim_codigo_bruto(dim, tech, r)
+            if cod:
+                r[tech] = cod
+    return rows
+
+
+def _bi_dim_enriquecer(dimensao, rows):
+    """Padroniza linhas dos endpoints de dimensão/mensal. Compatível com a RPC
+    publicada (label/dimensao/faturamento) e com o repo (chave/rotulo/vl_bruto).
+    Adiciona label/display_label/categoria/categoria_label/value/valor/
+    filtros_drill + os '*_label' e nm_*/ds_* por dimensão. label nunca nulo
+    quando há código; filtros_drill só com código técnico."""
+    dim = str(dimensao or "").lower().strip()
+    tech = _DIM_TECH.get(dim, "cd_origem")
+    if not isinstance(rows, list):
+        return rows
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        cod = _bi_dim_codigo_bruto(dim, tech, r)
+        rotulo = r.get("rotulo")
+        rot = "" if rotulo in (None, "", "SEM_INFO") else str(rotulo)
+        if cod != "":
+            r[tech] = cod
+        if dim == "cliente":
+            if not r.get("nm_cliente") and rot:
+                r["nm_cliente"] = rot
+            lbl = _lbl_cod_desc(cod, r.get("nm_cliente"))
+            r["cliente_label"] = lbl
+        elif dim == "estado":
+            nome = _UF_NOMES.get(cod.upper()) if cod else None
+            r["nm_estado"] = nome
+            lbl = (f"{cod} - {nome}" if nome else cod)
+            r["estado_label"] = lbl
+        elif dim == "revenda":
+            lbl = cod or rot
+            r["nm_revenda"] = (rot or cod) or None   # nome = cd_rev_pedido na fonte
+            r["revenda_label"] = lbl
+        elif dim == "obras":
+            lbl = _lbl_cod_desc(cod, rot)
+            r["cd_obra"] = cod or None
+            r["ds_obra"] = (rot or None)
+            r.setdefault("ds_abr_prj", rot or None)
+            r["obra_label"] = lbl
+        elif dim == "mensal":
+            lbl = cod or rot
+            r["anomes_label"] = _fmt_anomes(cod or rot)
+            r["serie"] = cod or rot
+            r["serie_label"] = r["anomes_label"]
+        else:  # mix, tns, unidade
+            lbl = rot or cod
+        if not lbl:
+            lbl = cod or rot
+        r["label"] = lbl
+        r["display_label"] = lbl
+        # genéricos p/ gráficos/rankings
+        r["categoria"] = cod or None
+        r["categoria_label"] = lbl
+        fat = r.get("faturamento")
+        if fat is None:
+            fat = r.get("vl_bruto")
+            if fat is not None:
+                r["faturamento"] = fat
+        r["value"] = fat
+        r["valor"] = fat
+        r["filtros_drill"] = ({tech: cod} if cod else {})
+    return rows
+
+
+def _bi_comercial_dim(dimensao, f: "ComercialFiltros"):
+    rows = _bi_unwrap_rpc(
+        _sb_rpc("bi_comercial_dimensao", {"p_dimensao": dimensao, **f.args}),
+        "bi_comercial_dimensao") or []
+    dim = str(dimensao or "").lower().strip()
+    _bi_dim_set_tech(dim, rows)            # garante cd_* p/ o safety-net
+    if dim == "cliente":
+        _bi_drill_preencher_nome_cliente(rows)   # nome via bi_cliente
+    return _bi_dim_enriquecer(dimensao, rows)
+
+
+def _bi_meta_periodo(anomes_ini, anomes_fim, unidade=None) -> float:
+    """SUM(vl_meta) de bi_meta_faturamento no período (e unidade, se filtrada).
+    A meta tem granularidade (anomes_emissao, unidade_negocio). Padronizado em
+    'anomes_emissao' (coluna real da tabela; 'anomes' não existe)."""
+    ai = re.sub(r"\D", "", str(anomes_ini or ""))[:6]
+    af = re.sub(r"\D", "", str(anomes_fim or ""))[:6]
+    if len(ai) != 6 or len(af) != 6:
+        return 0.0
+    u = str(unidade or "").strip().upper()
+    params = [("select", "vl_meta"),
+              ("anomes_emissao", f"gte.{ai}"), ("anomes_emissao", f"lte.{af}"),
+              ("ativo", "eq.true")]
+    if u and u != "CONSOLIDADO":
+        params.append(("unidade_negocio", f"eq.{u}"))
+    try:
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/bi_meta_faturamento",
+            params=params, headers=_supabase_headers("return=representation"), timeout=20)
+        if resp.status_code not in (200, 206):
+            print(f"[BI KPIS] meta período falhou: {resp.status_code} "
+                  f"{(resp.text or '')[:300]}")
+            return 0.0
+        return round(sum(float(r.get("vl_meta") or 0) for r in (resp.json() or [])), 2)
+    except Exception as exc:  # noqa
+        print(f"[BI KPIS] meta período falhou: {exc}")
+        return 0.0
+
+
+def _bi_num(v) -> float:
+    try:
+        return float(v or 0)
+    except Exception:
+        return 0.0
+
+
+def _bi_kpis_aplicar_meta(data: dict, args: dict) -> dict:
+    """Corrige meta, diferença e atingimento do card comercial.
+    Regra: a meta vem EXCLUSIVAMENTE de bi_meta_faturamento (orçamento
+    V_FATURAMENTO_META), no mesmo período/unidade. NUNCA aceita a meta da RPC
+    (era o que deixava os R$ 30 mi errados passarem). Recalcula diferença e
+    percentual SEMPRE, sobre o Fat. Líquido."""
+    meta = _bi_meta_periodo(
+        args.get("p_anomes_ini"), args.get("p_anomes_fim"),
+        args.get("p_unidade_negocio"))
+
+    fat_bruto = _bi_num(
+        data.get("faturamento") or data.get("faturamento_bruto")
+        or data.get("fat_bruto"))
+    fat_liquido = _bi_num(
+        data.get("faturamento_liquido") or data.get("fat_liquido")
+        or data.get("vl_realizado") or data.get("realizado") or fat_bruto)
+
+    # Líquido (Resumo Faturamento): diferença e % oficiais.
+    diferenca = round(fat_liquido - meta, 2)
+    percentual = round((fat_liquido / meta) * 100, 2) if meta > 0 else 0.0
+    # Bruto (gauge de atingimento): % e diferença sobre o faturamento bruto.
+    diferenca_bruto = round(fat_bruto - meta, 2)
+    percentual_bruto = round((fat_bruto / meta) * 100, 2) if meta > 0 else 0.0
+
+    data["faturamento"] = round(fat_bruto, 2)
+    data["faturamento_bruto"] = round(fat_bruto, 2)
+    data["fat_bruto"] = round(fat_bruto, 2)
+    data["faturamento_liquido"] = round(fat_liquido, 2)
+    data["fat_liquido"] = round(fat_liquido, 2)
+    data["realizado"] = round(fat_liquido, 2)
+    data["meta"] = round(meta, 2)
+    data["vl_meta"] = round(meta, 2)
+    data["diferenca"] = diferenca
+    data["vl_diferenca"] = diferenca
+    data["atingimento_pct"] = percentual
+    data["percentual_atingimento"] = percentual
+    data["percentual_meta"] = percentual
+    # Variantes BRUTO (gauge usa direto, sem recalcular no front).
+    data["diferenca_bruto"] = diferenca_bruto
+    data["atingimento_pct_bruto"] = percentual_bruto
+    data["percentual_atingimento_bruto"] = percentual_bruto
+    return data
+
+
+@app.get("/api/bi/comercial/kpis")
+def bi_comercial_kpis(f: ComercialFiltros = Depends(), usuario=Depends(validar_token)):
+    data = _bi_unwrap_rpc(_sb_rpc("bi_comercial_kpis", f.args), "bi_comercial_kpis")
+    data = data or dict(_BI_COMERCIAL_KPIS_ZERO)
+    if isinstance(data, dict):
+        _bi_kpis_aplicar_meta(data, f.args)
+    return data
+
+
+@app.get("/api/bi/comercial/mensal")
+def bi_comercial_mensal(f: ComercialFiltros = Depends(), usuario=Depends(validar_token)):
+    # RPC dedicada (realizado + meta por mês), não a genérica de dimensão.
+    rows = _bi_unwrap_rpc(_sb_rpc("bi_comercial_mensal", f.args),
+                          "bi_comercial_mensal") or []
+    return _bi_dim_enriquecer("mensal", rows)
+
+
+@app.get("/api/bi/comercial/mix")
+def bi_comercial_mix(f: ComercialFiltros = Depends(), usuario=Depends(validar_token)):
+    return _bi_comercial_dim("mix", f)
+
+
+@app.get("/api/bi/comercial/estado")
+def bi_comercial_estado(f: ComercialFiltros = Depends(), usuario=Depends(validar_token)):
+    return _bi_comercial_dim("estado", f)
+
+
+@app.get("/api/bi/comercial/revenda")
+def bi_comercial_revenda(f: ComercialFiltros = Depends(), usuario=Depends(validar_token)):
+    return _bi_comercial_dim("revenda", f)
+
+
+@app.get("/api/bi/comercial/obras")
+def bi_comercial_obras(f: ComercialFiltros = Depends(), usuario=Depends(validar_token)):
+    return _bi_comercial_dim("obras", f)
+
+
+@app.get("/api/bi/comercial/cliente")
+def bi_comercial_cliente(f: ComercialFiltros = Depends(), usuario=Depends(validar_token)):
+    return _bi_comercial_dim("cliente", f)
+
+
+@app.get("/api/bi/comercial/dimensao")
+def bi_comercial_dimensao(
+    dimensao: str, f: ComercialFiltros = Depends(), usuario=Depends(validar_token),
+):
+    return _bi_comercial_dim(dimensao, f)
+
+
+@app.get("/api/bi/comercial/detalhes")
+def bi_comercial_detalhes(
+    f: ComercialFiltros = Depends(),
+    somente_devolucao: bool = False, somente_impostos: bool = False,
+    cd_produto: Optional[str] = None, cd_derivacao: Optional[str] = None,
+    page: int = 1, page_size: int = 100,
+    usuario=Depends(validar_token),
+):
+    p_page = max(1, int(page or 1))
+    p_size = max(1, min(int(page_size or 100), 500))
+
+    def _n(v):
+        return str(v).strip() if v not in (None, "") else None
+
+    args = {
+        **f.args,
+        "p_somente_devolucao": bool(somente_devolucao),
+        "p_somente_impostos": bool(somente_impostos),
+        "p_page": p_page, "p_page_size": p_size,
+    }
+    # cd_produto/cd_derivacao só entram se filtrados — assim casa também com a
+    # assinatura ANTIGA da RPC publicada (que não tem esses params). Com a
+    # migração aplicada, a versão nova aceita os dois.
+    pcd, pcdv = _n(cd_produto), _n(cd_derivacao)
+    if pcd is not None:
+        args["p_cd_produto"] = pcd
+    if pcdv is not None:
+        args["p_cd_derivacao"] = pcdv
+    data = _bi_unwrap_rpc(_sb_rpc("bi_comercial_detalhes", args),
+                          "bi_comercial_detalhes")
+    if isinstance(data, dict):
+        _bi_drill_preencher_dimensoes(data.get("items") or [])
+        for it in (data.get("items") or []):
+            if isinstance(it, dict):
+                it["cliente_label"] = _lbl_cliente(it)
+                it["produto_label"] = _lbl_produto(it)
+                nf = it.get("cd_nf")
+                serie = it.get("cd_serie")
+                if nf not in (None, ""):
+                    it["nf_label"] = (f"{serie}-{nf}" if serie not in (None, "") else str(nf))
+        _bi_preencher_desconto(data.get("items") or [])
+        _bi_preencher_totais_nota(data.get("items") or [])
+    return data or {"page": p_page, "page_size": p_size, "total": 0, "items": []}
+
+
+# ----- Dimensão de cliente (nome) — bi_cliente <- ERP E085CLI ------------
+_SQL_CLIENTES_ERP = """
+    SELECT CAST(CLI.CODCLI AS VARCHAR(20))           AS cd_cliente,
+           LTRIM(RTRIM(COALESCE(CLI.NOMCLI, '')))    AS nm_cliente,
+           LTRIM(RTRIM(COALESCE(CLI.APECLI, '')))    AS nm_fantasia
+    FROM dbo.E085CLI CLI
+"""
+
+
+@app.post("/api/bi/comercial/clientes/sincronizar")
+def bi_comercial_sincronizar_clientes(usuario=Depends(validar_token_ou_cron_secret)):
+    """Sincroniza a dimensão public.bi_cliente (cd_cliente -> nome) a partir do
+    cadastro do ERP (E085CLI). Idempotente (upsert por cd_cliente). Depois disso
+    o drill/detalhes passam a exibir o nome via LEFT JOIN na view comercial."""
+    _supabase_required()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(_SQL_CLIENTES_ERP)
+        cols = [d[0].lower() for d in cur.description]
+        brutos = [dict(zip(cols, r)) for r in cur.fetchall()]
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    agora = datetime.utcnow().isoformat() + "Z"
+    vistos = set()
+    payload = []
+    for r in brutos:
+        cd = str(r.get("cd_cliente") or "").strip()
+        if not cd or cd in vistos:
+            continue
+        vistos.add(cd)
+        payload.append({
+            "cd_cliente": cd,
+            "nm_cliente": (str(r.get("nm_cliente") or "").strip() or None),
+            "nm_fantasia": (str(r.get("nm_fantasia") or "").strip() or None),
+            "atualizado_em": agora,
+        })
+
+    total, lote = 0, 1000
+    for i in range(0, len(payload), lote):
+        total += _supabase_upsert("bi_cliente", payload[i:i + lote], ["cd_cliente"])
+    return {"ok": True, "clientes_lidos": len(brutos),
+            "clientes_sincronizados": total}
+
+
+# ----- Dimensão de produto/serviço — bi_produto <- ERP E075PRO + E080SER --
+# cd_produto = CODEMP-'-'-COD* (mesma expressão da VM_FATURAMENTO).
+_SQL_PRODUTOS_ERP = """
+    SELECT
+        CAST(P.CODEMP AS VARCHAR) + '-' + LTRIM(RTRIM(P.CODPRO)) AS cd_produto,
+        LTRIM(RTRIM(P.DESPRO))                                   AS ds_produto,
+        LTRIM(RTRIM(P.CODFAM))                                   AS cd_familia,
+        LTRIM(RTRIM(P.CODORI))                                   AS cd_origem,
+        LTRIM(RTRIM(P.UNIMED))                                   AS cd_unidade_medida,
+        'PRODUTO'                                                AS tipo_item,
+        CASE WHEN COALESCE(P.SITPRO, 'A') = 'A' THEN 1 ELSE 0 END AS ativo
+    FROM E075PRO P
+    WHERE P.CODEMP = 1
+
+    UNION ALL
+
+    SELECT
+        CAST(S.CODEMP AS VARCHAR) + '-' + LTRIM(RTRIM(S.CODSER)) AS cd_produto,
+        LTRIM(RTRIM(S.DESSER))                                   AS ds_produto,
+        LTRIM(RTRIM(S.CODFAM))                                   AS cd_familia,
+        NULL                                                     AS cd_origem,
+        LTRIM(RTRIM(S.UNIMED))                                   AS cd_unidade_medida,
+        'SERVICO'                                                AS tipo_item,
+        1                                                        AS ativo
+    FROM E080SER S
+    WHERE S.CODEMP = 1
+"""
+
+
+@app.post("/api/bi/comercial/produtos/sincronizar")
+def bi_comercial_sincronizar_produtos(usuario=Depends(validar_token_ou_cron_secret)):
+    """Sincroniza public.bi_produto (cd_produto -> descrição + atributos) a partir
+    do cadastro do ERP: E075PRO (produtos) + E080SER (serviços). Idempotente
+    (upsert por cd_produto). Depois o drill PRODUTO/detalhes exibem a descrição."""
+    _supabase_required()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(_SQL_PRODUTOS_ERP)
+        cols = [d[0].lower() for d in cur.description]
+        brutos = [dict(zip(cols, r)) for r in cur.fetchall()]
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    def _txt(v):
+        return (str(v).strip() or None) if v is not None else None
+
+    agora = datetime.utcnow().isoformat() + "Z"
+    vistos, payload = set(), []
+    qtd_prod, qtd_serv = 0, 0
+    for r in brutos:
+        cd = str(r.get("cd_produto") or "").strip()
+        if not cd or cd in vistos:
+            continue
+        vistos.add(cd)
+        tipo = (str(r.get("tipo_item") or "").strip().upper() or None)
+        if tipo == "PRODUTO":
+            qtd_prod += 1
+        elif tipo == "SERVICO":
+            qtd_serv += 1
+        try:
+            ativo = bool(int(r.get("ativo")))
+        except (TypeError, ValueError):
+            ativo = True
+        payload.append({
+            "cd_produto": cd,
+            "ds_produto": _txt(r.get("ds_produto")),
+            "cd_familia": _txt(r.get("cd_familia")),
+            "cd_origem": _txt(r.get("cd_origem")),
+            "cd_unidade_medida": _txt(r.get("cd_unidade_medida")),
+            "tipo_item": tipo,
+            "ativo": ativo,
+            "atualizado_em": agora,
+        })
+
+    total, lote = 0, 1000
+    for i in range(0, len(payload), lote):
+        total += _supabase_upsert("bi_produto", payload[i:i + lote], ["cd_produto"])
+    return {"ok": True, "qtd_produtos": qtd_prod, "qtd_servicos": qtd_serv,
+            "qtd_total": total}
+
+
+# ----- Metas de faturamento (CRUD) — bi_meta_faturamento -----------------
+_BI_UNIDADES_META = {"GENIUS", "ESTRUTURAL ZORTEA"}
+
+
+class MetaFaturamentoPayload(BaseModel):
+    anomes: str
+    unidade_negocio: str
+    vl_meta: float = 0
+
+
+def _bi_meta_normalizar(m: "MetaFaturamentoPayload") -> dict:
+    anomes = re.sub(r"\D", "", str(m.anomes or ""))[:6]
+    if len(anomes) != 6:
+        raise HTTPException(status_code=400,
+                            detail=f"anomes inválido: {m.anomes} (use YYYYMM).")
+    uni = str(m.unidade_negocio or "").strip().upper()
+    if uni not in _BI_UNIDADES_META:
+        raise HTTPException(status_code=400,
+                            detail=f"unidade_negocio inválida: {m.unidade_negocio} "
+                                   "(use GENIUS ou ESTRUTURAL ZORTEA).")
+    # Coluna real da tabela publicada é 'anomes_emissao' (+ ano/mes).
+    return {"anomes_emissao": anomes, "ano": anomes[:4], "mes": anomes[4:6],
+            "unidade_negocio": uni, "vl_meta": float(m.vl_meta or 0)}
+
+
+@app.get("/api/bi/comercial/metas")
+def bi_comercial_metas_listar(
+    anomes_ini: Optional[str] = None, anomes_fim: Optional[str] = None,
+    unidade_negocio: Optional[str] = None, usuario=Depends(validar_token),
+):
+    _supabase_required()
+    params = [("select", "*"), ("order", "anomes_emissao.desc,unidade_negocio.asc")]
+    if anomes_ini:
+        params.append(("anomes_emissao", f"gte.{str(anomes_ini).strip()}"))
+    if anomes_fim:
+        params.append(("anomes_emissao", f"lte.{str(anomes_fim).strip()}"))
+    if unidade_negocio:
+        params.append(("unidade_negocio", f"eq.{str(unidade_negocio).strip().upper()}"))
+    resp = requests.get(
+        f"{SUPABASE_URL}/rest/v1/bi_meta_faturamento",
+        params=params, headers=_supabase_headers("return=representation"), timeout=30,
+    )
+    if resp.status_code not in (200, 206):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase GET bi_meta_faturamento: {resp.status_code} {(resp.text or '')[:300]}")
+    return {"dados": resp.json() if resp.text else []}
+
+
+@app.post("/api/bi/comercial/meta")
+def bi_comercial_meta_upsert(
+    body: List[MetaFaturamentoPayload], usuario=Depends(validar_token),
+):
+    """Cadastra/atualiza metas (upsert por anomes_emissao+unidade_negocio).
+    Aceita lote."""
+    rows = [_bi_meta_normalizar(m) for m in (body or [])]
+    if not rows:
+        raise HTTPException(status_code=400, detail="Envie ao menos uma meta.")
+    _supabase_upsert("bi_meta_faturamento", rows,
+                     on_conflict=["anomes_emissao", "unidade_negocio"])
+    return {"ok": True, "gravadas": len(rows), "metas": rows}
+
+
+@app.delete("/api/bi/comercial/meta")
+def bi_comercial_meta_remover(
+    anomes: str, unidade_negocio: str, usuario=Depends(validar_token),
+):
+    anomes_n = re.sub(r"\D", "", str(anomes or ""))[:6]
+    if len(anomes_n) != 6:
+        raise HTTPException(status_code=400, detail="anomes inválido (use YYYYMM).")
+    uni = str(unidade_negocio or "").strip().upper()
+    _sb_delete("bi_meta_faturamento",
+               [("anomes_emissao", f"eq.{anomes_n}"), ("unidade_negocio", f"eq.{uni}")])
+    return {"ok": True, "anomes_emissao": anomes_n, "unidade_negocio": uni}
+
+
+# ----- Sincronização de metas a partir da UpQuery (Oracle) ---------------
+# Origem da meta: V_FATURAMENTO_META (orçamento já tratado a partir da E650RTO
+# -> VM_ORC_DRE). A view já fixa CD_ORIGEM='META' e joga VL_ORCADO p/ VL_META,
+# então NÃO depende da tarefa ter recarregado a VM_FATURAMENTO antes.
+_META_SQL_UPQUERY = """
+    SELECT
+        ANOMES_EMISSAO,
+        CASE
+            WHEN SUBSTR(CD_CENTRO_CUSTOS_3, 1, 3) = '503' THEN 'GENIUS'
+            WHEN SUBSTR(CD_CENTRO_CUSTOS_3, 1, 3) = '502' THEN 'ESTRUTURAL ZORTEA'
+            ELSE 'OUTROS'
+        END AS UNIDADE_NEGOCIO,
+        CD_CENTRO_CUSTOS_3,
+        COUNT(*) AS QTD_LINHAS,
+        SUM(NVL(VL_META, 0)) AS VL_META
+    FROM EZORTEA.V_FATURAMENTO_META
+    WHERE ANOMES_EMISSAO BETWEEN :anomes_ini AND :anomes_fim
+    GROUP BY
+        ANOMES_EMISSAO,
+        CASE
+            WHEN SUBSTR(CD_CENTRO_CUSTOS_3, 1, 3) = '503' THEN 'GENIUS'
+            WHEN SUBSTR(CD_CENTRO_CUSTOS_3, 1, 3) = '502' THEN 'ESTRUTURAL ZORTEA'
+            ELSE 'OUTROS'
+        END,
+        CD_CENTRO_CUSTOS_3
+    ORDER BY
+        ANOMES_EMISSAO,
+        UNIDADE_NEGOCIO,
+        CD_CENTRO_CUSTOS_3
+"""
+_META_CODIGO_UNIDADE = {"GENIUS": "503", "ESTRUTURAL ZORTEA": "502"}
+
+
+class MetaSyncPayload(BaseModel):
+    anomes_ini: str
+    anomes_fim: str
+    origem: Optional[str] = "UPQUERY_V_FATURAMENTO_META"
+
+
+def _get_upquery_connection():
+    """Conexão Oracle (UpQuery) via oracledb modo thin (sem Instant Client)."""
+    dsn = os.getenv("UPQUERY_ORACLE_DSN", "").strip()
+    user = os.getenv("UPQUERY_ORACLE_USER", "").strip()
+    pwd = os.getenv("UPQUERY_ORACLE_PASSWORD", "").strip()
+    if not (dsn and user and pwd):
+        raise HTTPException(
+            status_code=503,
+            detail="Oracle UpQuery não configurado — defina UPQUERY_ORACLE_DSN, "
+                   "UPQUERY_ORACLE_USER e UPQUERY_ORACLE_PASSWORD no .env.")
+    try:
+        import oracledb
+    except Exception:
+        raise HTTPException(status_code=500,
+                            detail="Driver Oracle ausente: pip install oracledb.")
+    try:
+        return oracledb.connect(user=user, password=pwd, dsn=dsn)
+    except Exception as exc:
+        raise HTTPException(status_code=502,
+                            detail=f"Falha ao conectar no Oracle UpQuery: {exc}")
+
+
+def _meta_unidade_por_ccu3(ccu3) -> str:
+    c = str(ccu3 or "").strip()
+    if c == "503":
+        return "GENIUS"
+    if c == "502":
+        return "ESTRUTURAL ZORTEA"
+    return "OUTROS"
+
+
+def _meta_normalizar_unidade(valor: Optional[str]) -> str:
+    v = str(valor or "").strip().upper()
+    v = v.replace("ESTRUTURAL", "ESTRUTURAL ZORTEA") if v == "ESTRUTURAL" else v
+
+    if v in ("GENIUS", "G"):
+        return "GENIUS"
+
+    if v in ("ESTRUTURAL ZORTEA", "ESTRUTURAL", "ZORTEA", "EZ"):
+        return "ESTRUTURAL ZORTEA"
+
+    return "OUTROS"
+
+
+def _carregar_mapa_unidade_dre() -> dict:
+    """
+    Carrega o cadastro oficial da DRE usado para classificar metas por unidade.
+    Espera a tabela/view public.bi_mapa_unidade_dre no Supabase.
+    """
+    _supabase_required()
+
+    resp = requests.get(
+        f"{SUPABASE_URL}/rest/v1/bi_mapa_unidade_dre",
+        params=[
+            ("select", "cd_centro_custos_3,unidade_negocio,codigo_unidade,descricao_unidade,ativo"),
+            ("ativo", "eq.true"),
+        ],
+        headers=_supabase_headers("return=representation"),
+        timeout=30,
+    )
+
+    if resp.status_code not in (200, 206):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Erro ao ler bi_mapa_unidade_dre: {resp.status_code} {(resp.text or '')[:500]}",
+        )
+
+    mapa = {}
+    for row in (resp.json() if resp.text else []):
+        ccu3 = str(row.get("cd_centro_custos_3") or "").strip()
+        if not ccu3:
+            continue
+
+        unidade = _meta_normalizar_unidade(row.get("unidade_negocio"))
+        mapa[ccu3] = {
+            "unidade_negocio": unidade,
+            "codigo_unidade": str(row.get("codigo_unidade") or "").strip() or None,
+            "descricao_unidade": str(row.get("descricao_unidade") or unidade).strip() or unidade,
+        }
+
+    return mapa
+
+
+def _meta_unidade_por_cadastro_dre(cd_centro_custos_3, mapa_dre: dict) -> dict:
+    ccu3 = str(cd_centro_custos_3 or "").strip()
+
+    if ccu3 in mapa_dre:
+        return mapa_dre[ccu3]
+
+    # fallback antigo para não quebrar enquanto o cadastro DRE não estiver 100%
+    if ccu3 == "503":
+        return {
+            "unidade_negocio": "GENIUS",
+            "codigo_unidade": "503",
+            "descricao_unidade": "GENIUS",
+        }
+
+    if ccu3 == "502":
+        return {
+            "unidade_negocio": "ESTRUTURAL ZORTEA",
+            "codigo_unidade": "502",
+            "descricao_unidade": "ESTRUTURAL ZORTEA",
+        }
+
+    return {
+        "unidade_negocio": "OUTROS",
+        "codigo_unidade": None,
+        "descricao_unidade": "OUTROS",
+    }
+
+
+def _sincronizar_metas_upquery(anomes_ini, anomes_fim,
+                               origem="UPQUERY_V_FATURAMENTO_META") -> dict:
+    ai = re.sub(r"\D", "", str(anomes_ini or ""))[:6]
+    af = re.sub(r"\D", "", str(anomes_fim or ""))[:6]
+    if len(ai) != 6 or len(af) != 6:
+        raise HTTPException(status_code=400,
+                            detail="anomes_ini/anomes_fim inválidos (use YYYYMM).")
+
+    # 0) Cadastro oficial da DRE (cd_centro_custos_3 -> unidade). Se a tabela
+    #    ainda não existir no Supabase, degrada para o fallback fixo (502/503).
+    try:
+        mapa_dre = _carregar_mapa_unidade_dre()
+    except HTTPException as exc:
+        print(f"[META] bi_mapa_unidade_dre indisponível ({getattr(exc, 'detail', exc)}); "
+              "usando fallback fixo 502/503.")
+        mapa_dre = {}
+
+    # 1) Lê as metas no Oracle (UpQuery) — origem oficial: V_FATURAMENTO_META.
+    conn = _get_upquery_connection()
+    detalhe = []
+    uni_info = {}  # unidade_negocio -> {codigo_unidade, descricao_unidade}
+    try:
+        cur = conn.cursor()
+        cur.execute(_META_SQL_UPQUERY, anomes_ini=ai, anomes_fim=af)
+        cols = [c[0].lower() for c in cur.description]
+        for row in cur.fetchall():
+            it = {cols[i]: row[i] for i in range(len(cols))}
+            anomes = re.sub(r"\D", "", str(it.get("anomes_emissao") or ""))[:6]
+            ccu3 = str(it.get("cd_centro_custos_3") or "").strip() or None
+            # Classificação principal pela view (SUBSTR CD_CENTRO_CUSTOS_3);
+            # refino pelo cadastro DRE só quando cair em OUTROS.
+            uni = _meta_normalizar_unidade(it.get("unidade_negocio"))
+            if uni == "OUTROS":
+                cls = _meta_unidade_por_cadastro_dre(ccu3, mapa_dre)
+                uni = cls["unidade_negocio"]
+                uni_info[uni] = cls
+            detalhe.append({
+                "anomes_emissao": anomes,
+                "cd_centro_custos_3": ccu3,
+                "unidade_negocio": uni,
+                "qtd_linhas": int(it.get("qtd_linhas") or 0),
+                "vl_meta": float(it.get("vl_meta") or 0),
+            })
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    # 2) Apaga só o período. Coluna real publicada: 'anomes_emissao'
+    #    (a bi_meta_faturamento NÃO tem 'anomes' nem 'origem_meta').
+    _sb_delete("bi_meta_faturamento",
+               [("anomes_emissao", f"gte.{ai}"), ("anomes_emissao", f"lte.{af}")])
+    # Detalhe é auditoria — se a tabela não existir, não derruba o resumo do BI.
+    try:
+        _sb_delete("bi_meta_faturamento_detalhe",
+                   [("anomes_emissao", f"gte.{ai}"), ("anomes_emissao", f"lte.{af}")])
+        for i in range(0, len(detalhe), ETL_BATCH_UPSERT):
+            _sb_post("bi_meta_faturamento_detalhe", detalhe[i:i + ETL_BATCH_UPSERT],
+                     prefer="return=minimal")
+    except Exception as exc:  # noqa
+        print(f"[META] detalhe ignorado ({exc})")
+
+    # 3) Agrega por (anomes, unidade) e grava o resumo usado pelo BI.
+    agg = {}
+    for d in detalhe:
+        agg.setdefault((d["anomes_emissao"], d["unidade_negocio"]), 0.0)
+        agg[(d["anomes_emissao"], d["unidade_negocio"])] += d["vl_meta"]
+    resumo = []
+    for (anomes, uni), vl in agg.items():
+        if uni == "OUTROS":
+            continue  # só GENIUS/ESTRUTURAL no resumo do BI (CONSOLIDADO = soma das 2)
+        info = uni_info.get(uni, {})
+        resumo.append({
+            "anomes_emissao": anomes,
+            "ano": anomes[:4], "mes": anomes[4:6],
+            "codigo_unidade": info.get("codigo_unidade") or _META_CODIGO_UNIDADE.get(uni),
+            "unidade_negocio": uni,
+            "descricao_unidade": info.get("descricao_unidade") or uni,
+            "vl_meta": round(vl, 2), "observacao": None, "ativo": True,
+            "atualizado_em": _ts(),
+        })
+    for i in range(0, len(resumo), ETL_BATCH_UPSERT):
+        _sb_post("bi_meta_faturamento", resumo[i:i + ETL_BATCH_UPSERT],
+                 prefer="return=minimal")
+
+    # 5) Diagnóstico
+    tot_mes, tot_uni = {}, {}
+    for d in detalhe:
+        tot_mes[d["anomes_emissao"]] = tot_mes.get(d["anomes_emissao"], 0.0) + d["vl_meta"]
+        tot_uni[d["unidade_negocio"]] = tot_uni.get(d["unidade_negocio"], 0.0) + d["vl_meta"]
+    return {
+        "ok": True, "anomes_ini": ai, "anomes_fim": af,
+        "linhas_detalhe": len(detalhe), "linhas_resumo": len(resumo),
+        "totais_por_mes": [{"anomes_emissao": k, "vl_meta": round(v, 2)}
+                           for k, v in sorted(tot_mes.items())],
+        "totais_por_unidade": [{"unidade_negocio": k, "vl_meta": round(v, 2)}
+                               for k, v in sorted(tot_uni.items())],
+    }
+
+
+@app.post("/api/bi/comercial/metas/sincronizar")
+def bi_comercial_metas_sincronizar(
+    body: MetaSyncPayload, usuario=Depends(validar_token_ou_cron_secret),
+):
+    """Importa as metas da UpQuery (Oracle EZORTEA.V_FATURAMENTO_META — orçamento
+    já tratado de E650RTO->VM_ORC_DRE) para bi_meta_faturamento(_detalhe).
+    Aceita JWT ou x-cron-secret."""
+    return _sincronizar_metas_upquery(body.anomes_ini, body.anomes_fim,
+                                      body.origem or "UPQUERY_V_FATURAMENTO_META")
+
+
+# ----- Motor único de DRILL do BI Comercial ------------------------------
+_DRILL_MET_COLS = [
+    {"key": "qtd_linhas", "label": "Linhas"},
+    {"key": "faturamento", "label": "Faturamento"},
+    {"key": "fat_liquido", "label": "Fat. Líquido"},
+    {"key": "impostos", "label": "Impostos"},
+    {"key": "devolucao", "label": "Devolução"},
+    {"key": "quantidade", "label": "Quantidade"},
+    {"key": "numero_vendas", "label": "Vendas"},
+    {"key": "numero_clientes", "label": "Clientes"},
+]
+_DRILL_COLUMNS = {
+    "ACUMULADO": [{"key": "unidade_negocio", "label": "Unidade"}] + _DRILL_MET_COLS,
+    "MENSAL":    [{"key": "anomes_emissao", "label": "Mês"}] + _DRILL_MET_COLS,
+    "ESTADO":    [{"key": "estado_label", "label": "Estado"}] + _DRILL_MET_COLS,
+    "CLIENTE":   [{"key": "cliente_label", "label": "Cliente"}] + _DRILL_MET_COLS,
+    "REVENDA":   [{"key": "revenda_label", "label": "Revenda"}] + _DRILL_MET_COLS,
+    "OBRAS":     [{"key": "obra_label", "label": "Obra"}] + _DRILL_MET_COLS,
+    "PRODUTO":   [{"key": "produto_label", "label": "Produto"},
+                  {"key": "cd_derivacao", "label": "Derivação"},
+                  {"key": "cd_familia", "label": "Família"}] + _DRILL_MET_COLS,
+    "NOTA_FISCAL": [
+        {"key": "dt_emissao", "label": "Emissão"}, {"key": "cd_nf", "label": "NF"},
+        {"key": "cd_serie", "label": "Série"}, {"key": "cd_cliente", "label": "Cliente"},
+        {"key": "cd_estado", "label": "Estado"},
+        {"key": "cd_produto", "label": "Produto"}, {"key": "ds_produto", "label": "Descrição"},
+        {"key": "cd_derivacao", "label": "Derivação"},
+        {"key": "cd_tns", "label": "TNS"},
+        {"key": "cd_origem", "label": "Origem"}, {"key": "cd_tp_movimento", "label": "Movimento"},
+        {"key": "faturamento", "label": "Faturamento"},
+        {"key": "vl_desconto", "label": "Desconto"},
+        {"key": "impostos", "label": "Impostos"},
+        {"key": "devolucao", "label": "Devolução"},
+        {"key": "vl_total_nota", "label": "Total da Nota"},
+        {"key": "vl_liquido_nota", "label": "Total Líquido da Nota"},
+    ],
+    "DETALHES_IMPOSTOS": [
+        {"key": "anomes_emissao", "label": "Ano/Mês"},
+        {"key": "dt_emissao", "label": "Emissão"}, {"key": "cd_nf", "label": "NF"},
+        {"key": "cd_serie", "label": "Série"}, {"key": "cd_cliente", "label": "Cliente"},
+        {"key": "cliente_label", "label": "Nome Cliente"},
+        {"key": "cd_produto", "label": "Produto"}, {"key": "ds_produto", "label": "Descrição"},
+        {"key": "cd_derivacao", "label": "Derivação"},
+        {"key": "cd_tns", "label": "TNS"},
+        {"key": "vl_desconto", "label": "Desconto"},
+        {"key": "vl_icms", "label": "ICMS"},
+        {"key": "vl_ipi", "label": "IPI"}, {"key": "vl_pis", "label": "PIS"},
+        {"key": "vl_cofins", "label": "COFINS"}, {"key": "vl_iss", "label": "ISS"},
+        {"key": "vl_icmsst", "label": "ICMS ST"}, {"key": "vl_difal", "label": "DIFAL"},
+        {"key": "vl_impostos", "label": "Impostos"},
+        {"key": "vl_total_nota", "label": "Total da Nota"},
+        {"key": "vl_liquido_nota", "label": "Total Líquido da Nota"},
+    ],
+}
+_DRILL_TITULO = {
+    "ACUMULADO": "Drill Acumulado", "MENSAL": "Drill Mensal", "ESTADO": "Drill por Estado",
+    "CLIENTE": "Drill por Cliente", "REVENDA": "Drill por Revenda", "OBRAS": "Drill por Obra",
+    "PRODUTO": "Drill por Produto",
+    "NOTA_FISCAL": "Drill por Nota Fiscal", "DETALHES_IMPOSTOS": "Detalhes de Impostos",
+}
+_DRILL_CTX_KEYS = ["anomes_emissao", "cd_estado", "cd_cliente", "cd_prj", "cd_rev_pedido",
+                   "cd_origem", "cd_tp_movimento", "cd_tns", "cd_nf", "categoria_custom",
+                   "cd_produto", "cd_derivacao"]
+
+# Por drill_type, quais colunas da linha viram filtro técnico p/ o próximo nível.
+# O front usa isso (e NÃO o label) para empilhar o contexto e montar
+# botões "Remover Produto/Cliente/Revenda".
+_DRILL_ROW_FILTROS = {
+    "ACUMULADO": [("unidade_negocio", "unidade_negocio")],
+    "MENSAL": [("anomes_emissao", "anomes_emissao")],
+    "ESTADO": [("cd_estado", "cd_estado")],
+    "CLIENTE": [("cd_cliente", "cd_cliente")],
+    "REVENDA": [("cd_rev_pedido", "cd_rev_pedido")],
+    "OBRAS": [("cd_prj", "cd_prj")],
+    "PRODUTO": [("cd_produto", "cd_produto"), ("cd_derivacao", "cd_derivacao")],
+    "NOTA_FISCAL": [("cd_nf", "cd_nf")],
+    "DETALHES_IMPOSTOS": [("cd_nf", "cd_nf")],
+}
+
+
+class DrillPayload(BaseModel):
+    drill_type: str
+    anomes_ini: Optional[str] = None
+    anomes_fim: Optional[str] = None
+    unidade_negocio: Optional[str] = None
+    contexto: Optional[Dict[str, Any]] = None
+    page: int = 1
+    page_size: int = 100
+
+
+# Rótulo de cada filtro (pela SUA dimensão) e nome do nível atual do drill.
+_DRILL_FILTRO_LABEL = {
+    "anomes_emissao": "Mês", "cd_estado": "Estado", "cd_cliente": "Cliente",
+    "cd_prj": "Projeto", "cd_rev_pedido": "Revenda", "cd_origem": "Origem",
+    "cd_tp_movimento": "Movimento", "cd_tns": "TNS", "cd_nf": "NF",
+    "cd_produto": "Produto", "cd_derivacao": "Derivação", "categoria_custom": "Categoria",
+}
+# Ordem hierárquica da trilha (filtros já aplicados).
+_DRILL_BREADCRUMB_ORDER = ["anomes_emissao", "cd_estado", "cd_cliente", "cd_rev_pedido",
+                           "cd_prj", "cd_produto", "cd_derivacao", "cd_tns", "cd_nf",
+                           "cd_origem", "cd_tp_movimento", "categoria_custom"]
+_DRILL_NIVEL_LABEL = {
+    "ACUMULADO": "Acumulado", "MENSAL": "Mês", "ESTADO": "Estado", "CLIENTE": "Cliente",
+    "REVENDA": "Revenda", "OBRAS": "Obra", "PRODUTO": "Produto", "NOTA_FISCAL": "Nota Fiscal",
+    "DETALHES_IMPOSTOS": "Impostos",
+}
+# De-para sigla -> nome da UF (p/ estado_label = 'PA - Pará').
+_UF_NOMES = {
+    "AC": "Acre", "AL": "Alagoas", "AP": "Amapá", "AM": "Amazonas", "BA": "Bahia",
+    "CE": "Ceará", "DF": "Distrito Federal", "ES": "Espírito Santo", "GO": "Goiás",
+    "MA": "Maranhão", "MT": "Mato Grosso", "MS": "Mato Grosso do Sul", "MG": "Minas Gerais",
+    "PA": "Pará", "PB": "Paraíba", "PR": "Paraná", "PE": "Pernambuco", "PI": "Piauí",
+    "RJ": "Rio de Janeiro", "RN": "Rio Grande do Norte", "RS": "Rio Grande do Sul",
+    "RO": "Rondônia", "RR": "Roraima", "SC": "Santa Catarina", "SP": "São Paulo",
+    "SE": "Sergipe", "TO": "Tocantins", "EX": "Exterior",
+}
+_MESES_ABBR = ["", "Jan", "Fev", "Mar", "Abr", "Mai", "Jun",
+               "Jul", "Ago", "Set", "Out", "Nov", "Dez"]
+
+
+def _fmt_anomes(am) -> str:
+    """'202601' -> 'Jan/2026' (devolve o original se não for AAAAMM)."""
+    s = str(am or "").strip()
+    if len(s) == 6 and s.isdigit():
+        mes = int(s[4:6])
+        if 1 <= mes <= 12:
+            return f"{_MESES_ABBR[mes]}/{s[:4]}"
+    return s
+
+
+def _drill_breadcrumb(unidade, ctx, drill):
+    """Trilha = [unidade] + filtros JÁ APLICADOS (cada um rotulado pela SUA
+    dimensão, formato 'Rótulo: valor') + NÍVEL ATUAL (só rótulo, sem valor).
+    O valor NUNCA é colado no nível atual -> corrige 'Cliente: PA' (PA é Estado).
+    Cada nó traz 'filtro' técnico (só o código) p/ o botão Remover."""
+    bc = []
+    if unidade and str(unidade).upper() != "CONSOLIDADO":
+        bc.append({"label": unidade, "rotulo": "Unidade", "valor": unidade,
+                   "filtro": {"unidade_negocio": unidade}})
+    else:
+        bc.append({"label": "Consolidado", "rotulo": "Unidade", "valor": None,
+                   "filtro": {}})
+    for k in _DRILL_BREADCRUMB_ORDER:
+        v = ctx.get(k)
+        if v not in (None, ""):
+            rot = _DRILL_FILTRO_LABEL.get(k, k)
+            bc.append({"label": f"{rot}: {v}", "rotulo": rot, "valor": v,
+                       "filtro": {k: v}})
+    nivel = _DRILL_NIVEL_LABEL.get(str(drill).upper(), str(drill).title())
+    bc.append({"label": nivel, "rotulo": nivel, "valor": None,
+               "atual": True, "filtro": {}})
+    return bc
+
+
+def _lbl_cod_desc(cod, desc):
+    """'cod - desc' (fallback p/ só cod; '' se ambos vazios)."""
+    cod = "" if cod in (None, "") else str(cod)
+    desc = desc.strip() if isinstance(desc, str) else ("" if desc is None else str(desc))
+    if desc and desc != cod:
+        return f"{cod} - {desc}" if cod else desc
+    return cod
+
+
+def _lbl_cliente(r):
+    return _lbl_cod_desc(r.get("cd_cliente"), r.get("nm_cliente"))
+
+
+def _lbl_produto(r):
+    return _lbl_cod_desc(r.get("cd_produto"), r.get("ds_produto"))
+
+
+def _lbl_estado(r):
+    uf = r.get("cd_estado")
+    uf = str(uf).strip() if uf not in (None, "") else ""
+    nome = _UF_NOMES.get(uf.upper()) if uf else None
+    return (f"{uf} - {nome}" if nome else uf)
+
+
+# 1ª chave técnica não-vazia (fallback p/ garantir label nunca nulo).
+_DRILL_LABEL_FALLBACK_KEYS = ("cd_cliente", "cd_produto", "cd_rev_pedido", "cd_estado",
+                              "cd_prj", "cd_nf", "anomes_emissao", "unidade_negocio")
+
+
+def _drill_enriquecer_rows(drill, rows):
+    """Padroniza cada linha do drill: 'filtros_drill' (só código técnico),
+    'label'/'display_label' (nome amigável, nunca nulo se houver código),
+    'value'/'faturamento', e os '*_label' por dimensão. Centraliza p/ valer
+    no endpoint e no export."""
+    drill = str(drill or "").upper().strip()
+    pares = _DRILL_ROW_FILTROS.get(drill, [])
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        # filtros_drill (sempre presente; só códigos técnicos)
+        fd = {}
+        for rk, fk in pares:
+            v = r.get(rk)
+            if v not in (None, ""):
+                fd[fk] = v
+        r["filtros_drill"] = fd
+
+        # label por nível (+ nm_*/ds_* prontos p/ o front)
+        lbl = ""
+        if drill == "CLIENTE":
+            lbl = _lbl_cliente(r); r["cliente_label"] = lbl
+        elif drill == "REVENDA":
+            rev = r.get("cd_rev_pedido")
+            cod = "" if rev in (None, "") else str(rev).strip()
+            lbl = cod
+            r["nm_revenda"] = cod or None   # a fonte grava o nome em cd_rev_pedido
+            r["revenda_label"] = lbl
+        elif drill == "ESTADO":
+            uf = r.get("cd_estado")
+            uf = str(uf).strip() if uf not in (None, "") else ""
+            r["nm_estado"] = _UF_NOMES.get(uf.upper()) if uf else None
+            lbl = _lbl_estado(r); r["estado_label"] = lbl
+        elif drill == "PRODUTO":
+            lbl = _lbl_produto(r); r["produto_label"] = lbl
+        elif drill == "OBRAS":
+            cd = r.get("cd_prj")
+            ds = r.get("ds_obra") or r.get("ds_abr_prj")
+            r["cd_obra"] = ("" if cd in (None, "") else str(cd)) or None
+            r["ds_obra"] = (str(ds).strip() if ds not in (None, "") else None)
+            lbl = _lbl_cod_desc(cd, ds)
+            r["obra_label"] = lbl
+        elif drill == "ACUMULADO":
+            uni = r.get("unidade_negocio")
+            lbl = "" if uni in (None, "") else str(uni)
+        elif drill == "MENSAL":
+            am = r.get("anomes_emissao")
+            lbl = "" if am in (None, "") else str(am)
+            r["anomes_label"] = _fmt_anomes(am)
+            r["serie"] = lbl
+            r["serie_label"] = r["anomes_label"]
+        elif drill in ("NOTA_FISCAL", "DETALHES_IMPOSTOS"):
+            nf = r.get("cd_nf"); serie = r.get("cd_serie")
+            nf_s = "" if nf in (None, "") else str(nf)
+            serie_s = "" if serie in (None, "") else str(serie)
+            if nf_s:
+                r["nf_label"] = (f"{serie_s}-{nf_s}" if serie_s else nf_s)
+                lbl = f"NF {nf_s}"
+            # listas analíticas também carregam labels de cliente/produto
+            r["cliente_label"] = _lbl_cliente(r)
+            r["produto_label"] = _lbl_produto(r)
+
+        if not lbl:  # nunca nulo se houver qualquer código técnico
+            for k in _DRILL_LABEL_FALLBACK_KEYS:
+                v = r.get(k)
+                if v not in (None, ""):
+                    lbl = str(v); break
+        r["label"] = lbl
+        r["display_label"] = lbl
+        # genéricos p/ gráficos/rankings (categoria = código técnico primário)
+        r["categoria"] = (fd.get(pares[0][1]) if pares else None)
+        r["categoria_label"] = lbl
+
+        # value / faturamento (impostos: value = total de impostos, sem fingir faturamento)
+        if r.get("faturamento") is not None:
+            val = r.get("faturamento")
+        elif r.get("vl_bruto") is not None:
+            val = r.get("vl_bruto"); r.setdefault("faturamento", val)
+        elif r.get("vl_impostos") is not None:
+            val = r.get("vl_impostos")
+        else:
+            val = None
+        r["value"] = val
+        r["valor"] = val
+    return rows
+
+
+def _bi_lookup_produtos_supabase(codigos: list) -> dict:
+    """Busca descrições na dimensão public.bi_produto. Retorna {cd_produto: ds_produto}.
+    Safety-net: funciona mesmo se a view/RPC não fizer o JOIN com bi_produto."""
+    codigos_limpos, vistos = [], set()
+    for c in codigos or []:
+        cd = str(c or "").strip()
+        if not cd or cd in vistos:
+            continue
+        vistos.add(cd)
+        codigos_limpos.append(cd)
+    if not codigos_limpos:
+        return {}
+
+    _supabase_required()
+    mapa, lote = {}, 100
+    for i in range(0, len(codigos_limpos), lote):
+        parte = codigos_limpos[i:i + lote]
+        in_filter = "in.(" + ",".join([f'"{x}"' for x in parte]) + ")"
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/bi_produto",
+            params={"select": "cd_produto,ds_produto", "cd_produto": in_filter},
+            headers=_supabase_headers("return=representation"),
+            timeout=30,
+        )
+        if resp.status_code not in (200, 206):
+            print(f"[BI DRILL] Falha ao buscar bi_produto: {resp.status_code} "
+                  f"{(resp.text or '')[:300]}")
+            continue
+        for row in (resp.json() if resp.text else []):
+            cd = str(row.get("cd_produto") or "").strip()
+            ds = str(row.get("ds_produto") or "").strip()
+            if cd and ds:
+                mapa[cd] = ds
+    return mapa
+
+
+def _bi_drill_preencher_descricao_produto(rows: list) -> list:
+    """Garante ds_produto preenchido nas linhas que têm cd_produto mas vieram
+    sem descrição (busca em bi_produto). Recalcula produto_label."""
+    if not rows:
+        return rows
+    codigos = [
+        str(r.get("cd_produto") or "").strip()
+        for r in rows
+        if isinstance(r, dict)
+        and str(r.get("cd_produto") or "").strip()
+        and not str(r.get("ds_produto") or "").strip()
+    ]
+    if not codigos:
+        return rows
+    mapa_produtos = _bi_lookup_produtos_supabase(codigos)
+    if not mapa_produtos:
+        return rows
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        cd = str(r.get("cd_produto") or "").strip()
+        ds_atual = str(r.get("ds_produto") or "").strip()
+        if not ds_atual and cd in mapa_produtos:
+            r["ds_produto"] = mapa_produtos[cd]
+            try:
+                r["produto_label"] = _lbl_produto(r)
+            except Exception:
+                pass
+    return rows
+
+
+def _bi_lookup_clientes_supabase(codigos: list) -> dict:
+    """Busca nomes na dimensão public.bi_cliente. Retorna {cd_cliente: nm_cliente}.
+    Safety-net: funciona mesmo se a view/RPC não fizer o JOIN com bi_cliente."""
+    codigos_limpos, vistos = [], set()
+    for c in codigos or []:
+        cd = str(c or "").strip()
+        if not cd or cd in vistos:
+            continue
+        vistos.add(cd)
+        codigos_limpos.append(cd)
+    if not codigos_limpos:
+        return {}
+
+    _supabase_required()
+    mapa, lote = {}, 100
+    for i in range(0, len(codigos_limpos), lote):
+        parte = codigos_limpos[i:i + lote]
+        in_filter = "in.(" + ",".join([f'"{x}"' for x in parte]) + ")"
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/bi_cliente",
+            params={"select": "cd_cliente,nm_cliente", "cd_cliente": in_filter},
+            headers=_supabase_headers("return=representation"),
+            timeout=30,
+        )
+        if resp.status_code not in (200, 206):
+            print(f"[BI DRILL] Falha ao buscar bi_cliente: {resp.status_code} "
+                  f"{(resp.text or '')[:300]}")
+            continue
+        for row in (resp.json() if resp.text else []):
+            cd = str(row.get("cd_cliente") or "").strip()
+            nm = str(row.get("nm_cliente") or "").strip()
+            if cd and nm:
+                mapa[cd] = nm
+    return mapa
+
+
+def _bi_drill_preencher_nome_cliente(rows: list) -> list:
+    """Garante nm_cliente preenchido nas linhas que têm cd_cliente mas vieram
+    sem nome (busca em bi_cliente). Recalcula cliente_label."""
+    if not rows:
+        return rows
+    codigos = [
+        str(r.get("cd_cliente") or "").strip()
+        for r in rows
+        if isinstance(r, dict)
+        and str(r.get("cd_cliente") or "").strip()
+        and not str(r.get("nm_cliente") or "").strip()
+    ]
+    if not codigos:
+        return rows
+    mapa = _bi_lookup_clientes_supabase(codigos)
+    if not mapa:
+        return rows
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        cd = str(r.get("cd_cliente") or "").strip()
+        if not str(r.get("nm_cliente") or "").strip() and cd in mapa:
+            r["nm_cliente"] = mapa[cd]
+            try:
+                r["cliente_label"] = _lbl_cliente(r)
+            except Exception:
+                pass
+    return rows
+
+
+def _bi_drill_preencher_dimensoes(rows: list) -> list:
+    """Safety-net combinado: preenche ds_produto (bi_produto) e nm_cliente
+    (bi_cliente) quando a view/RPC não trouxe. Idempotente."""
+    _bi_drill_preencher_descricao_produto(rows)
+    _bi_drill_preencher_nome_cliente(rows)
+    return rows
+
+
+def _bi_preencher_totais_nota(rows: list) -> list:
+    """Preenche vl_total_nota / vl_liquido_nota por linha = total consolidado da
+    NF (soma de TODAS as linhas da mesma NF) — chave (cd_empresa, cd_filial,
+    cd_nf, cd_serie). Todas as linhas da mesma NF recebem o mesmo valor.
+    Só preenche quando a RPC não trouxe (setdefault). Atenção: agrega sobre as
+    linhas PRESENTES na resposta — exato quando a NF cabe no conjunto retornado
+    (a janela analítica na RPC, via migração, é exata entre páginas)."""
+    if not rows:
+        return rows
+    tot = {}
+    for r in rows:
+        if not isinstance(r, dict) or r.get("cd_nf") in (None, ""):
+            continue
+        key = (r.get("cd_empresa"), r.get("cd_filial"), r.get("cd_nf"), r.get("cd_serie"))
+        # bruto: vl_total -> vl_bruto -> faturamento (alias usado nas listas/drill)
+        bruto = r.get("vl_total")
+        if bruto is None:
+            bruto = r.get("vl_bruto")
+        if bruto is None:
+            bruto = r.get("faturamento")
+        bruto = _bi_num(bruto)
+        # líquido: vl_liquido -> fat_liquido -> (fallback) bruto
+        liq = r.get("vl_liquido")
+        if liq is None:
+            liq = r.get("fat_liquido")
+        liq = _bi_num(liq) if liq is not None else bruto
+        acc = tot.setdefault(key, [0.0, 0.0])
+        acc[0] += bruto
+        acc[1] += liq
+    for r in rows:
+        if not isinstance(r, dict) or r.get("cd_nf") in (None, ""):
+            continue
+        key = (r.get("cd_empresa"), r.get("cd_filial"), r.get("cd_nf"), r.get("cd_serie"))
+        if key in tot:
+            r.setdefault("vl_total_nota", round(tot[key][0], 2))
+            r.setdefault("vl_liquido_nota", round(tot[key][1], 2))
+    return rows
+
+
+def _bi_preencher_desconto(items: list) -> list:
+    """Preenche vl_desconto por linha (via 'id' na view) quando a RPC publicada
+    não trouxe. A v_bi_faturamento_comercial expõe vl_desconto (= bi_faturamento).
+    Safety-net exato por linha (id é único)."""
+    if not items:
+        return items
+    ids = list({str(it.get("id")) for it in items
+                if isinstance(it, dict) and it.get("id") is not None
+                and "vl_desconto" not in it})
+    if not ids:
+        return items
+    mapa, lote = {}, 150
+    for i in range(0, len(ids), lote):
+        parte = ids[i:i + lote]
+        in_filter = "in.(" + ",".join(parte) + ")"
+        try:
+            resp = requests.get(
+                f"{SUPABASE_URL}/rest/v1/v_bi_faturamento_comercial",
+                params={"select": "id,vl_desconto", "id": in_filter},
+                headers=_supabase_headers("return=representation"), timeout=30)
+            if resp.status_code not in (200, 206):
+                print(f"[BI] desconto lookup: {resp.status_code} {(resp.text or '')[:200]}")
+                continue
+            for row in (resp.json() or []):
+                mapa[str(row.get("id"))] = _bi_num(row.get("vl_desconto"))
+        except Exception as exc:  # noqa
+            print(f"[BI] desconto lookup falhou: {exc}")
+    for it in items:
+        if isinstance(it, dict) and it.get("id") is not None:
+            it.setdefault("vl_desconto", mapa.get(str(it.get("id")), 0.0))
+    return items
+
+
+def _drill_args_from_body(body: "DrillPayload"):
+    """Monta os args p_* da RPC de drill (sem paginação). Reusado no export."""
+    ctx = body.contexto or {}
+
+    def c(k):
+        v = ctx.get(k)
+        return str(v).strip() if v not in (None, "") else None
+
+    drill = str(body.drill_type or "MENSAL").upper().strip()
+    cat = ctx.get("categoria_custom")
+    cat = str(cat).strip().upper() if cat not in (None, "") else None
+    uni = str(body.unidade_negocio).strip() if body.unidade_negocio else None
+    args = {
+        "p_drill_type": drill,
+        "p_anomes_ini": (str(body.anomes_ini).strip() if body.anomes_ini else None),
+        "p_anomes_fim": (str(body.anomes_fim).strip() if body.anomes_fim else None),
+        "p_unidade_negocio": uni,
+        "p_anomes_emissao": c("anomes_emissao"), "p_cd_estado": c("cd_estado"),
+        "p_cd_cliente": c("cd_cliente"), "p_cd_prj": c("cd_prj"),
+        "p_cd_rev_pedido": c("cd_rev_pedido"), "p_cd_origem": c("cd_origem"),
+        "p_cd_tp_movimento": c("cd_tp_movimento"), "p_cd_tns": c("cd_tns"),
+        "p_cd_nf": c("cd_nf"), "p_categoria_custom": cat,
+        # IMPORTANTE: cd_produto guarda o valor COMPLETO com prefixo (ex.: 1-200000003).
+        "p_cd_produto": c("cd_produto"), "p_cd_derivacao": c("cd_derivacao"),
+    }
+    return args, drill, uni, ctx
+
+
+def _drill_coletar_tudo(args, total_cap=50000):
+    """Pagina a RPC de drill (500/pág) até trazer tudo (cap de segurança)."""
+    a = {**args, "p_page_size": 500}
+    rows, total, page = [], 0, 1
+    while True:
+        a["p_page"] = page
+        res = _bi_unwrap_rpc(_sb_rpc("bi_comercial_drill", a), "bi_comercial_drill") or {}
+        batch = res.get("rows") or []
+        if page == 1:
+            total = int(res.get("total") or 0)
+        rows.extend(batch)
+        if (len(batch) < 500 or len(rows) >= total
+                or len(rows) >= total_cap or page >= 200):
+            break
+        page += 1
+    rows = rows[:total_cap]
+    rows = _bi_drill_preencher_dimensoes(rows)
+    _drill_enriquecer_rows(str(args.get("p_drill_type") or "MENSAL").upper(), rows)
+    _bi_preencher_totais_nota(rows)
+    return rows, total
+
+
+@app.post("/api/bi/comercial/drill")
+def bi_comercial_drill(body: DrillPayload, usuario=Depends(validar_token_ou_cron_secret)):
+    """Motor único de drill (UpQuery-like). Aplica contexto acumulado +
+    categoria_custom. Nunca 500 com filtros null; sem dados -> 200 + diagnóstico."""
+    args, drill, uni, ctx = _drill_args_from_body(body)
+    p_page = max(1, int(body.page or 1))
+    p_size = max(1, min(int(body.page_size or 100), 500))
+    args = {**args, "p_page": p_page, "p_page_size": p_size}
+    res = _bi_unwrap_rpc(_sb_rpc("bi_comercial_drill", args), "bi_comercial_drill") or {}
+    rows = res.get("rows") or []
+    total = int(res.get("total") or 0)
+
+    # Safety-net: preenche ds_produto (bi_produto) e nm_cliente (bi_cliente)
+    # quando a RPC/view não trouxe. Antes do enriquecimento p/ label correto.
+    rows = _bi_drill_preencher_dimensoes(rows)
+    # filtros_drill (código técnico p/ empilhar contexto) + label do cliente.
+    _drill_enriquecer_rows(drill, rows)
+    # Total consolidado por NF (no-op p/ níveis sem cd_nf).
+    _bi_preencher_totais_nota(rows)
+
+    contexto_aplicado = {k: args[f"p_{k}"] for k in _DRILL_CTX_KEYS if args.get(f"p_{k}")}
+
+    # Diagnóstico incremental vindo da RPC (contagem por etapa + filtro_que_zerou).
+    diag_rpc = res.get("diagnostico") if isinstance(res.get("diagnostico"), dict) else {}
+    diagnostico = {
+        "qtd_linhas_base": int(res.get("qtd_base") or 0),
+        "qtd_linhas_filtradas": int(res.get("qtd_filtrada") or 0),
+        "anomes_ini": body.anomes_ini, "anomes_fim": body.anomes_fim,
+        "unidade_negocio": uni or "CONSOLIDADO", "drill_type": drill,
+    }
+    diagnostico.update(diag_rpc)  # qtd_linhas_apos_* / filtro_que_zerou / filtros_aplicados
+
+    mensagem = res.get("mensagem")
+    if not rows:
+        fz = diag_rpc.get("filtro_que_zerou")
+        if not mensagem:
+            mensagem = "Não existem registros para esta combinação de filtros."
+        diagnostico["motivo"] = (
+            f"O filtro '{fz}' zerou o resultado (remova-o para voltar a ter dados)."
+            if fz else "Nenhum registro encontrado para os filtros aplicados")
+        if fz:
+            diagnostico["filtro_que_zerou"] = fz
+
+    return {
+        "ok": True, "drill_type": drill,
+        "titulo": _DRILL_TITULO.get(drill, f"Drill {drill}"),
+        "page": p_page, "page_size": p_size, "total": total,
+        "columns": _DRILL_COLUMNS.get(drill, _DRILL_COLUMNS["MENSAL"]),
+        "rows": rows, "contexto_aplicado": contexto_aplicado,
+        "breadcrumb": _drill_breadcrumb(uni, ctx, drill),
+        "mensagem": mensagem, "diagnostico": diagnostico,
+    }
+
+
+@app.post("/api/bi/comercial/drill/export")
+def bi_comercial_drill_export(
+    body: DrillPayload,
+    formato: str = Query("xlsx"),
+    usuario=Depends(validar_token_ou_cron_secret),
+):
+    """Exporta o drill atual (mesmos filtros/contexto) em CSV ou XLSX.
+    Pagina a RPC bi_comercial_drill (500/pág) até trazer tudo (cap de segurança).
+    formato: 'xlsx' (default) | 'csv'."""
+    args, drill, uni, ctx = _drill_args_from_body(body)
+    rows, _total = _drill_coletar_tudo(args)
+    cols = _DRILL_COLUMNS.get(drill, _DRILL_COLUMNS["MENSAL"])
+    cabecalhos = {c["key"]: c["label"] for c in cols}
+    # Garante ordem/colunas conforme _DRILL_COLUMNS (descarta chaves extras).
+    rows_ord = [{k: r.get(k) for k in cabecalhos} for r in rows]
+    titulo = _DRILL_TITULO.get(drill, f"Drill {drill}")
+    base = f"drill_{drill.lower()}_{(uni or 'consolidado')}"
+    base = re.sub(r"[^0-9a-zA-Z_]+", "_", base).strip("_") or "drill"
+    fmt = (formato or "xlsx").strip().lower()
+    if fmt == "csv":
+        return _csv_response(f"{base}.csv", rows_ord, cabecalhos)
+    return _xlsx_response(f"{base}.xlsx", [(titulo, rows_ord, cabecalhos)])
+
+
+# ----- "Gerar gráfico com IA" — BI conversacional -------------------------
+# A IA (ou fallback por palavra-chave) gera uma INTENÇÃO estruturada; a API
+# valida contra whitelists (NUNCA SQL livre) e consulta via bi_comercial_dimensao.
+_IA_METRICAS = {
+    "faturamento": "vl_bruto", "faturamento_liquido": "vl_liquido",
+    "liquido": "vl_liquido", "impostos": "vl_impostos", "devolucao": "vl_devolucao",
+    "custo": "vl_custo", "quantidade": "quantidade",
+    "clientes": "qtd_clientes", "vendas": "qtd_vendas",
+}
+_IA_DIMENSOES = {"mix", "estado", "cliente", "revenda", "obras", "mensal", "tns", "unidade"}
+_IA_TIPOS = {"donut", "pie", "bar", "line"}
+_IA_METRICA_LABEL = {
+    "vl_bruto": "Faturamento", "vl_liquido": "Faturamento Líquido",
+    "vl_impostos": "Impostos", "vl_devolucao": "Devolução", "vl_custo": "Custo",
+    "quantidade": "Quantidade", "qtd_clientes": "Clientes", "qtd_vendas": "Vendas",
+}
+_IA_DIMENSAO_LABEL = {
+    "mix": "Origem", "estado": "Estado", "cliente": "Cliente", "revenda": "Revenda",
+    "obras": "Obra/Projeto", "mensal": "Mês", "tns": "Transação", "unidade": "Unidade",
+    "categoria_custom": "categoria", "cd_origem": "Origem", "origem": "Origem",
+    "cd_estado": "Estado", "cd_cliente": "Cliente", "cd_prj": "Obra/Projeto",
+    "cd_rev_pedido": "Revenda", "cd_tns": "Transação", "anomes_emissao": "Mês",
+    "tipo_movimento": "Movimento", "cd_tp_movimento": "Movimento",
+}
+# Mapa dimensão -> coluna usada nos filtros_drill de cada série.
+_IA_DRILL_COL = {
+    "categoria_custom": "categoria_custom",
+    "mix": "cd_origem", "origem": "cd_origem", "cd_origem": "cd_origem",
+    "estado": "cd_estado", "cd_estado": "cd_estado",
+    "cliente": "cd_cliente", "cd_cliente": "cd_cliente",
+    "obras": "cd_prj", "cd_prj": "cd_prj",
+    "revenda": "cd_rev_pedido", "cd_rev_pedido": "cd_rev_pedido",
+    "tns": "cd_tns", "cd_tns": "cd_tns",
+    "mensal": "anomes_emissao", "anomes_emissao": "anomes_emissao",
+    "tipo_movimento": "cd_tp_movimento", "cd_tp_movimento": "cd_tp_movimento",
+    "unidade": "unidade_negocio",
+}
+
+
+class IaGraficoPayload(BaseModel):
+    prompt: Optional[str] = None
+    anomes_ini: Optional[str] = None
+    anomes_fim: Optional[str] = None
+    unidade_negocio: Optional[str] = None
+    # Config estruturada (alternativa ao prompt — interpretada pela Cloud/IA).
+    tipo_grafico: Optional[str] = None
+    metrica: Optional[str] = None
+    dimensao: Optional[str] = None
+    grupos: Optional[List[str]] = None
+    mostrar_percentual: Optional[bool] = None
+    limite: Optional[int] = None
+    ordem: Optional[str] = None
+    comparar_meta: Optional[bool] = None
+    incluir_outros: Optional[bool] = None
+    filtros: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="after")
+    def _validar_prompt_ou_config(self):
+        tem_prompt = bool(self.prompt and self.prompt.strip())
+        tem_config = bool(self.tipo_grafico and self.metrica and self.dimensao)
+        if not tem_prompt and not tem_config:
+            raise ValueError("Informe 'prompt' ou a configuração estruturada "
+                             "(tipo_grafico, metrica e dimensao).")
+        return self
+
+
+def _ia_interpretar_keyword(prompt: str) -> dict:
+    """Interpretador determinístico por palavra-chave (fallback sem LLM)."""
+    p = (prompt or "").lower()
+    if "rosca" in p or "donut" in p:
+        tipo = "donut"
+    elif "pizza" in p or "pie" in p:
+        tipo = "pie"
+    elif "linha" in p or "evolu" in p or "ao longo" in p:
+        tipo = "line"
+    elif "barra" in p:
+        tipo = "bar"
+    else:
+        tipo = "donut"
+
+    if "líquid" in p or "liquid" in p:
+        met = "faturamento_liquido"
+    elif "imposto" in p:
+        met = "impostos"
+    elif "devolu" in p:
+        met = "devolucao"
+    elif "custo" in p:
+        met = "custo"
+    elif ("nº de cliente" in p or "numero de cliente" in p or "número de cliente" in p
+          or "quantos cliente" in p):
+        met = "clientes"
+    elif ("nº de venda" in p or "numero de venda" in p or "número de venda" in p
+          or "quantas venda" in p):
+        met = "vendas"
+    elif "quantidade" in p:
+        met = "quantidade"
+    else:
+        met = "faturamento"
+
+    grupos = []
+    if "peça" in p or "peca" in p:
+        grupos.append("PEÇAS")
+    if "serviço" in p or "servico" in p:
+        grupos.append("SERVIÇOS")
+    if "máquina" in p or "maquina" in p:
+        grupos.append("MÁQUINAS")
+
+    if ((("peça" in p or "peca" in p) and ("serviço" in p or "servico" in p))
+            or "categoria" in p):
+        dim = "categoria_custom"
+    elif "estado" in p:
+        dim = "estado"
+    elif "cliente" in p and met != "clientes":
+        dim = "cliente"
+    elif "revenda" in p:
+        dim = "revenda"
+    elif "obra" in p or "projeto" in p:
+        dim = "obras"
+    elif "mês" in p or "mensal" in p or "evolu" in p or "por mes" in p:
+        dim = "mensal"
+    elif "transaç" in p or "tns" in p:
+        dim = "tns"
+    elif "fonte" in p or "conciliaç" in p:
+        dim = "fonte"
+    elif "movimento" in p or "tipo de mov" in p:
+        dim = "movimento"
+    elif "unidade" in p:
+        dim = "unidade"
+    else:
+        dim = "mix"  # default: por origem (peças/serviços/máquinas)
+
+    if "genius" in p:
+        uni = "GENIUS"
+    elif "estrutural" in p or "zortea" in p:
+        uni = "ESTRUTURAL ZORTEA"
+    elif "total" in p or "consolidado" in p:
+        uni = "CONSOLIDADO"
+    else:
+        uni = None
+
+    # comparação entre unidades (GENIUS x ESTRUTURAL no mesmo gráfico)
+    if ("por unidade" in p or "unidades" in p or "comparar unidade" in p
+            or ("genius" in p and ("estrutural" in p or "zortea" in p))):
+        dim = "unidade"
+        uni = None
+    # meta x realizado (por mês)
+    comparar_meta = "meta" in p
+    if comparar_meta:
+        dim = "mensal"
+        tipo = "line"
+    incluir_outros = ("outros" in p or "demais" in p or "restante" in p)
+
+    perc = "percentual" in p or "%" in p or tipo in ("donut", "pie")
+
+    # top N / maiores / menores
+    m_lim = (re.search(r"top\s*(\d+)", p)
+             or re.search(r"(\d+)\s*(maiores|melhores|principais|primeiros|maior|"
+                          r"menores|piores|menor)", p))
+    limite = int(m_lim.group(1)) if m_lim else None
+    ordem = "asc" if ("menores" in p or "piores" in p or "menor" in p) else "desc"
+
+    return {"tipo_grafico": tipo, "metrica": met, "dimensao": dim,
+            "unidade_negocio": uni, "grupos": grupos, "mostrar_percentual": perc,
+            "limite": limite, "ordem": ordem, "comparar_meta": comparar_meta,
+            "incluir_outros": incluir_outros, "fonte_interpretacao": "keyword"}
+
+
+def _ia_interpretar_gemini(prompt: str):
+    """Usa o Gemini (se GEMINI_API_KEY configurada) para gerar a intenção JSON.
+    Retorna None se indisponível/erro — o chamador cai no fallback keyword."""
+    key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not key:
+        return None
+    model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
+    instr = (
+        "Você converte um pedido de gráfico de BI em JSON estrito. "
+        "Responda APENAS JSON com as chaves: tipo_grafico (donut|pie|bar|line), "
+        "metrica (faturamento|faturamento_liquido|impostos|devolucao|custo|"
+        "quantidade|clientes|vendas), dimensao (mix|estado|cliente|revenda|"
+        "obras|mensal|tns|unidade), unidade_negocio (GENIUS|ESTRUTURAL ZORTEA|null), "
+        "grupos (lista de strings em MAIÚSCULAS, ex.: [\"PEÇAS\",\"SERVIÇOS\"], ou []), "
+        "mostrar_percentual (boolean), limite (inteiro p/ 'top N', ou null), "
+        "ordem (desc|asc), comparar_meta (boolean — meta x realizado por mês), "
+        "incluir_outros (boolean — agrega o resto após top N). "
+        "'mix' = por origem (PEÇAS/SERVIÇOS/MÁQUINAS); para 'evolução mensal' use "
+        "dimensao=mensal e tipo_grafico=line; para comparar unidades use "
+        "dimensao=unidade e unidade_negocio=null."
+    )
+    try:
+        resp = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
+            json={
+                "contents": [{"parts": [{"text": instr + "\n\nPedido: " + prompt}]}],
+                "generationConfig": {"temperature": 0, "response_mime_type": "application/json"},
+            },
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            return None
+        txt = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        txt = txt.strip()
+        if txt.startswith("```"):
+            txt = re.sub(r"^```[a-zA-Z]*\n?", "", txt)
+            txt = re.sub(r"\n?```$", "", txt).strip()
+        intent = json.loads(txt)
+        if isinstance(intent, dict) and intent.get("dimensao"):
+            intent["fonte_interpretacao"] = "gemini"
+            return intent
+    except Exception as exc:
+        print(f"[IA_GRAFICO] Gemini falhou, usando keyword: {exc}")
+    return None
+
+
+def _ia_interpretar_grafico(prompt: str) -> dict:
+    return _ia_interpretar_gemini(prompt) or _ia_interpretar_keyword(prompt)
+
+
+@app.post("/api/bi/comercial/ia-grafico")
+def bi_comercial_ia_grafico(body: IaGraficoPayload, usuario=Depends(validar_token)):
+    """BI conversacional: interpreta o pedido e devolve config+dados do gráfico.
+    Validação por whitelist (sem SQL livre vindo do prompt)."""
+    if body.prompt and body.prompt.strip():
+        intent = _ia_interpretar_grafico(body.prompt)
+    else:
+        # Config estruturada já interpretada (Cloud/IA) — sem reinterpretar.
+        intent = {
+            "tipo_grafico": body.tipo_grafico, "metrica": body.metrica,
+            "dimensao": body.dimensao, "grupos": body.grupos or [],
+            "unidade_negocio": body.unidade_negocio,
+            "mostrar_percentual": True if body.mostrar_percentual is None
+                                  else body.mostrar_percentual,
+            "limite": body.limite, "ordem": body.ordem,
+            "comparar_meta": body.comparar_meta, "incluir_outros": body.incluir_outros,
+            "fonte_interpretacao": "config",
+        }
+
+    tipo = str(intent.get("tipo_grafico") or "donut").lower()
+    if tipo not in _IA_TIPOS:
+        tipo = "donut"
+    met_key = str(intent.get("metrica") or "faturamento").lower()
+    met_col = _IA_METRICAS.get(met_key)
+    if not met_col:
+        raise HTTPException(status_code=400, detail=f"Métrica não suportada: {met_key}")
+    # Aceita qualquer dimensão (aliases + categoria_custom). A RPC resolve e
+    # NUNCA erra (desconhecida cai em cd_origem). Default: categoria_custom.
+    dim = str(intent.get("dimensao") or body.dimensao or "categoria_custom").lower()
+    uni = (intent.get("unidade_negocio") or body.unidade_negocio) or None
+    grupos = [str(g).strip().upper() for g in (intent.get("grupos") or []) if str(g).strip()]
+    perc = bool(intent.get("mostrar_percentual", True))
+    ordem = "asc" if str(intent.get("ordem") or "desc").lower() == "asc" else "desc"
+    try:
+        limite = int(intent.get("limite")) if intent.get("limite") else None
+    except (TypeError, ValueError):
+        limite = None
+    if limite:
+        limite = max(1, min(limite, 100))
+    comparar_meta = bool(intent.get("comparar_meta"))
+    incluir_outros = bool(intent.get("incluir_outros"))
+
+    # args base p/ as RPCs, repassando filtros de drill ativos (se enviados).
+    _drill_cols = ("anomes_emissao", "cd_estado", "cd_cliente", "cd_prj",
+                   "cd_rev_pedido", "cd_origem", "cd_tp_movimento", "cd_tns", "cd_nf")
+    extra = {k: (body.filtros or {}).get(k) for k in _drill_cols
+             if (body.filtros or {}).get(k) not in (None, "")}
+    args_base = _bi_comercial_args(body.anomes_ini, body.anomes_fim, uni, **extra)
+
+    # Branch META x REALIZADO por mês (RPC dedicada bi_comercial_mensal).
+    if comparar_meta:
+        rows_m = _bi_unwrap_rpc(
+            _sb_rpc("bi_comercial_mensal", args_base),
+            "bi_comercial_mensal") or []
+        series_m = [{"label": str(r.get("chave") or r.get("rotulo") or ""),
+                     "valor": float(r.get("vl_bruto") or 0),
+                     "meta": float(r.get("vl_meta") or 0),
+                     "percentual_meta": float(r.get("percentual_meta") or 0)}
+                    for r in rows_m]
+        return {
+            "titulo": f"Realizado x Meta {('da ' + uni) if uni else '(Consolidado)'} por Mês",
+            "subtitulo": "Faturamento x Meta", "tipo_grafico": "line",
+            "metrica": "faturamento", "dimensao": "mensal", "unidade_negocio": uni,
+            "comparativo": "meta", "serie_temporal": True,
+            "total": round(sum(s["valor"] for s in series_m), 2),
+            "total_meta": round(sum(s["meta"] for s in series_m), 2),
+            "series": series_m, "interpretacao": intent,
+        }
+
+    res = _bi_unwrap_rpc(
+        _sb_rpc("bi_comercial_grafico", {"p_dimensao": dim, **args_base}),
+        "bi_comercial_grafico") or {}
+    rows = res.get("series") or []
+    qtd_base = int(res.get("qtd_base") or 0)
+    qtd_filt = int(res.get("qtd_filtrada") or 0)
+
+    drill_key = _IA_DRILL_COL.get(dim, dim)
+    series = []
+    for r in rows:
+        chave = str(r.get("chave") or "")
+        if grupos and chave.upper() not in grupos:
+            continue
+        series.append({"label": str(r.get("rotulo") or chave),
+                       "valor": float(r.get(met_col) or 0),
+                       "filtros_drill": {drill_key: chave}})
+    total = round(sum(s["valor"] for s in series), 2)
+    if perc:
+        for s in series:
+            s["percentual"] = round(s["valor"] / total * 100, 2) if total else 0
+
+    if dim in ("mensal", "anomes_emissao") or tipo == "line":
+        serie_temporal = True
+    else:
+        serie_temporal = False
+        series.sort(key=lambda s: s["valor"], reverse=(ordem != "asc"))
+        if limite:
+            series = series[:limite]
+            if incluir_outros:
+                resto = round(total - sum(s["valor"] for s in series), 2)
+                if abs(resto) > 0.005:
+                    outro = {"label": "OUTROS", "valor": resto,
+                             "filtros_drill": {drill_key: "OUTROS"}}
+                    if perc:
+                        outro["percentual"] = round(resto / total * 100, 2) if total else 0
+                    series.append(outro)
+
+    consolidado = (not uni) or str(uni).upper() == "CONSOLIDADO"
+    diagnostico = {
+        "qtd_linhas_base": qtd_base, "qtd_linhas_filtradas": qtd_filt,
+        "anomes_ini": body.anomes_ini, "anomes_fim": body.anomes_fim,
+        "unidade_negocio": "CONSOLIDADO" if consolidado else uni,
+        "dimensao": dim, "metrica": met_key,
+        "filtros_aplicados": {"unidade_negocio": (None if consolidado else uni)},
+    }
+    met_lbl = _IA_METRICA_LABEL.get(met_col, met_key)
+    dim_lbl = _IA_DIMENSAO_LABEL.get(dim, dim)
+
+    # Sem dados -> HTTP 200 + diagnóstico (front exibe card explicando filtros).
+    if not series:
+        diagnostico["motivo"] = "Nenhum registro encontrado para os filtros aplicados"
+        return {
+            "titulo": "Sem dados para o gráfico", "tipo_grafico": tipo,
+            "metrica": met_key, "dimensao": dim, "total": 0, "series": [],
+            "diagnostico": diagnostico, "interpretacao": intent,
+        }
+
+    uni_part = "consolidado" if consolidado else f"da {uni}"
+    if grupos:
+        subtitulo = " x ".join(grupos)
+    elif dim == "categoria_custom":
+        subtitulo = " x ".join(s["label"] for s in series if s["label"] != "OUTROS") or None
+    else:
+        subtitulo = None
+    return {
+        "titulo": f"{met_lbl} {uni_part} por {dim_lbl}", "subtitulo": subtitulo,
+        "tipo_grafico": tipo, "metrica": met_key, "dimensao": dim,
+        "unidade_negocio": ("CONSOLIDADO" if consolidado else uni),
+        "ordem": ordem, "limite": limite, "serie_temporal": serie_temporal,
+        "total": total, "series": series, "diagnostico": diagnostico,
+        "interpretacao": intent,
+    }
+
+
+# ------------------------------------------------------------
+# BI TÉCNICO / CONCILIAÇÃO — TODAS as fontes (auditoria de onde vem cada valor).
+# Mesma base do comercial, mas sobre v_bi_faturamento_tecnico + filtro/dimensão
+# fonte_acao. unidade: cd_prj='12' -> GENIUS; demais -> ESTRUTURAL ZORTEA.
+# ------------------------------------------------------------
+_BI_TECNICO_KPIS_ZERO = {
+    "faturamento": 0, "faturamento_liquido": 0, "impostos": 0, "devolucao": 0,
+    "custo": 0, "qtd_linhas": 0, "qtd_vendas": 0, "qtd_fontes": 0, "quantidade": 0,
+}
+_IA_DIMENSOES_TEC = _IA_DIMENSOES | {"fonte", "movimento"}
+_IA_DIMENSAO_LABEL_TEC = {**_IA_DIMENSAO_LABEL, "fonte": "Fonte", "movimento": "Movimento"}
+
+
+def _bi_tecnico_args(anomes_ini, anomes_fim, unidade_negocio=None, fonte_acao=None,
+                     anomes_emissao=None, cd_estado=None, cd_cliente=None,
+                     cd_prj=None, cd_rev_pedido=None, cd_origem=None,
+                     cd_tp_movimento=None, cd_tns=None, cd_nf=None):
+    base = _bi_comercial_args(
+        anomes_ini, anomes_fim, unidade_negocio, anomes_emissao, cd_estado,
+        cd_cliente, cd_prj, cd_rev_pedido, cd_origem, cd_tp_movimento, cd_tns, cd_nf)
+    base["p_fonte_acao"] = (str(fonte_acao).strip()
+                            if fonte_acao not in (None, "") else None)
+    return base
+
+
+class TecnicoFiltros:
+    """Dependência FastAPI: filtros de drill da visão técnica (inclui fonte_acao)."""
+    def __init__(
+        self,
+        anomes_ini: Optional[str] = None, anomes_fim: Optional[str] = None,
+        unidade_negocio: Optional[str] = None, fonte_acao: Optional[str] = None,
+        anomes_emissao: Optional[str] = None, cd_estado: Optional[str] = None,
+        cd_cliente: Optional[str] = None, cd_prj: Optional[str] = None,
+        cd_rev_pedido: Optional[str] = None, cd_origem: Optional[str] = None,
+        cd_tp_movimento: Optional[str] = None, cd_tns: Optional[str] = None,
+        cd_nf: Optional[str] = None,
+    ):
+        self.args = _bi_tecnico_args(
+            anomes_ini, anomes_fim, unidade_negocio, fonte_acao, anomes_emissao,
+            cd_estado, cd_cliente, cd_prj, cd_rev_pedido, cd_origem,
+            cd_tp_movimento, cd_tns, cd_nf)
+
+
+@app.get("/api/bi/tecnico/kpis")
+def bi_tecnico_kpis(f: TecnicoFiltros = Depends(), usuario=Depends(validar_token)):
+    data = _bi_unwrap_rpc(_sb_rpc("bi_tecnico_kpis", f.args), "bi_tecnico_kpis")
+    return data or dict(_BI_TECNICO_KPIS_ZERO)
+
+
+@app.get("/api/bi/tecnico/dimensao")
+def bi_tecnico_dimensao(
+    dimensao: str, f: TecnicoFiltros = Depends(), usuario=Depends(validar_token),
+):
+    return _bi_unwrap_rpc(
+        _sb_rpc("bi_tecnico_dimensao", {"p_dimensao": dimensao, **f.args}),
+        "bi_tecnico_dimensao") or []
+
+
+@app.get("/api/bi/tecnico/por-fonte")
+def bi_tecnico_por_fonte(f: TecnicoFiltros = Depends(), usuario=Depends(validar_token)):
+    return _bi_unwrap_rpc(
+        _sb_rpc("bi_tecnico_dimensao", {"p_dimensao": "fonte", **f.args}),
+        "bi_tecnico_dimensao") or []
+
+
+@app.get("/api/bi/tecnico/detalhes")
+def bi_tecnico_detalhes(
+    f: TecnicoFiltros = Depends(),
+    somente_devolucao: bool = False, somente_impostos: bool = False,
+    page: int = 1, page_size: int = 100, usuario=Depends(validar_token),
+):
+    p_page = max(1, int(page or 1))
+    p_size = max(1, min(int(page_size or 100), 500))
+    args = {**f.args, "p_somente_devolucao": bool(somente_devolucao),
+            "p_somente_impostos": bool(somente_impostos),
+            "p_page": p_page, "p_page_size": p_size}
+    data = _bi_unwrap_rpc(_sb_rpc("bi_tecnico_detalhes", args), "bi_tecnico_detalhes")
+    return data or {"page": p_page, "page_size": p_size, "total": 0, "items": []}
+
+
+@app.post("/api/bi/tecnico/ia-grafico")
+def bi_tecnico_ia_grafico(body: IaGraficoPayload, usuario=Depends(validar_token)):
+    """BI conversacional da conciliação (todas as fontes). Aceita prompt OU config.
+    Dimensões extras: 'fonte' e 'movimento'."""
+    if body.prompt and body.prompt.strip():
+        intent = _ia_interpretar_grafico(body.prompt)
+    else:
+        intent = {
+            "tipo_grafico": body.tipo_grafico, "metrica": body.metrica,
+            "dimensao": body.dimensao, "grupos": body.grupos or [],
+            "unidade_negocio": body.unidade_negocio,
+            "mostrar_percentual": True if body.mostrar_percentual is None
+                                  else body.mostrar_percentual,
+            "limite": body.limite, "ordem": body.ordem,
+            "incluir_outros": body.incluir_outros, "fonte_interpretacao": "config",
+        }
+
+    tipo = str(intent.get("tipo_grafico") or "donut").lower()
+    if tipo not in _IA_TIPOS:
+        tipo = "donut"
+    met_key = str(intent.get("metrica") or "faturamento").lower()
+    met_col = _IA_METRICAS.get(met_key)
+    if not met_col:
+        raise HTTPException(status_code=400, detail=f"Métrica não suportada: {met_key}")
+    dim = str(intent.get("dimensao") or "fonte").lower()
+    if dim not in _IA_DIMENSOES_TEC:
+        raise HTTPException(status_code=400, detail=f"Dimensão não suportada: {dim}")
+    uni = (intent.get("unidade_negocio") or body.unidade_negocio) or None
+    fonte = (body.filtros or {}).get("fonte_acao") or None
+    grupos = [str(g).strip().upper() for g in (intent.get("grupos") or []) if str(g).strip()]
+    perc = bool(intent.get("mostrar_percentual", True))
+    ordem = "asc" if str(intent.get("ordem") or "desc").lower() == "asc" else "desc"
+    try:
+        limite = int(intent.get("limite")) if intent.get("limite") else None
+    except (TypeError, ValueError):
+        limite = None
+    if limite:
+        limite = max(1, min(limite, 100))
+    incluir_outros = bool(intent.get("incluir_outros"))
+
+    _drill = ("anomes_emissao", "cd_estado", "cd_cliente", "cd_prj", "cd_rev_pedido",
+              "cd_origem", "cd_tp_movimento", "cd_tns", "cd_nf")
+    extra = {k: (body.filtros or {}).get(k) for k in _drill
+             if (body.filtros or {}).get(k) not in (None, "")}
+    args_base = _bi_tecnico_args(body.anomes_ini, body.anomes_fim, uni, fonte, **extra)
+    rows = _bi_unwrap_rpc(
+        _sb_rpc("bi_tecnico_dimensao", {"p_dimensao": dim, **args_base}),
+        "bi_tecnico_dimensao") or []
+
+    series = []
+    for r in rows:
+        chave = str(r.get("chave") or "")
+        if grupos and chave.upper() not in grupos:
+            continue
+        series.append({"label": str(r.get("rotulo") or chave),
+                       "valor": float(r.get(met_col) or 0)})
+    total = round(sum(s["valor"] for s in series), 2)
+    if perc:
+        for s in series:
+            s["percentual"] = round(s["valor"] / total * 100, 2) if total else 0
+
+    if dim == "mensal" or tipo == "line":
+        serie_temporal = True
+    else:
+        serie_temporal = False
+        series.sort(key=lambda s: s["valor"], reverse=(ordem != "asc"))
+        if limite:
+            series = series[:limite]
+            if incluir_outros:
+                resto = round(total - sum(s["valor"] for s in series), 2)
+                if abs(resto) > 0.005:
+                    outro = {"label": "OUTROS", "valor": resto}
+                    if perc:
+                        outro["percentual"] = round(resto / total * 100, 2) if total else 0
+                    series.append(outro)
+
+    met_lbl = _IA_METRICA_LABEL.get(met_col, met_key)
+    dim_lbl = _IA_DIMENSAO_LABEL_TEC.get(dim, dim)
+    titulo = f"{met_lbl} {('da ' + uni) if uni else '(Todas as unidades)'} por {dim_lbl}"
+    return {
+        "titulo": titulo, "subtitulo": (" x ".join(grupos) if grupos else None),
+        "tipo_grafico": tipo, "metrica": met_key, "dimensao": dim,
+        "unidade_negocio": uni, "fonte_acao": fonte, "ordem": ordem,
+        "limite": limite, "serie_temporal": serie_temporal,
+        "total": total, "series": series, "interpretacao": intent,
+    }
+
+
+# ============================================================
 # BI SHADOW MODE — endpoints paralelos lendo bi_compras / bi_recebimentos
 # ============================================================
 # Estratégia:
@@ -34049,6 +39409,8 @@ def _ops_jato_peso_cte_multinivel(codemp: int, *, data_ini=None, data_fim=None,
     return cte, params
 
 
+@app.get("/api/auditoria-apontamento-genius/ops-pintura-jato")
+@app.get("/api/auditoria-apontamento-genius/ops-pintura-jato-peso")
 @app.get("/api/auditoria-apontamento-genius/ops-jato-peso")
 def auditoria_genius_ops_jato_peso(
     codemp: int = EMPRESA_PADRAO,
@@ -34800,7 +40162,7 @@ def consultar_balanco_patrimonial(
     tamanho_pagina = max(1, min(int(tamanho_pagina or 100), 500))
     offset = (pagina - 1) * tamanho_pagina
 
-    where = ["B.ANOMES_REFERENTE BETWEEN ? AND ?"]
+    where = ["B.ANOMES_REFERENTE BETWEEN $[ANOMES_INI] AND $[ANOMES_FIM]"]
     params: list = [int(anomes_ini), int(anomes_fim)]
 
     where.append("B.CD_EMPRESA = ?")
@@ -37037,6 +42399,3683 @@ def criar_relatorio_de_template(template_id: str, usuario=Depends(validar_token)
         "mensagem": "Relatório criado a partir do modelo.",
         "template_id": template_id,
         "relatorio": criado,
+    }
+
+
+# ============================================================
+# PRODUÇÃO - CARGA DE PRODUÇÃO
+# Fonte ERP: E900COP + E900OOP + E725CRE + E720OPR + E075PRO
+# Parametrização Supabase: public.producao_recurso_unidade
+#
+# Regra: ERP eh fonte operacional (OPs/operacoes/recursos), Supabase eh
+# parametrizacao de classificacao (unidade de negocio, tipo de recurso,
+# CCU sugerido para recursos sem CODCCU no ERP).
+# ============================================================
+
+PRODUCAO_RECURSO_UNIDADE_TABLE = os.getenv(
+    "PRODUCAO_RECURSO_UNIDADE_TABLE",
+    "producao_recurso_unidade",
+)
+
+PRODUCAO_STATUS_CARGA_DEFAULT = ("A", "L")  # Abertas + Liberadas
+
+
+# Mapeamento padrao interno usado quando o Supabase nao esta configurado
+# (ou retornou vazio/erro). Garante que a tela de Carga de Producao funcione
+# mesmo sem SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY no ambiente.
+PRODUCAO_RECURSOS_PADRAO = [
+    {"codemp": 1, "codcre": "012",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10775", "considera_carga": True,  "ativo": True, "obs": "Serra fita estrutura metálica"},
+    {"codemp": 1, "codcre": "013",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10715", "considera_carga": True,  "ativo": True, "obs": "Guilhotina"},
+    {"codemp": 1, "codcre": "015",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10725", "considera_carga": True,  "ativo": True, "obs": "Prensa excêntrica"},
+    {"codemp": 1, "codcre": "016",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10755", "considera_carga": True,  "ativo": True, "obs": "Furadeira de bancada"},
+    {"codemp": 1, "codcre": "018",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10745", "considera_carga": True,  "ativo": True, "obs": "Dobradeira manual"},
+    {"codemp": 1, "codcre": "019",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10750", "considera_carga": True,  "ativo": True, "obs": "Solda eletrodo"},
+    {"codemp": 1, "codcre": "020",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10750", "considera_carga": True,  "ativo": True, "obs": "Solda MIG/MAG"},
+    {"codemp": 1, "codcre": "021",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10715", "considera_carga": True,  "ativo": True, "obs": "Policorte estrutura metálica"},
+    {"codemp": 1, "codcre": "022",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10715", "considera_carga": True,  "ativo": True, "obs": "Oxicorte fotocélula"},
+    {"codemp": 1, "codcre": "023",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10755", "considera_carga": True,  "ativo": True, "obs": "Rosqueadeira"},
+    {"codemp": 1, "codcre": "024",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10790", "considera_carga": True,  "ativo": True, "obs": "Motor esmeril"},
+    {"codemp": 1, "codcre": "025",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10745", "considera_carga": True,  "ativo": True, "obs": "Dobradeira Newton"},
+    {"codemp": 1, "codcre": "026",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10755", "considera_carga": True,  "ativo": True, "obs": "Furadeira imantada"},
+    {"codemp": 1, "codcre": "027",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10785", "considera_carga": True,  "ativo": True, "obs": "Pintura"},
+    {"codemp": 1, "codcre": "028",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10755", "considera_carga": True,  "ativo": True, "obs": "Lixadeira/esmerilhadeira"},
+    {"codemp": 1, "codcre": "029",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10740", "considera_carga": True,  "ativo": True, "obs": "Talha elétrica / ponte rolante"},
+    {"codemp": 1, "codcre": "030",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10760", "considera_carga": True,  "ativo": True, "obs": "Jato granalha"},
+    {"codemp": 1, "codcre": "031",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10755", "considera_carga": True,  "ativo": True, "obs": "Furadeira elétrica manual"},
+    {"codemp": 1, "codcre": "032",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10740", "considera_carga": True,  "ativo": True, "obs": "Montadores estruturas metálicas"},
+
+    {"codemp": 1, "codcre": "066",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10775", "considera_carga": True,  "ativo": True, "obs": "Serra fita Durma"},
+    {"codemp": 1, "codcre": "067",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10725", "considera_carga": True,  "ativo": True, "obs": "Prensa hidráulica"},
+    {"codemp": 1, "codcre": "068",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10715", "considera_carga": True,  "ativo": True, "obs": "Guilhotina hidráulica"},
+    {"codemp": 1, "codcre": "069",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10740", "considera_carga": True,  "ativo": True, "obs": "Calandra"},
+    {"codemp": 1, "codcre": "070",  "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10715", "considera_carga": True,  "ativo": True, "obs": "Oxicorte CNC"},
+
+    {"codemp": 1, "codcre": "1100", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10715", "considera_carga": True,  "ativo": True, "obs": "Corte em geral"},
+    {"codemp": 1, "codcre": "1200", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10730", "considera_carga": True,  "ativo": True, "obs": "Preparação"},
+    {"codemp": 1, "codcre": "1300", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10740", "considera_carga": True,  "ativo": True, "obs": "Fabricação estrutura"},
+    {"codemp": 1, "codcre": "1400", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10740", "considera_carga": True,  "ativo": True, "obs": "Pré-montagem"},
+    {"codemp": 1, "codcre": "1500", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10750", "considera_carga": True,  "ativo": True, "obs": "Ressolda"},
+    {"codemp": 1, "codcre": "1600", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10790", "considera_carga": True,  "ativo": True, "obs": "Limpeza de peças"},
+    {"codemp": 1, "codcre": "1700", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10760", "considera_carga": True,  "ativo": True, "obs": "Jateamento"},
+    {"codemp": 1, "codcre": "1800", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10785", "considera_carga": True,  "ativo": True, "obs": "Pintura"},
+
+    {"codemp": 1, "codcre": "1810", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "LOGISTICA",  "codccu_sugerido": "10810", "considera_carga": False, "ativo": True, "obs": "Entrada estoque"},
+    {"codemp": 1, "codcre": "3132", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "LOGISTICA",  "codccu_sugerido": "10810", "considera_carga": False, "ativo": True, "obs": "Expedição Tekla"},
+    {"codemp": 1, "codcre": "4000", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "TERCEIROS",  "codccu_sugerido": "10795", "considera_carga": True,  "ativo": True, "obs": "Terceiros galvanização"},
+
+    # ---- TEKLA / ESTRUTURAL (recursos 30xx) ----
+    # CCU sugerido segue o padrao da Estrutural 107xx. Em qualquer caso, se
+    # o ERP tiver CODCCU em E725CRE, esse valor vence — codccu_sugerido eh
+    # apenas fallback quando o CRE.CODCCU esta em branco.
+    {"codemp": 1, "codcre": "3000", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10775", "considera_carga": True,  "ativo": True, "obs": "E-SERRA - TEKLA"},
+    {"codemp": 1, "codcre": "3005", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10775", "considera_carga": True,  "ativo": True, "obs": "E-SERRA PERFIL - TEKLA"},
+    {"codemp": 1, "codcre": "3020", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10715", "considera_carga": True,  "ativo": True, "obs": "E-GUILHOTINA - TEKLA"},
+    {"codemp": 1, "codcre": "3030", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10725", "considera_carga": True,  "ativo": True, "obs": "E-PRENSA EXCENT - TEKLA"},
+    {"codemp": 1, "codcre": "3040", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10715", "considera_carga": True,  "ativo": True, "obs": "E-CORTE LASER - TEKLA"},
+    {"codemp": 1, "codcre": "3050", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10755", "considera_carga": True,  "ativo": True, "obs": "E-FURAÇÃO/ENCAIXE - TEKLA"},
+    {"codemp": 1, "codcre": "3060", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10745", "considera_carga": True,  "ativo": True, "obs": "E-DOBRADEIRA - TEKLA"},
+    {"codemp": 1, "codcre": "3070", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10755", "considera_carga": True,  "ativo": True, "obs": "E-FURAD. FICEP - TEKLA"},
+    {"codemp": 1, "codcre": "3071", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10755", "considera_carga": True,  "ativo": True, "obs": "E-USINAGEM - TEKLA"},
+    {"codemp": 1, "codcre": "3080", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10740", "considera_carga": True,  "ativo": True, "obs": "E-MONTAGEM - TEKLA"},
+    {"codemp": 1, "codcre": "3100", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10750", "considera_carga": True,  "ativo": True, "obs": "E-SOLDA - TEKLA"},
+    {"codemp": 1, "codcre": "3120", "unidade_negocio": "ESTRUTURAL", "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "10785", "considera_carga": True,  "ativo": True, "obs": "E-PINTURA - TEKLA"},
+
+    # ---- GENIUS (recursos 21xx) ----
+    # CCU sugerido na faixa 127xx (padrao GENIUS). Mesma regra: ERP vence.
+    {"codemp": 1, "codcre": "2100", "unidade_negocio": "GENIUS",     "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "12775", "considera_carga": True,  "ativo": True, "obs": "G-SERRA"},
+    {"codemp": 1, "codcre": "2107", "unidade_negocio": "GENIUS",     "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "12740", "considera_carga": True,  "ativo": True, "obs": "G-MONTAGEM SUB.CONJUNTOS"},
+    {"codemp": 1, "codcre": "2108", "unidade_negocio": "GENIUS",     "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "12755", "considera_carga": True,  "ativo": True, "obs": "G-TORNO (CNC)"},
+    {"codemp": 1, "codcre": "2120", "unidade_negocio": "GENIUS",     "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "12745", "considera_carga": True,  "ativo": True, "obs": "G-DOBRA"},
+    {"codemp": 1, "codcre": "2125", "unidade_negocio": "GENIUS",     "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "12725", "considera_carga": True,  "ativo": True, "obs": "G-PRENSA"},
+    {"codemp": 1, "codcre": "2130", "unidade_negocio": "GENIUS",     "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "12755", "considera_carga": True,  "ativo": True, "obs": "G-FURADEIRA"},
+    {"codemp": 1, "codcre": "2135", "unidade_negocio": "GENIUS",     "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "12755", "considera_carga": True,  "ativo": True, "obs": "G-TORNO CONVENCIONAL"},
+    {"codemp": 1, "codcre": "2145", "unidade_negocio": "GENIUS",     "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "12740", "considera_carga": True,  "ativo": True, "obs": "G-MONTAGEM LEVE PARA SOLDA"},
+    {"codemp": 1, "codcre": "2150", "unidade_negocio": "GENIUS",     "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "12750", "considera_carga": True,  "ativo": True, "obs": "G-SOLDA GERAL"},
+    {"codemp": 1, "codcre": "2160", "unidade_negocio": "GENIUS",     "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "12760", "considera_carga": True,  "ativo": True, "obs": "G-JATO AUTOMATICO"},
+    {"codemp": 1, "codcre": "2161", "unidade_negocio": "GENIUS",     "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "12760", "considera_carga": True,  "ativo": True, "obs": "G-JATO MANUAL"},
+    {"codemp": 1, "codcre": "2165", "unidade_negocio": "GENIUS",     "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "12785", "considera_carga": True,  "ativo": True, "obs": "G-PINTURA LIQUIDA"},
+    {"codemp": 1, "codcre": "2166", "unidade_negocio": "GENIUS",     "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "12785", "considera_carga": True,  "ativo": True, "obs": "G-PINTURA PÓ"},
+    {"codemp": 1, "codcre": "2175", "unidade_negocio": "GENIUS",     "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "12740", "considera_carga": True,  "ativo": True, "obs": "G-MONTAGEM FINAL"},
+    {"codemp": 1, "codcre": "2190", "unidade_negocio": "GENIUS",     "tipo_recurso": "TERCEIROS",  "codccu_sugerido": "12795", "considera_carga": True,  "ativo": True, "obs": "G-TERCEIRIZAÇÃO"},
+    {"codemp": 1, "codcre": "2195", "unidade_negocio": "GENIUS",     "tipo_recurso": "PRODUCAO",   "codccu_sugerido": "12715", "considera_carga": True,  "ativo": True, "obs": "G-CORTE A LASER"},
+
+    {"codemp": 1, "codcre": "90",   "unidade_negocio": "APOIO",      "tipo_recurso": "MANUTENCAO", "codccu_sugerido": "10410", "considera_carga": False, "ativo": True, "obs": "Manutenção de equipamentos"},
+    {"codemp": 1, "codcre": "95",   "unidade_negocio": "APOIO",      "tipo_recurso": "MANUTENCAO", "codccu_sugerido": "10410", "considera_carga": False, "ativo": True, "obs": "Manutenção de veículos"},
+]
+
+
+# ------------------------------------------------------------------
+# Capacidade por recurso
+# ------------------------------------------------------------------
+# Tabela alvo no SQL Server (quando existir):
+#   USU_BI_CAPACIDADE_RECURSO (CODEMP, CODCRE, DATA_INI, DATA_FIM,
+#       MINUTOS_DIA, QTDE_RECURSOS, EFICIENCIA_PERC,
+#       CONSIDERA_SABADO, ATIVO)
+# Enquanto o cadastro nao existir, usamos PRODUCAO_CAPACIDADE_PADRAO
+# como fallback interno. Recursos com `considera_carga=False`
+# (logistica, manutencao) ficam SEM_CAPACIDADE de proposito.
+#
+# Tabela do Supabase (override opcional):
+#   public.producao_capacidade_recurso
+# ------------------------------------------------------------------
+
+PRODUCAO_CAPACIDADE_RECURSO_TABLE = os.getenv(
+    "PRODUCAO_CAPACIDADE_RECURSO_TABLE",
+    "producao_capacidade_recurso",
+)
+
+# Defaults conservadores: 1 turno de 8h, 1 recurso, 85% de eficiencia,
+# sem sabado. PCP pode subir/baixar via Supabase ou tabela SQL Server.
+PRODUCAO_CAPACIDADE_DEFAULT_MIN_DIA = 480       # 8h x 60min
+PRODUCAO_CAPACIDADE_DEFAULT_QTDE = 1
+PRODUCAO_CAPACIDADE_DEFAULT_EFICIENCIA = 85
+PRODUCAO_CAPACIDADE_DEFAULT_CONSIDERA_SABADO = False
+
+# Faixas de status_ocupacao (em %)
+PRODUCAO_OCUPACAO_FAIXA_BAIXO = 60.0
+PRODUCAO_OCUPACAO_FAIXA_MEDIO = 80.0
+PRODUCAO_OCUPACAO_FAIXA_ALTO = 95.0
+
+# Mapeamento padrao interno. Cobre apenas recursos com considera_carga=True
+# de PRODUCAO_RECURSOS_PADRAO. Quando precisar de cadastro real por
+# recurso, configurar via Supabase/SQL Server.
+PRODUCAO_CAPACIDADE_PADRAO = [
+    {"codemp": 1, "codcre": cre,
+     "minutos_dia": PRODUCAO_CAPACIDADE_DEFAULT_MIN_DIA,
+     "qtde_recursos": PRODUCAO_CAPACIDADE_DEFAULT_QTDE,
+     "eficiencia_perc": PRODUCAO_CAPACIDADE_DEFAULT_EFICIENCIA,
+     "considera_sabado": PRODUCAO_CAPACIDADE_DEFAULT_CONSIDERA_SABADO,
+     "ativo": True}
+    for cre in [
+        "012", "013", "015", "016", "018", "019", "020", "021", "022",
+        "023", "024", "025", "026", "027", "028", "029", "030", "031",
+        "032", "066", "067", "068", "069", "070",
+        "1100", "1200", "1300", "1400", "1500", "1600", "1700", "1800",
+        "4000",
+        # TEKLA / ESTRUTURAL
+        "3000", "3005", "3020", "3030", "3040", "3050", "3060",
+        "3070", "3071", "3080", "3100", "3120",
+        # GENIUS
+        "2100", "2107", "2108", "2120", "2125", "2130", "2135", "2145",
+        "2150", "2160", "2161", "2165", "2166", "2175", "2190", "2195",
+    ]
+]
+
+
+def _prod_trim(valor) -> str:
+    if valor is None:
+        return ""
+    return str(valor).strip()
+
+
+def _prod_float(valor) -> float:
+    try:
+        if valor is None:
+            return 0.0
+        if isinstance(valor, str):
+            valor = valor.replace(",", ".")
+        return float(valor)
+    except Exception:
+        return 0.0
+
+
+def _prod_int(valor, default: int = 0) -> int:
+    try:
+        return int(valor)
+    except Exception:
+        return default
+
+
+def _prod_data_padrao_ini() -> str:
+    hoje = date.today()
+    return date(hoje.year, hoje.month, 1).isoformat()
+
+
+def _prod_data_padrao_fim() -> str:
+    return date.today().isoformat()
+
+
+def _prod_codcre_keys(codcre: str) -> list:
+    """Variacoes de chave para casar '012' com '12' (zeros a esquerda).
+
+    Mantem a chave original e tambem a chave sem zeros a esquerda
+    (e zfill(3) para chaves curtas).
+    """
+    c = _prod_trim(codcre)
+    keys = [c]
+    if c.isdigit():
+        sem_zero = c.lstrip("0") or "0"
+        if sem_zero not in keys:
+            keys.append(sem_zero)
+        if len(c) < 3:
+            z3 = c.zfill(3)
+            if z3 not in keys:
+                keys.append(z3)
+    return keys
+
+
+def _prod_supabase_get(table: str, params: Optional[dict] = None, timeout: int = 30) -> list:
+    _supabase_required()
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    resp = requests.get(
+        url,
+        params=params or {},
+        headers=_supabase_headers("return=representation"),
+        timeout=timeout,
+    )
+    if resp.status_code not in (200, 206):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase GET {table} HTTP {resp.status_code}: {(resp.text or '')[:500]}",
+        )
+    try:
+        return resp.json() if resp.text else []
+    except Exception:
+        return []
+
+
+def _prod_mapa_recursos_padrao(codemp: int = 1) -> dict:
+    """Constroi o mapa de recursos a partir de PRODUCAO_RECURSOS_PADRAO.
+
+    Usado quando o Supabase nao esta configurado ou retornou vazio/erro.
+    Marca cada row com origem='PADRAO_API' para que o classificador devolva
+    isso no campo origem_mapeamento (em vez de SUPABASE).
+    """
+    mapa = {}
+
+    for r in PRODUCAO_RECURSOS_PADRAO:
+        if int(r.get("codemp", 0)) != int(codemp):
+            continue
+
+        emp = int(r.get("codemp", codemp))
+        codcre = _prod_trim(r.get("codcre"))
+
+        row = dict(r)
+        row["id"] = None
+        row["origem"] = "PADRAO_API"
+
+        for key_codcre in _prod_codcre_keys(codcre):
+            mapa[(emp, key_codcre)] = row
+
+    return mapa
+
+
+def _prod_carregar_mapa_recursos(codemp: int = 1) -> dict:
+    """Carrega o mapeamento ativo, com fallback automatico.
+
+    Ordem:
+      1) Supabase, se SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY estiverem
+         configurados E a consulta retornar algo.
+      2) PRODUCAO_RECURSOS_PADRAO (mapa interno) se Supabase nao estiver
+         configurado, retornar vazio ou falhar por qualquer motivo.
+
+    Replica a chave para variacoes com/sem zeros a esquerda — assim '012'
+    casa com '12' vindos do ERP.
+    """
+    supabase_url = os.getenv("SUPABASE_URL", "").strip()
+    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+
+    if not supabase_url or not supabase_key:
+        return _prod_mapa_recursos_padrao(codemp)
+
+    try:
+        params = {
+            "select": "id,codemp,codcre,descre,unidade_negocio,tipo_recurso,codccu_sugerido,considera_carga,ativo,obs",
+            "codemp": f"eq.{int(codemp)}",
+            "ativo": "eq.true",
+            "limit": "5000",
+        }
+
+        rows = _prod_supabase_get(PRODUCAO_RECURSO_UNIDADE_TABLE, params=params)
+        mapa = {}
+
+        for r in rows:
+            emp = _prod_int(r.get("codemp"), codemp)
+            codcre = _prod_trim(r.get("codcre"))
+            r["origem"] = "SUPABASE"
+
+            for key_codcre in _prod_codcre_keys(codcre):
+                mapa[(emp, key_codcre)] = r
+
+        # Se Supabase respondeu mas estava vazio, ainda assim usa padrao.
+        if not mapa:
+            return _prod_mapa_recursos_padrao(codemp)
+
+        return mapa
+
+    except Exception:
+        # Nao deixa a tela quebrar por falha de rede/auth no Supabase.
+        return _prod_mapa_recursos_padrao(codemp)
+
+
+def _prod_classificar_unidade(row: dict, mapa_recursos: dict) -> dict:
+    """Classifica a linha em unidade_negocio/tipo_recurso/codccu.
+
+    Prioriza o mapeamento do Supabase. Se nao houver, aplica regra
+    automatica por CODCCU (faixa) ou CODORI conhecida.
+    """
+    codemp = _prod_int(row.get("codemp"), EMPRESA_PADRAO)
+    codcre = _prod_trim(row.get("codcre"))
+    codccu_erp = _prod_trim(row.get("codccu"))
+    codori = _prod_trim(row.get("codori")).upper()
+
+    map_row = None
+    for k in _prod_codcre_keys(codcre):
+        map_row = mapa_recursos.get((codemp, k))
+        if map_row:
+            break
+
+    if map_row:
+        codccu_final = _prod_trim(codccu_erp) or _prod_trim(map_row.get("codccu_sugerido"))
+        return {
+            "codccu": codccu_final,
+            "unidade_negocio": _prod_trim(map_row.get("unidade_negocio")).upper() or "NAO_CLASSIFICADO",
+            "tipo_recurso": _prod_trim(map_row.get("tipo_recurso")).upper() or "PRODUCAO",
+            "considera_carga": bool(map_row.get("considera_carga", True)),
+            # PADRAO_API quando vem do fallback interno, SUPABASE quando vem do banco.
+            "origem_mapeamento": map_row.get("origem") or "SUPABASE",
+            "id_mapeamento": map_row.get("id"),
+        }
+
+    # Fallback automatico por faixa de CODCCU
+    unidade = "NAO_CLASSIFICADO"
+    codccu_num = None
+    try:
+        codccu_num = int(codccu_erp)
+    except Exception:
+        codccu_num = None
+
+    if codccu_num is not None:
+        if 12100 <= codccu_num <= 12999:
+            unidade = "GENIUS"
+        elif 10100 <= codccu_num <= 11999:
+            unidade = "ESTRUTURAL"
+
+    # Fallback por origem da OP
+    if unidade == "NAO_CLASSIFICADO":
+        if codori in ("TKE", "TKC", "TKS"):
+            unidade = "ESTRUTURAL"
+        elif codori in GENIUS_ORIGENS:
+            unidade = "GENIUS"
+
+    return {
+        "codccu": codccu_erp,
+        "unidade_negocio": unidade,
+        "tipo_recurso": "PRODUCAO",
+        "considera_carga": True,
+        "origem_mapeamento": "REGRA_API",
+        "id_mapeamento": None,
+    }
+
+
+def _prod_rows_to_dict(cursor, rows) -> list:
+    """Converte rows do pyodbc em list[dict] (colunas em lowercase, valores serializaveis)."""
+    colunas = [c[0].lower() for c in cursor.description]
+    out = []
+
+    for row in rows:
+        item = {}
+        for idx, col in enumerate(colunas):
+            val = row[idx]
+            if isinstance(val, str):
+                val = val.strip()
+            elif isinstance(val, Decimal):
+                val = float(val)
+            elif isinstance(val, datetime):
+                val = val.isoformat()
+            elif isinstance(val, date):
+                val = val.isoformat()
+            item[col] = val
+        out.append(item)
+
+    return out
+
+
+def _prod_consultar_carga_erp(
+    *,
+    codemp: int = 1,
+    data_ini: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    situacoes: Optional[str] = None,
+    codori: Optional[str] = None,
+    codcre: Optional[str] = None,
+    codopr: Optional[str] = None,
+    codpro: Optional[str] = None,
+    limite: int = 50000,
+) -> list:
+    """Consulta bruta do ERP — carga prevista por OP/operacao.
+
+    Usa COP.DATGER como referencia de janela (OOP.DTPINI/DTPFIM costumam
+    vir 31/12/1900 nessa base).
+    """
+    data_ini = data_ini or _prod_data_padrao_ini()
+    data_fim = data_fim or _prod_data_padrao_fim()
+
+    limite = max(100, min(int(limite or 50000), 200000))
+
+    sit_list = []
+    if situacoes:
+        sit_list = [
+            x.strip().upper()
+            for x in str(situacoes).replace(";", ",").split(",")
+            if x.strip()
+        ]
+    if not sit_list:
+        sit_list = list(PRODUCAO_STATUS_CARGA_DEFAULT)
+
+    placeholders_sit = ",".join(["?"] * len(sit_list))
+
+    where_extra = ""
+    params = [
+        int(codemp),
+        *sit_list,
+        data_ini,
+        data_fim,
+    ]
+
+    if codori:
+        where_extra += " AND COP.CODORI = ? "
+        params.append(codori.strip())
+
+    if codcre:
+        where_extra += " AND OOP.CODCRE = ? "
+        params.append(codcre.strip())
+
+    if codopr:
+        where_extra += " AND OOP.CODOPR = ? "
+        params.append(codopr.strip())
+
+    if codpro:
+        where_extra += " AND COP.CODPRO LIKE ? "
+        params.append(f"%{codpro.strip()}%")
+
+    sql = f"""
+        SELECT TOP {limite}
+            COP.CODEMP AS codemp,
+            COP.CODORI AS codori,
+            COP.NUMORP AS numorp,
+            COP.CODPRO AS codpro,
+            COALESCE(PRO.DESPRO, '') AS despro,
+            COP.SITORP AS sitorp,
+            COP.DATGER AS data_geracao_op,
+
+            OOP.CODETG AS codetg,
+            OOP.SEQROT AS seqrot,
+            OOP.CODOPR AS codopr,
+            COALESCE(OPR.DESOPR, '') AS desopr,
+
+            OOP.CODCRE AS codcre,
+            COALESCE(CRE.DESCRE, '') AS descre,
+            COALESCE(CRE.CODCCU, '') AS codccu,
+
+            COALESCE(OOP.QTDPRV, 0) AS qtd_prevista_operacao,
+            COALESCE(OOP.TMPPRP, 0) AS tempo_unitario_min,
+            COALESCE(OOP.TMPFIX, 0) AS tempo_fixo_min,
+            COALESCE(OOP.TMPTPR, 0) AS tempo_total_previsto_original,
+
+            CASE
+                WHEN COALESCE(OOP.TMPTPR, 0) > 0
+                    THEN COALESCE(OOP.TMPTPR, 0)
+                ELSE
+                    COALESCE(OOP.TMPFIX, 0)
+                    + (COALESCE(OOP.TMPPRP, 0) * COALESCE(NULLIF(OOP.QTDPRV, 0), 1))
+            END AS tempo_previsto_min,
+
+            OOP.DTPINI AS data_inicio_prevista,
+            OOP.DTPFIM AS data_fim_prevista
+
+        FROM E900COP COP
+
+        INNER JOIN E900OOP OOP
+            ON OOP.CODEMP = COP.CODEMP
+           AND OOP.CODORI = COP.CODORI
+           AND OOP.NUMORP = COP.NUMORP
+
+        LEFT JOIN E725CRE CRE
+            ON CRE.CODEMP = OOP.CODEMP
+           AND CRE.CODCRE = OOP.CODCRE
+
+        LEFT JOIN E720OPR OPR
+            ON OPR.CODEMP = OOP.CODEMP
+           AND OPR.CODOPR = OOP.CODOPR
+
+        LEFT JOIN E075PRO PRO
+            ON PRO.CODEMP = COP.CODEMP
+           AND PRO.CODPRO = COP.CODPRO
+
+        WHERE COP.CODEMP = ?
+          AND COP.SITORP IN ({placeholders_sit})
+          AND COALESCE(COP.CODORI, '') <> '100'
+          AND CONVERT(DATE, COP.DATGER) >= ?
+          AND CONVERT(DATE, COP.DATGER) <= ?
+          {where_extra}
+
+        ORDER BY
+            COP.DATGER DESC,
+            COP.CODORI,
+            COP.NUMORP,
+            OOP.SEQROT
+    """
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+        return _prod_rows_to_dict(cursor, rows)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao consultar carga de produção no ERP: {str(e)}",
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _prod_enriquecer_linhas(
+    linhas: list,
+    mapa_recursos: dict,
+    *,
+    unidade_negocio: Optional[str] = None,
+    tipo_recurso: Optional[str] = None,
+    considera_carga: Optional[bool] = True,
+) -> list:
+    """Aplica classificacao por linha e filtra conforme parametros.
+
+    considera_carga=None desativa o filtro (usado por /opcoes que precisa
+    enumerar TUDO, inclusive recursos que nao entram no calculo de carga).
+    """
+    out = []
+
+    unidade_filtro = _prod_trim(unidade_negocio).upper()
+    tipo_filtro = _prod_trim(tipo_recurso).upper()
+
+    for item in linhas:
+        info = _prod_classificar_unidade(item, mapa_recursos)
+
+        novo = dict(item)
+        novo.update(info)
+
+        novo["qtd_prevista_operacao"] = _prod_float(novo.get("qtd_prevista_operacao"))
+        novo["tempo_unitario_min"] = _prod_float(novo.get("tempo_unitario_min"))
+        novo["tempo_fixo_min"] = _prod_float(novo.get("tempo_fixo_min"))
+        novo["tempo_total_previsto_original"] = _prod_float(novo.get("tempo_total_previsto_original"))
+        novo["tempo_previsto_min"] = _prod_float(novo.get("tempo_previsto_min"))
+        novo["tempo_previsto_horas"] = round(novo["tempo_previsto_min"] / 60.0, 6)
+
+        novo["op_chave"] = f"{novo.get('codori')}-{novo.get('numorp')}"
+
+        if considera_carga is not None:
+            if bool(novo.get("considera_carga", True)) != bool(considera_carga):
+                continue
+
+        if unidade_filtro and unidade_filtro not in ("TODOS", "TODAS"):
+            if _prod_trim(novo.get("unidade_negocio")).upper() != unidade_filtro:
+                continue
+
+        if tipo_filtro and tipo_filtro not in ("TODOS", "TODAS"):
+            if _prod_trim(novo.get("tipo_recurso")).upper() != tipo_filtro:
+                continue
+
+        out.append(novo)
+
+    return out
+
+
+def _prod_agrupar_por_centro(linhas: list, cap_por_codcre: Optional[dict] = None) -> list:
+    """Agrupa por (unidade_negocio, tipo_recurso, ccu, recurso, operacao).
+
+    qtd_ops eh count distinct de OPs dentro do grupo.
+    Se cap_por_codcre for informado, cada linha recebe tambem:
+      capacidade_disponivel_min, ocupacao_pct, status_ocupacao.
+    capacidade eh a do recurso (codcre) inteiro — quando o mesmo recurso
+    aparece em multiplas operacoes, cada linha mostra a capacidade total
+    e a ocupacao relativa daquela operacao.
+    """
+    grupos = {}
+
+    for it in linhas:
+        key = (
+            it.get("unidade_negocio") or "",
+            it.get("tipo_recurso") or "",
+            it.get("codccu") or "",
+            it.get("codcre") or "",
+            it.get("descre") or "",
+            it.get("codopr") or "",
+            it.get("desopr") or "",
+        )
+
+        if key not in grupos:
+            grupos[key] = {
+                "unidade_negocio": key[0],
+                "tipo_recurso": key[1],
+                "codccu": key[2],
+                "codcre": key[3],
+                "descre": key[4],
+                "codopr": key[5],
+                "desopr": key[6],
+                "_ops": set(),
+                "qtd_prevista": 0.0,
+                "carga_prevista_min": 0.0,
+            }
+
+        grupos[key]["_ops"].add(it.get("op_chave"))
+        grupos[key]["qtd_prevista"] += _prod_float(it.get("qtd_prevista_operacao"))
+        grupos[key]["carga_prevista_min"] += _prod_float(it.get("tempo_previsto_min"))
+
+    dados = []
+    for g in grupos.values():
+        carga_min = round(g["carga_prevista_min"], 6)
+        linha = {
+            "unidade_negocio": g["unidade_negocio"],
+            "tipo_recurso": g["tipo_recurso"],
+            "codccu": g["codccu"],
+            "codcre": g["codcre"],
+            "descre": g["descre"],
+            "codopr": g["codopr"],
+            "desopr": g["desopr"],
+            "qtd_ops": len(g["_ops"]),
+            "qtd_prevista": round(g["qtd_prevista"], 6),
+            "carga_prevista_min": carga_min,
+            "carga_prevista_horas": round(carga_min / 60.0, 6),
+        }
+
+        if cap_por_codcre is not None:
+            cap_min = _prod_capacidade_lookup(cap_por_codcre, g["codcre"])
+            if cap_min and cap_min > 0:
+                ocup_pct = round((carga_min / cap_min) * 100.0, 2)
+                linha["capacidade_disponivel_min"] = round(cap_min, 2)
+                linha["ocupacao_pct"] = ocup_pct
+                linha["status_ocupacao"] = _prod_status_ocupacao(carga_min, cap_min)
+            else:
+                linha["capacidade_disponivel_min"] = None
+                linha["ocupacao_pct"] = None
+                linha["status_ocupacao"] = "SEM_CAPACIDADE"
+
+        dados.append(linha)
+
+    dados.sort(key=lambda x: (
+        x.get("unidade_negocio") or "",
+        x.get("codccu") or "",
+        x.get("codcre") or "",
+        x.get("codopr") or "",
+    ))
+
+    return dados
+
+
+def _prod_agrupar_por_recurso(linhas: list, cap_por_codcre: Optional[dict] = None) -> list:
+    """Visao GERENCIAL — agrega por (unidade, tipo, ccu, codcre, descre).
+
+    Diferente de _prod_agrupar_por_centro (que quebra por operacao tambem),
+    aqui temos UMA linha por centro de recurso. Inclui qtd_operacoes
+    (distintas operacoes que rodam nesse recurso) para nao perder essa
+    informacao.
+
+    Quando cap_por_codcre eh informado, cada linha ja sai com capacidade /
+    ocupacao / status — sem o problema de double-count que existia na
+    visao por operacao.
+    """
+    grupos = {}
+
+    for it in linhas:
+        key = (
+            it.get("unidade_negocio") or "",
+            it.get("tipo_recurso") or "",
+            it.get("codccu") or "",
+            it.get("codcre") or "",
+            it.get("descre") or "",
+        )
+
+        if key not in grupos:
+            grupos[key] = {
+                "unidade_negocio": key[0],
+                "tipo_recurso": key[1],
+                "codccu": key[2],
+                "codcre": key[3],
+                "descre": key[4],
+                "_ops": set(),
+                "_operacoes": set(),
+                "qtd_prevista": 0.0,
+                "carga_prevista_min": 0.0,
+            }
+
+        grupos[key]["_ops"].add(it.get("op_chave"))
+        codopr = _prod_trim(it.get("codopr"))
+        if codopr:
+            grupos[key]["_operacoes"].add(codopr)
+        grupos[key]["qtd_prevista"] += _prod_float(it.get("qtd_prevista_operacao"))
+        grupos[key]["carga_prevista_min"] += _prod_float(it.get("tempo_previsto_min"))
+
+    dados = []
+    for g in grupos.values():
+        carga_min = round(g["carga_prevista_min"], 6)
+        linha = {
+            "unidade_negocio": g["unidade_negocio"],
+            "tipo_recurso": g["tipo_recurso"],
+            "codccu": g["codccu"],
+            "codcre": g["codcre"],
+            "descre": g["descre"],
+            "qtd_ops": len(g["_ops"]),
+            "qtd_operacoes": len(g["_operacoes"]),
+            "qtd_prevista": round(g["qtd_prevista"], 6),
+            "carga_prevista_min": carga_min,
+            "carga_prevista_horas": round(carga_min / 60.0, 6),
+        }
+
+        if cap_por_codcre is not None:
+            cap_min = _prod_capacidade_lookup(cap_por_codcre, g["codcre"])
+            if cap_min and cap_min > 0:
+                linha["capacidade_disponivel_min"] = round(cap_min, 2)
+                linha["ocupacao_pct"] = round((carga_min / cap_min) * 100.0, 2)
+                linha["status_ocupacao"] = _prod_status_ocupacao(carga_min, cap_min)
+            else:
+                linha["capacidade_disponivel_min"] = None
+                linha["ocupacao_pct"] = None
+                linha["status_ocupacao"] = "SEM_CAPACIDADE"
+
+        dados.append(linha)
+
+    # Ordem default: carga decrescente — primeiro item = recurso mais demandado
+    dados.sort(
+        key=lambda x: (
+            -(x.get("carga_prevista_min") or 0),
+            x.get("unidade_negocio") or "",
+            x.get("codccu") or "",
+            x.get("codcre") or "",
+        )
+    )
+
+    return dados
+
+
+def _prod_resumo(linhas: list, cap_por_codcre: Optional[dict] = None,
+                 dados_agrupados: Optional[list] = None,
+                 qtd_obras: Optional[int] = None) -> dict:
+    """KPIs agregados.
+
+    Se cap_por_codcre vier:
+      - capacidade_disponivel_min: soma da capacidade dos recursos DISTINTOS
+        que aparecem nas linhas (evita contar capacidade duas vezes quando
+        o mesmo codcre aparece em mais de uma operacao).
+      - ocupacao_media_pct: media ponderada pela capacidade
+        (sum(carga onde tem capacidade) / sum(capacidade) * 100).
+      - centros_criticos: count distinct de codcre com status CRITICO
+        (calculado pelo agrupador, vem em dados_agrupados).
+
+    obras_em_producao: count distinct de obras (projetos). Caller passa
+    via qtd_obras quando consegue resolver pela USU_T900COP — senao usa
+    count distinct de OPs como fallback.
+    """
+    ops = set()
+    recursos = set()
+    unidades = set()
+    carga_min = 0.0
+    qtd_prev = 0.0
+    sem_mapeamento = 0
+
+    for it in linhas:
+        ops.add(it.get("op_chave"))
+        recursos.add(it.get("codcre"))
+        unidades.add(it.get("unidade_negocio"))
+        carga_min += _prod_float(it.get("tempo_previsto_min"))
+        qtd_prev += _prod_float(it.get("qtd_prevista_operacao"))
+
+        if it.get("origem_mapeamento") == "REGRA_API":
+            sem_mapeamento += 1
+
+    out = {
+        "qtd_ops": len(ops),
+        "qtd_recursos": len([x for x in recursos if x]),
+        "qtd_unidades": len([x for x in unidades if x]),
+        "qtd_linhas_operacao": len(linhas),
+        "qtd_prevista": round(qtd_prev, 6),
+        "carga_prevista_min": round(carga_min, 6),
+        "carga_prevista_horas": round(carga_min / 60.0, 6),
+        "linhas_sem_mapeamento_supabase": sem_mapeamento,
+    }
+
+    if cap_por_codcre is not None:
+        # Capacidade total: soma da capacidade dos recursos DISTINTOS.
+        # Usa id() para deduplicar a mesma referencia (que pode aparecer
+        # em multiplas chaves do mapa).
+        capacidade_total = 0.0
+        carga_com_cap = 0.0
+        recursos_validos = set()
+        for codcre in {x for x in recursos if x}:
+            cap_min = _prod_capacidade_lookup(cap_por_codcre, codcre)
+            if cap_min and cap_min > 0:
+                capacidade_total += cap_min
+                recursos_validos.add(codcre)
+        # Carga apenas dos recursos com capacidade definida (para ponderar
+        # a ocupacao_media_pct corretamente — recursos SEM_CAPACIDADE nao
+        # entram no calculo).
+        for it in linhas:
+            cc = it.get("codcre")
+            if cc and cc in recursos_validos:
+                carga_com_cap += _prod_float(it.get("tempo_previsto_min"))
+
+        out["capacidade_disponivel_min"] = round(capacidade_total, 2)
+        out["ocupacao_media_pct"] = (
+            round((carga_com_cap / capacidade_total) * 100.0, 2)
+            if capacidade_total > 0 else None
+        )
+
+        # Centros criticos: count distinct de codcre com status CRITICO
+        # a partir do agrupador (que ja consolidou a carga por recurso x
+        # operacao). Para ser conservador, agrupamos a carga POR RECURSO
+        # (somando operacoes) e classificamos no nivel do recurso.
+        criticos = set()
+        carga_por_recurso = {}
+        for it in linhas:
+            cc = it.get("codcre")
+            if not cc:
+                continue
+            carga_por_recurso[cc] = carga_por_recurso.get(cc, 0.0) + _prod_float(
+                it.get("tempo_previsto_min")
+            )
+        for cc, carga in carga_por_recurso.items():
+            cap_min = _prod_capacidade_lookup(cap_por_codcre, cc)
+            if cap_min and cap_min > 0:
+                if _prod_status_ocupacao(carga, cap_min) == "CRITICO":
+                    criticos.add(cc)
+        out["centros_criticos"] = len(criticos)
+    else:
+        out["capacidade_disponivel_min"] = None
+        out["ocupacao_media_pct"] = None
+        out["centros_criticos"] = None
+
+    # Obras em producao: distinct projetos quando o caller resolveu,
+    # senao distinct OPs (fallback documentado).
+    if qtd_obras is not None:
+        out["obras_em_producao"] = int(qtd_obras)
+    else:
+        out["obras_em_producao"] = len(ops)
+
+    return out
+
+
+# ============================================================
+# CAPACIDADE / OCUPAÇÃO
+# ============================================================
+
+def _prod_parse_iso(data_str: str):
+    """Converte 'YYYY-MM-DD' em date. Retorna None se invalido."""
+    if not data_str:
+        return None
+    try:
+        return datetime.strptime(str(data_str)[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _prod_dias_uteis(data_ini, data_fim, considera_sabado: bool = False,
+                     considera_domingo: bool = False) -> int:
+    """Conta dias uteis entre data_ini e data_fim (inclusive).
+
+    - Segunda a sexta sempre conta.
+    - Sabado conta se considera_sabado=True.
+    - Domingo conta se considera_domingo=True.
+    Nao subtrai feriados (cadastro fora do escopo desta versao).
+    """
+    if isinstance(data_ini, str):
+        data_ini = _prod_parse_iso(data_ini)
+    if isinstance(data_fim, str):
+        data_fim = _prod_parse_iso(data_fim)
+    if not data_ini or not data_fim or data_fim < data_ini:
+        return 0
+
+    dias = 0
+    atual = data_ini
+    while atual <= data_fim:
+        weekday = atual.weekday()  # 0=Seg ... 6=Dom
+        if weekday <= 4:
+            dias += 1
+        elif weekday == 5 and considera_sabado:
+            dias += 1
+        elif weekday == 6 and considera_domingo:
+            dias += 1
+        atual = atual + timedelta(days=1)
+    return dias
+
+
+def _prod_status_ocupacao(carga_min: float, capacidade_min: float) -> str:
+    """Classifica o status de ocupacao de um recurso.
+
+    - capacidade <= 0 -> SEM_CAPACIDADE
+    - <60% -> BAIXO, <80% -> MEDIO, <95% -> ALTO, >=95% -> CRITICO
+    """
+    if capacidade_min is None or capacidade_min <= 0:
+        return "SEM_CAPACIDADE"
+    try:
+        pct = (float(carga_min or 0) / float(capacidade_min)) * 100.0
+    except Exception:
+        return "SEM_CAPACIDADE"
+    if pct < PRODUCAO_OCUPACAO_FAIXA_BAIXO:
+        return "BAIXO"
+    if pct < PRODUCAO_OCUPACAO_FAIXA_MEDIO:
+        return "MEDIO"
+    if pct < PRODUCAO_OCUPACAO_FAIXA_ALTO:
+        return "ALTO"
+    return "CRITICO"
+
+
+def _prod_status_gargalo(carga_min: float, capacidade_min: float) -> str:
+    """Status simplificado p/ o endpoint /capacidade.
+
+    Taxonomia gerencial (PCP), independente das faixas de _prod_status_ocupacao:
+      - capacidade <= 0  -> SEM_PARAMETRO
+      - <=80%            -> OK
+      - 80% a 100%       -> ATENCAO
+      - >100%            -> GARGALO
+    """
+    if capacidade_min is None or capacidade_min <= 0:
+        return "SEM_PARAMETRO"
+    try:
+        pct = (float(carga_min or 0) / float(capacidade_min)) * 100.0
+    except Exception:
+        return "SEM_PARAMETRO"
+    if pct <= 80.0:
+        return "OK"
+    if pct <= 100.0:
+        return "ATENCAO"
+    return "GARGALO"
+
+
+def _prod_capacidade_padrao_rows(codemp: int = 1) -> list:
+    """Filtra PRODUCAO_CAPACIDADE_PADRAO pela empresa, marcando origem."""
+    out = []
+    for r in PRODUCAO_CAPACIDADE_PADRAO:
+        if int(r.get("codemp", 0)) != int(codemp):
+            continue
+        row = dict(r)
+        row["origem"] = "PADRAO_API"
+        out.append(row)
+    return out
+
+
+def _prod_carregar_mapa_capacidade(codemp: int = 1) -> dict:
+    """Carrega cadastro de capacidade por recurso, com fallback interno.
+
+    Ordem:
+      1) Supabase (PRODUCAO_CAPACIDADE_RECURSO_TABLE) se configurado.
+      2) PRODUCAO_CAPACIDADE_PADRAO (mapa interno) caso contrario.
+
+    Retorno: dict[codcre] -> {minutos_dia, qtde_recursos, eficiencia_perc,
+                              considera_sabado, ativo, origem}
+    Replica chave para variacoes com/sem zeros a esquerda.
+    """
+    supabase_url = os.getenv("SUPABASE_URL", "").strip()
+    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+
+    rows = []
+    if supabase_url and supabase_key:
+        try:
+            params = {
+                "select": "codemp,codcre,minutos_dia,qtde_recursos,eficiencia_perc,considera_sabado,ativo",
+                "codemp": f"eq.{int(codemp)}",
+                "ativo": "eq.true",
+                "limit": "5000",
+            }
+            rows = _prod_supabase_get(PRODUCAO_CAPACIDADE_RECURSO_TABLE, params=params) or []
+            for r in rows:
+                r["origem"] = "SUPABASE"
+        except Exception:
+            rows = []
+
+    if not rows:
+        rows = _prod_capacidade_padrao_rows(codemp)
+
+    mapa = {}
+    for r in rows:
+        codcre = _prod_trim(r.get("codcre"))
+        if not codcre:
+            continue
+        for key in _prod_codcre_keys(codcre):
+            mapa[key] = r
+    return mapa
+
+
+def _prod_cap_flag_sabado(cap_row: dict) -> bool:
+    """Le considera_sabado/considerar_sabado (tolera as duas grafias)."""
+    if cap_row is None:
+        return False
+    if "considera_sabado" in cap_row:
+        return bool(cap_row.get("considera_sabado"))
+    if "considerar_sabado" in cap_row:
+        return bool(cap_row.get("considerar_sabado"))
+    return False
+
+
+def _prod_cap_flag_domingo(cap_row: dict) -> bool:
+    """Le considera_domingo/considerar_domingo (tolera as duas grafias)."""
+    if cap_row is None:
+        return False
+    if "considera_domingo" in cap_row:
+        return bool(cap_row.get("considera_domingo"))
+    if "considerar_domingo" in cap_row:
+        return bool(cap_row.get("considerar_domingo"))
+    return False
+
+
+def _prod_capacidade_no_periodo(
+    cap_row: dict,
+    data_ini,
+    data_fim,
+) -> float:
+    """Calcula capacidade total (em minutos) de um recurso no periodo.
+
+    capacidade = dias_uteis * minutos_dia * qtde_recursos * eficiencia/100
+    """
+    if not cap_row:
+        return 0.0
+    try:
+        minutos_dia = _prod_float(cap_row.get("minutos_dia")) or PRODUCAO_CAPACIDADE_DEFAULT_MIN_DIA
+        qtde = _prod_float(cap_row.get("qtde_recursos")) or PRODUCAO_CAPACIDADE_DEFAULT_QTDE
+        eficiencia = _prod_float(cap_row.get("eficiencia_perc")) or PRODUCAO_CAPACIDADE_DEFAULT_EFICIENCIA
+        considera_sabado = _prod_cap_flag_sabado(cap_row)
+        considera_domingo = _prod_cap_flag_domingo(cap_row)
+
+        dias = _prod_dias_uteis(
+            data_ini, data_fim,
+            considera_sabado=considera_sabado,
+            considera_domingo=considera_domingo,
+        )
+        if dias <= 0 or minutos_dia <= 0 or qtde <= 0:
+            return 0.0
+        return float(dias) * minutos_dia * qtde * (eficiencia / 100.0)
+    except Exception:
+        return 0.0
+
+
+def _prod_capacidade_por_codcre(
+    mapa_capacidade: dict,
+    data_ini,
+    data_fim,
+) -> dict:
+    """Pre-calcula capacidade total no periodo por codcre.
+
+    Devolve dict[codcre (normalizado)] -> capacidade_min.
+    A chave usa todas as variacoes (_prod_codcre_keys), igual ao mapa.
+    """
+    out = {}
+    vistos = set()
+    for key, cap_row in mapa_capacidade.items():
+        # cap_row pode repetir entre keys (zfill/lstrip variantes). Evita
+        # recomputar cap_no_periodo varias vezes para o mesmo recurso.
+        marca = id(cap_row)
+        if marca in vistos:
+            cap_min = out.get(key)
+        else:
+            cap_min = _prod_capacidade_no_periodo(cap_row, data_ini, data_fim)
+            vistos.add(marca)
+        out[key] = cap_min
+    return out
+
+
+def _prod_capacidade_lookup(cap_por_codcre: dict, codcre: str) -> float:
+    """Busca capacidade tolerando variacoes de zeros a esquerda."""
+    for key in _prod_codcre_keys(codcre):
+        if key in cap_por_codcre:
+            return float(cap_por_codcre[key] or 0.0)
+    return 0.0
+
+
+# ============================================================
+# OBRAS / PROJETOS
+# ============================================================
+
+def _prod_resolver_obras_por_op(linhas: list, codemp: int = 1) -> dict:
+    """Mapeia (codori, numorp) -> usu_numprj usando USU_T900COP.
+
+    Defensivo:
+      - Se a tabela nao existir / falhar, retorna {} (caller usa fallback).
+      - Particiona em chunks de 500 para nao estourar IN clause.
+    """
+    pares = sorted({
+        (_prod_trim(x.get("codori")), _prod_int(x.get("numorp"), 0))
+        for x in linhas
+        if x.get("codori") and x.get("numorp")
+    })
+    if not pares:
+        return {}
+
+    mapa = {}
+    chunk_size = 500
+    try:
+        conn = get_connection()
+        try:
+            cursor = conn.cursor()
+            for i in range(0, len(pares), chunk_size):
+                chunk = pares[i:i + chunk_size]
+                clauses = " OR ".join(
+                    ["(usu_codori = ? AND usu_numorp = ?)"] * len(chunk)
+                )
+                sql = f"""
+                    SELECT usu_codori, usu_numorp, usu_numprj
+                    FROM usu_t900cop
+                    WHERE usu_codemp = ?
+                      AND ({clauses})
+                """
+                params = [int(codemp)]
+                for codori, numorp in chunk:
+                    params.extend([codori, int(numorp)])
+                cursor.execute(sql, params)
+                for r in cursor.fetchall():
+                    cori = _prod_trim(r[0])
+                    norp = _prod_int(r[1], 0)
+                    numprj = r[2]
+                    if cori and norp and numprj:
+                        mapa[(cori, norp)] = _prod_trim(numprj)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        # USU_T900COP indisponivel — caller cai para fallback.
+        return {}
+    return mapa
+
+
+def _prod_contar_obras(linhas: list, codemp: int = 1) -> Optional[int]:
+    """Conta obras (projetos) distintas das OPs em `linhas`.
+
+    Retorna None se nao conseguir resolver via USU_T900COP — caller usa
+    count distinct de OPs como fallback.
+    """
+    mapa = _prod_resolver_obras_por_op(linhas, codemp=codemp)
+    if not mapa:
+        return None
+    projetos = set()
+    for v in mapa.values():
+        if v:
+            projetos.add(v)
+    return len(projetos)
+
+
+def _prod_obras_em_risco(
+    linhas: list,
+    cap_por_codcre: dict,
+    codemp: int = 1,
+    limite: int = 50,
+) -> list:
+    """Lista obras (projetos) com OPs em recursos CRITICOS.
+
+    Critério V1:
+      - identifica codcre com status_ocupacao=CRITICO no periodo;
+      - localiza OPs em `linhas` que tocam esses recursos;
+      - agrupa por (codori, numprj) — usa USU_T900COP para resolver
+        projeto; se nao resolver, agrupa por OP (codori, numorp).
+    """
+    if not linhas or not cap_por_codcre:
+        return []
+
+    # Calcula carga por recurso para classificar criticos
+    carga_por_recurso = {}
+    for it in linhas:
+        cc = _prod_trim(it.get("codcre"))
+        if not cc:
+            continue
+        carga_por_recurso[cc] = carga_por_recurso.get(cc, 0.0) + _prod_float(
+            it.get("tempo_previsto_min")
+        )
+    criticos = {
+        cc for cc, carga in carga_por_recurso.items()
+        if _prod_capacidade_lookup(cap_por_codcre, cc) > 0
+        and _prod_status_ocupacao(carga, _prod_capacidade_lookup(cap_por_codcre, cc)) == "CRITICO"
+    }
+    if not criticos:
+        return []
+
+    # Linhas das OPs que tocam recursos criticos
+    linhas_risco = [
+        it for it in linhas
+        if _prod_trim(it.get("codcre")) in criticos
+    ]
+    if not linhas_risco:
+        return []
+
+    # Resolve projeto por (codori, numorp)
+    mapa_obra = _prod_resolver_obras_por_op(linhas_risco, codemp=codemp)
+
+    # Agrupa carga/capacidade por (codori, numprj-ou-numorp)
+    grupos = {}
+    for it in linhas_risco:
+        codori = _prod_trim(it.get("codori"))
+        numorp = _prod_int(it.get("numorp"), 0)
+        codcre = _prod_trim(it.get("codcre"))
+        numprj = mapa_obra.get((codori, numorp))
+
+        chave = (codori, numprj) if numprj else (codori, f"OP-{numorp}")
+
+        if chave not in grupos:
+            grupos[chave] = {
+                "codori": codori,
+                "numprj": numprj if numprj else None,
+                "numorp_referencia": numorp if not numprj else None,
+                "descricao": (
+                    f"Obra {numprj}" if numprj
+                    else f"OP {codori}-{numorp} (sem projeto)"
+                ),
+                "_ops": set(),
+                "_recursos": set(),
+                "carga_prevista_min": 0.0,
+                "capacidade_disponivel_min": 0.0,
+            }
+        g = grupos[chave]
+        g["_ops"].add((codori, numorp))
+        if codcre and codcre not in g["_recursos"]:
+            g["_recursos"].add(codcre)
+            # Capacidade conta uma vez por recurso (nao por operacao)
+            g["capacidade_disponivel_min"] += _prod_capacidade_lookup(
+                cap_por_codcre, codcre
+            )
+        g["carga_prevista_min"] += _prod_float(it.get("tempo_previsto_min"))
+
+    out = []
+    for g in grupos.values():
+        cap = round(g["capacidade_disponivel_min"], 2)
+        carga = round(g["carga_prevista_min"], 2)
+        ocup = round((carga / cap) * 100.0, 2) if cap > 0 else None
+        out.append({
+            "codori": g["codori"],
+            "numprj": g["numprj"],
+            "numorp_referencia": g["numorp_referencia"],
+            "descricao": g["descricao"],
+            "carga_prevista_min": carga,
+            "capacidade_disponivel_min": cap,
+            "ocupacao_pct": ocup,
+            "ocupacao_critica": True,
+            "qtd_ops": len(g["_ops"]),
+            "motivo": "Carga prevista acima da capacidade em recurso crítico",
+        })
+    # Maiores ocupacoes primeiro
+    out.sort(key=lambda x: (x.get("ocupacao_pct") or 0), reverse=True)
+    return out[:limite]
+
+
+# ============================================================
+# COMPARATIVO PERIODO ANTERIOR
+# ============================================================
+
+def _prod_periodo_anterior(data_ini: str, data_fim: str) -> tuple:
+    """Calcula o periodo anterior de MESMA quantidade de dias.
+
+    Ex.: 01/05 a 31/05 (31 dias) -> 31/03 a 30/04 (31 dias).
+    """
+    d_ini = _prod_parse_iso(data_ini)
+    d_fim = _prod_parse_iso(data_fim)
+    if not d_ini or not d_fim or d_fim < d_ini:
+        return None, None
+    dias = (d_fim - d_ini).days + 1
+    anterior_fim = d_ini - timedelta(days=1)
+    anterior_ini = anterior_fim - timedelta(days=dias - 1)
+    return anterior_ini.isoformat(), anterior_fim.isoformat()
+
+
+@app.get("/api/producao/carga/centros")
+def consultar_producao_carga_centros(
+    codemp: int = 1,
+    data_ini: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    situacoes: Optional[str] = "A,L",
+    unidade_negocio: Optional[str] = None,
+    tipo_recurso: Optional[str] = None,
+    codori: Optional[str] = None,
+    codcre: Optional[str] = None,
+    codopr: Optional[str] = None,
+    codpro: Optional[str] = None,
+    considera_carga: bool = True,
+    incluir_comparativo: bool = True,
+    incluir_obras_risco: bool = True,
+    limite: int = 50000,
+    usuario=Depends(validar_token),
+):
+    """Carga prevista agrupada por unidade/CCU/recurso/operacao.
+
+    Inclui capacidade, ocupacao, comparativo com periodo anterior e obras
+    em risco. Front pode desabilitar comparativo/obras_risco via flags
+    quando quiser resposta mais leve (ex.: refresh frequente).
+    """
+    # Datas resolvidas (uma vez) — usadas tanto pela query do ERP quanto
+    # pelo calculo de capacidade no periodo.
+    data_ini_eff = data_ini or _prod_data_padrao_ini()
+    data_fim_eff = data_fim or _prod_data_padrao_fim()
+
+    mapa_recursos = _prod_carregar_mapa_recursos(codemp)
+    mapa_capacidade = _prod_carregar_mapa_capacidade(codemp)
+    cap_por_codcre = _prod_capacidade_por_codcre(
+        mapa_capacidade, data_ini_eff, data_fim_eff,
+    )
+
+    linhas_erp = _prod_consultar_carga_erp(
+        codemp=codemp,
+        data_ini=data_ini_eff,
+        data_fim=data_fim_eff,
+        situacoes=situacoes,
+        codori=codori,
+        codcre=codcre,
+        codopr=codopr,
+        codpro=codpro,
+        limite=limite,
+    )
+
+    linhas = _prod_enriquecer_linhas(
+        linhas_erp,
+        mapa_recursos,
+        unidade_negocio=unidade_negocio,
+        tipo_recurso=tipo_recurso,
+        considera_carga=considera_carga,
+    )
+
+    dados = _prod_agrupar_por_centro(linhas, cap_por_codcre=cap_por_codcre)
+
+    # Obras em producao: tenta resolver via USU_T900COP; se falhar, vira None
+    # (resumo cai para count distinct de OPs).
+    qtd_obras = _prod_contar_obras(linhas, codemp=codemp)
+
+    resumo = _prod_resumo(
+        linhas,
+        cap_por_codcre=cap_por_codcre,
+        dados_agrupados=dados,
+        qtd_obras=qtd_obras,
+    )
+
+    # Comparativo com periodo anterior (mesma quantidade de dias).
+    comparativo = None
+    if incluir_comparativo:
+        comp_ini, comp_fim = _prod_periodo_anterior(data_ini_eff, data_fim_eff)
+        if comp_ini and comp_fim:
+            try:
+                cap_por_codcre_ant = _prod_capacidade_por_codcre(
+                    mapa_capacidade, comp_ini, comp_fim,
+                )
+                linhas_erp_ant = _prod_consultar_carga_erp(
+                    codemp=codemp,
+                    data_ini=comp_ini,
+                    data_fim=comp_fim,
+                    situacoes=situacoes,
+                    codori=codori,
+                    codcre=codcre,
+                    codopr=codopr,
+                    codpro=codpro,
+                    limite=limite,
+                )
+                linhas_ant = _prod_enriquecer_linhas(
+                    linhas_erp_ant,
+                    mapa_recursos,
+                    unidade_negocio=unidade_negocio,
+                    tipo_recurso=tipo_recurso,
+                    considera_carga=considera_carga,
+                )
+                qtd_obras_ant = _prod_contar_obras(linhas_ant, codemp=codemp)
+                resumo_ant = _prod_resumo(
+                    linhas_ant,
+                    cap_por_codcre=cap_por_codcre_ant,
+                    qtd_obras=qtd_obras_ant,
+                )
+                comparativo = {
+                    "periodo_ini": comp_ini,
+                    "periodo_fim": comp_fim,
+                    "qtd_ops": resumo_ant.get("qtd_ops"),
+                    "qtd_recursos": resumo_ant.get("qtd_recursos"),
+                    "qtd_linhas_operacao": resumo_ant.get("qtd_linhas_operacao"),
+                    "carga_prevista_min": resumo_ant.get("carga_prevista_min"),
+                    "carga_prevista_horas": resumo_ant.get("carga_prevista_horas"),
+                    "capacidade_disponivel_min": resumo_ant.get("capacidade_disponivel_min"),
+                    "ocupacao_media_pct": resumo_ant.get("ocupacao_media_pct"),
+                    "centros_criticos": resumo_ant.get("centros_criticos"),
+                    "obras_em_producao": resumo_ant.get("obras_em_producao"),
+                }
+            except Exception:
+                comparativo = None
+
+    obras_risco = []
+    if incluir_obras_risco:
+        try:
+            obras_risco = _prod_obras_em_risco(linhas, cap_por_codcre, codemp=codemp)
+        except Exception:
+            obras_risco = []
+
+    return {
+        "filtros": {
+            "codemp": codemp,
+            "data_ini": data_ini_eff,
+            "data_fim": data_fim_eff,
+            "situacoes": situacoes or "A,L",
+            "unidade_negocio": unidade_negocio,
+            "tipo_recurso": tipo_recurso,
+            "codori": codori,
+            "codcre": codcre,
+            "codopr": codopr,
+            "codpro": codpro,
+            "considera_carga": considera_carga,
+        },
+        "resumo": resumo,
+        "comparativo_anterior": comparativo,
+        "total_registros": len(dados),
+        "dados": dados,
+        "obras_risco": obras_risco,
+    }
+
+
+@app.get("/api/producao/carga/recursos")
+def consultar_producao_carga_recursos(
+    codemp: int = 1,
+    data_ini: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    situacoes: Optional[str] = "A,L",
+    unidade_negocio: Optional[str] = None,
+    tipo_recurso: Optional[str] = None,
+    codori: Optional[str] = None,
+    codcre: Optional[str] = None,
+    codopr: Optional[str] = None,
+    codpro: Optional[str] = None,
+    considera_carga: bool = True,
+    incluir_comparativo: bool = True,
+    limite: int = 50000,
+    usuario=Depends(validar_token),
+):
+    """Visao GERENCIAL: carga por centro de recurso (sem quebrar por operacao).
+
+    Uma linha por (unidade, tipo, ccu, codcre). Inclui qtd_operacoes
+    distintas. Por consolidar tudo no recurso, capacidade/ocupacao saem
+    sem o problema de double-count que existe na visao /centros.
+
+    Saida ordenada por carga_prevista_min DESC (recurso mais demandado
+    primeiro) — pronta para o ranking de gargalos.
+    """
+    data_ini_eff = data_ini or _prod_data_padrao_ini()
+    data_fim_eff = data_fim or _prod_data_padrao_fim()
+
+    mapa_recursos = _prod_carregar_mapa_recursos(codemp)
+    mapa_capacidade = _prod_carregar_mapa_capacidade(codemp)
+    cap_por_codcre = _prod_capacidade_por_codcre(
+        mapa_capacidade, data_ini_eff, data_fim_eff,
+    )
+
+    linhas_erp = _prod_consultar_carga_erp(
+        codemp=codemp,
+        data_ini=data_ini_eff,
+        data_fim=data_fim_eff,
+        situacoes=situacoes,
+        codori=codori,
+        codcre=codcre,
+        codopr=codopr,
+        codpro=codpro,
+        limite=limite,
+    )
+
+    linhas = _prod_enriquecer_linhas(
+        linhas_erp,
+        mapa_recursos,
+        unidade_negocio=unidade_negocio,
+        tipo_recurso=tipo_recurso,
+        considera_carga=considera_carga,
+    )
+
+    dados = _prod_agrupar_por_recurso(linhas, cap_por_codcre=cap_por_codcre)
+
+    qtd_obras = _prod_contar_obras(linhas, codemp=codemp)
+    resumo = _prod_resumo(
+        linhas,
+        cap_por_codcre=cap_por_codcre,
+        dados_agrupados=dados,
+        qtd_obras=qtd_obras,
+    )
+
+    # Comparativo do mesmo periodo anterior — opcional.
+    comparativo = None
+    if incluir_comparativo:
+        comp_ini, comp_fim = _prod_periodo_anterior(data_ini_eff, data_fim_eff)
+        if comp_ini and comp_fim:
+            try:
+                cap_ant = _prod_capacidade_por_codcre(
+                    mapa_capacidade, comp_ini, comp_fim,
+                )
+                linhas_erp_ant = _prod_consultar_carga_erp(
+                    codemp=codemp,
+                    data_ini=comp_ini,
+                    data_fim=comp_fim,
+                    situacoes=situacoes,
+                    codori=codori,
+                    codcre=codcre,
+                    codopr=codopr,
+                    codpro=codpro,
+                    limite=limite,
+                )
+                linhas_ant = _prod_enriquecer_linhas(
+                    linhas_erp_ant,
+                    mapa_recursos,
+                    unidade_negocio=unidade_negocio,
+                    tipo_recurso=tipo_recurso,
+                    considera_carga=considera_carga,
+                )
+                qtd_obras_ant = _prod_contar_obras(linhas_ant, codemp=codemp)
+                resumo_ant = _prod_resumo(
+                    linhas_ant,
+                    cap_por_codcre=cap_ant,
+                    qtd_obras=qtd_obras_ant,
+                )
+                comparativo = {
+                    "periodo_ini": comp_ini,
+                    "periodo_fim": comp_fim,
+                    "qtd_ops": resumo_ant.get("qtd_ops"),
+                    "qtd_recursos": resumo_ant.get("qtd_recursos"),
+                    "qtd_linhas_operacao": resumo_ant.get("qtd_linhas_operacao"),
+                    "carga_prevista_min": resumo_ant.get("carga_prevista_min"),
+                    "carga_prevista_horas": resumo_ant.get("carga_prevista_horas"),
+                    "capacidade_disponivel_min": resumo_ant.get("capacidade_disponivel_min"),
+                    "ocupacao_media_pct": resumo_ant.get("ocupacao_media_pct"),
+                    "centros_criticos": resumo_ant.get("centros_criticos"),
+                    "obras_em_producao": resumo_ant.get("obras_em_producao"),
+                }
+            except Exception:
+                comparativo = None
+
+    return {
+        "filtros": {
+            "codemp": codemp,
+            "data_ini": data_ini_eff,
+            "data_fim": data_fim_eff,
+            "situacoes": situacoes or "A,L",
+            "unidade_negocio": unidade_negocio,
+            "tipo_recurso": tipo_recurso,
+            "codori": codori,
+            "codcre": codcre,
+            "codopr": codopr,
+            "codpro": codpro,
+            "considera_carga": considera_carga,
+        },
+        "resumo": resumo,
+        "comparativo_anterior": comparativo,
+        "total_registros": len(dados),
+        "dados": dados,
+    }
+
+
+@app.get("/api/producao/carga/capacidade")
+def consultar_producao_carga_capacidade(
+    codemp: int = 1,
+    data_ini: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    situacoes: Optional[str] = "A,L",
+    unidade_negocio: Optional[str] = None,
+    tipo_recurso: Optional[str] = None,
+    codori: Optional[str] = None,
+    codcre: Optional[str] = None,
+    codopr: Optional[str] = None,
+    codpro: Optional[str] = None,
+    considera_carga: bool = True,
+    limite: int = 50000,
+    usuario=Depends(validar_token),
+):
+    """Endpoint dedicado de CAPACIDADE x OCUPACAO por centro de recurso.
+
+    Diferente de /recursos (que e gerencial e devolve tudo junto), este
+    endpoint foca em capacidade: para cada recurso, devolve carga, capacidade
+    no periodo, percentual de ocupacao e status PCP (OK/ATENCAO/GARGALO/
+    SEM_PARAMETRO).
+
+    Formula:
+      dias_uteis = dias entre data_ini e data_fim
+                   (ignora sabado/domingo salvo se considera_* = True
+                    no cadastro do recurso)
+      capacidade_min = dias_uteis * minutos_dia * qtde_recursos
+                      * eficiencia_perc/100
+      ocupacao_percentual = carga_prevista_min / capacidade_min * 100
+
+    Fonte de capacidade: producao_capacidade_recurso (Supabase) ou
+    PRODUCAO_CAPACIDADE_PADRAO (fallback interno).
+    """
+    data_ini_eff = data_ini or _prod_data_padrao_ini()
+    data_fim_eff = data_fim or _prod_data_padrao_fim()
+
+    mapa_recursos = _prod_carregar_mapa_recursos(codemp)
+    mapa_capacidade = _prod_carregar_mapa_capacidade(codemp)
+    cap_por_codcre = _prod_capacidade_por_codcre(
+        mapa_capacidade, data_ini_eff, data_fim_eff,
+    )
+
+    linhas_erp = _prod_consultar_carga_erp(
+        codemp=codemp,
+        data_ini=data_ini_eff,
+        data_fim=data_fim_eff,
+        situacoes=situacoes,
+        codori=codori,
+        codcre=codcre,
+        codopr=codopr,
+        codpro=codpro,
+        limite=limite,
+    )
+    linhas = _prod_enriquecer_linhas(
+        linhas_erp,
+        mapa_recursos,
+        unidade_negocio=unidade_negocio,
+        tipo_recurso=tipo_recurso,
+        considera_carga=considera_carga,
+    )
+
+    # Agrega carga por (codemp, codcre) — uma linha por recurso
+    by_recurso = {}
+    for it in linhas:
+        cc = _prod_trim(it.get("codcre"))
+        if not cc:
+            continue
+        slot = by_recurso.setdefault(cc, {
+            "codemp": _prod_int(it.get("codemp"), codemp),
+            "codcre": cc,
+            "descre": _prod_trim(it.get("descre")),
+            "codccu": _prod_trim(it.get("codccu")),
+            "unidade_negocio": _prod_trim(it.get("unidade_negocio")),
+            "tipo_recurso": _prod_trim(it.get("tipo_recurso")),
+            "_ops": set(),
+            "_operacoes": set(),
+            "carga_prevista_min": 0.0,
+        })
+        slot["_ops"].add(it.get("op_chave"))
+        codopr_v = _prod_trim(it.get("codopr"))
+        if codopr_v:
+            slot["_operacoes"].add(codopr_v)
+        slot["carga_prevista_min"] += _prod_float(it.get("tempo_previsto_min"))
+
+    # Localiza cap_row original (com parametros) para echo back
+    def _cap_row_lookup(cc):
+        for key in _prod_codcre_keys(cc):
+            if key in mapa_capacidade:
+                return mapa_capacidade[key]
+        return None
+
+    dados = []
+    qtd_gargalos = 0
+    soma_carga = 0.0
+    soma_capacidade = 0.0
+    for cc, slot in by_recurso.items():
+        carga_min = round(slot["carga_prevista_min"], 2)
+        cap_min = _prod_capacidade_lookup(cap_por_codcre, cc)
+        cap_row = _cap_row_lookup(cc)
+
+        status = _prod_status_gargalo(carga_min, cap_min)
+        if status == "GARGALO":
+            qtd_gargalos += 1
+
+        if cap_min and cap_min > 0:
+            ocup_pct = round((carga_min / cap_min) * 100.0, 2)
+            soma_carga += carga_min
+            soma_capacidade += cap_min
+        else:
+            ocup_pct = None
+
+        # Echo dos parametros usados (transparencia)
+        if cap_row:
+            param = {
+                "minutos_dia": _prod_float(cap_row.get("minutos_dia")) or PRODUCAO_CAPACIDADE_DEFAULT_MIN_DIA,
+                "qtde_recursos": _prod_float(cap_row.get("qtde_recursos")) or PRODUCAO_CAPACIDADE_DEFAULT_QTDE,
+                "eficiencia_perc": _prod_float(cap_row.get("eficiencia_perc")) or PRODUCAO_CAPACIDADE_DEFAULT_EFICIENCIA,
+                "considerar_sabado": _prod_cap_flag_sabado(cap_row),
+                "considerar_domingo": _prod_cap_flag_domingo(cap_row),
+                "origem_capacidade": cap_row.get("origem") or "SUPABASE",
+            }
+        else:
+            param = {
+                "minutos_dia": None,
+                "qtde_recursos": None,
+                "eficiencia_perc": None,
+                "considerar_sabado": None,
+                "considerar_domingo": None,
+                "origem_capacidade": "SEM_CADASTRO",
+            }
+
+        dados.append({
+            "codemp": slot["codemp"],
+            "codcre": cc,
+            "descre": slot["descre"],
+            "codccu": slot["codccu"],
+            "unidade_negocio": slot["unidade_negocio"],
+            "tipo_recurso": slot["tipo_recurso"],
+            "qtd_ops": len(slot["_ops"]),
+            "qtd_operacoes": len(slot["_operacoes"]),
+            "carga_prevista_min": carga_min,
+            "carga_prevista_horas": round(carga_min / 60.0, 4),
+            "capacidade_disponivel_min": round(cap_min, 2) if cap_min and cap_min > 0 else None,
+            "capacidade_disponivel_horas": round(cap_min / 60.0, 4) if cap_min and cap_min > 0 else None,
+            "ocupacao_percentual": ocup_pct,
+            "status": status,
+            **param,
+        })
+
+    # Ordenacao: GARGALO -> ATENCAO -> OK -> SEM_PARAMETRO, e dentro por ocupacao desc
+    status_ordem = {"GARGALO": 0, "ATENCAO": 1, "OK": 2, "SEM_PARAMETRO": 3}
+    dados.sort(key=lambda x: (
+        status_ordem.get(x.get("status"), 9),
+        -(x.get("ocupacao_percentual") or 0),
+        x.get("codcre") or "",
+    ))
+
+    qtd_obras = _prod_contar_obras(linhas, codemp=codemp)
+    if qtd_obras is None:
+        qtd_obras = len({(x.get("codori"), x.get("numorp")) for x in linhas})
+
+    qtd_recursos = len(by_recurso)
+    qtd_parametrizados = sum(
+        1 for d in dados
+        if d.get("capacidade_disponivel_min") is not None
+    )
+    qtd_sem_parametro = qtd_recursos - qtd_parametrizados
+
+    soma_carga_horas = round(soma_carga / 60.0, 4)
+    soma_cap_horas = round(soma_capacidade / 60.0, 4)
+    ocupacao_media = (
+        round((soma_carga / soma_capacidade) * 100.0, 2)
+        if soma_capacidade > 0 else None
+    )
+
+    return {
+        "filtros": {
+            "codemp": codemp,
+            "data_ini": data_ini_eff,
+            "data_fim": data_fim_eff,
+            "situacoes": situacoes or "A,L",
+            "unidade_negocio": unidade_negocio,
+            "tipo_recurso": tipo_recurso,
+            "codori": codori,
+            "codcre": codcre,
+            "codopr": codopr,
+            "codpro": codpro,
+            "considera_carga": considera_carga,
+        },
+        "resumo": {
+            "carga_prevista_min": round(soma_carga + sum(
+                d.get("carga_prevista_min", 0) for d in dados
+                if d.get("capacidade_disponivel_min") is None
+            ), 2),
+            "carga_prevista_horas": round(sum(d.get("carga_prevista_horas") or 0 for d in dados), 4),
+            "capacidade_disponivel_min": round(soma_capacidade, 2),
+            "capacidade_disponivel_horas": soma_cap_horas,
+            "ocupacao_media_percentual": ocupacao_media,
+            "qtd_recursos": qtd_recursos,
+            "qtd_recursos_parametrizados": qtd_parametrizados,
+            "qtd_recursos_sem_parametro": qtd_sem_parametro,
+            "qtd_gargalos": qtd_gargalos,
+            "obras_em_producao": int(qtd_obras),
+        },
+        "total_registros": len(dados),
+        "dados": dados,
+    }
+
+
+@app.get("/api/producao/carga/detalhe")
+def consultar_producao_carga_detalhe(
+    codemp: int = 1,
+    data_ini: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    situacoes: Optional[str] = "A,L",
+    unidade_negocio: Optional[str] = None,
+    tipo_recurso: Optional[str] = None,
+    codori: Optional[str] = None,
+    codcre: Optional[str] = None,
+    codopr: Optional[str] = None,
+    codpro: Optional[str] = None,
+    considera_carga: bool = True,
+    pagina: int = 1,
+    tamanho_pagina: int = 100,
+    limite: int = 50000,
+    usuario=Depends(validar_token),
+):
+    """Detalhe (linha a linha) das operacoes que compoem a carga."""
+    pagina = max(1, int(pagina or 1))
+    tamanho_pagina = max(1, min(int(tamanho_pagina or 100), 500))
+    offset = (pagina - 1) * tamanho_pagina
+
+    mapa = _prod_carregar_mapa_recursos(codemp)
+
+    linhas_erp = _prod_consultar_carga_erp(
+        codemp=codemp,
+        data_ini=data_ini,
+        data_fim=data_fim,
+        situacoes=situacoes,
+        codori=codori,
+        codcre=codcre,
+        codopr=codopr,
+        codpro=codpro,
+        limite=limite,
+    )
+
+    linhas = _prod_enriquecer_linhas(
+        linhas_erp,
+        mapa,
+        unidade_negocio=unidade_negocio,
+        tipo_recurso=tipo_recurso,
+        considera_carga=considera_carga,
+    )
+
+    total = len(linhas)
+    total_paginas = (total + tamanho_pagina - 1) // tamanho_pagina if total else 1
+    dados = linhas[offset:offset + tamanho_pagina]
+
+    return {
+        "pagina": pagina,
+        "tamanho_pagina": tamanho_pagina,
+        "total_registros": total,
+        "total_paginas": total_paginas,
+        "resumo": _prod_resumo(linhas),
+        "dados": dados,
+    }
+
+
+@app.get("/api/producao/carga/opcoes")
+def listar_opcoes_producao_carga(
+    codemp: int = 1,
+    data_ini: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    situacoes: Optional[str] = "A,L",
+    usuario=Depends(validar_token),
+):
+    """Lista valores distintos para alimentar filtros da tela (unidades,
+    tipos, centros de recurso, operacoes).
+    """
+    mapa = _prod_carregar_mapa_recursos(codemp)
+
+    linhas_erp = _prod_consultar_carga_erp(
+        codemp=codemp,
+        data_ini=data_ini,
+        data_fim=data_fim,
+        situacoes=situacoes,
+        limite=50000,
+    )
+
+    linhas = _prod_enriquecer_linhas(
+        linhas_erp,
+        mapa,
+        considera_carga=None,
+    )
+
+    unidades = sorted(set(_prod_trim(x.get("unidade_negocio")) for x in linhas if x.get("unidade_negocio")))
+    tipos = sorted(set(_prod_trim(x.get("tipo_recurso")) for x in linhas if x.get("tipo_recurso")))
+
+    centros = {}
+    operacoes = {}
+
+    for x in linhas:
+        codcre = _prod_trim(x.get("codcre"))
+        if codcre and codcre not in centros:
+            centros[codcre] = {
+                "codcre": codcre,
+                "descre": _prod_trim(x.get("descre")),
+                "codccu": _prod_trim(x.get("codccu")),
+                "unidade_negocio": _prod_trim(x.get("unidade_negocio")),
+            }
+
+        codopr = _prod_trim(x.get("codopr"))
+        if codopr and codopr not in operacoes:
+            operacoes[codopr] = {
+                "codopr": codopr,
+                "desopr": _prod_trim(x.get("desopr")),
+            }
+
+    return {
+        "unidades_negocio": unidades,
+        "tipos_recurso": tipos,
+        "centros_recurso": sorted(centros.values(), key=lambda x: x["codcre"]),
+        "operacoes": sorted(operacoes.values(), key=lambda x: x["codopr"]),
+    }
+
+
+# ============================================================
+# /situacoes — distribuicao real das OPs por situacao
+# ============================================================
+
+PRODUCAO_SITUACAO_DESCRICAO = {
+    "A": "Aberta",
+    "L": "Liberada",
+    "F": "Finalizada",
+    "E": "Encerrada",
+    "C": "Cancelada",
+    "S": "Suspensa",
+}
+
+
+@app.get("/api/producao/carga/situacoes")
+def consultar_producao_carga_situacoes(
+    codemp: int = 1,
+    data_ini: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    unidade_negocio: Optional[str] = None,
+    tipo_recurso: Optional[str] = None,
+    codori: Optional[str] = None,
+    codcre: Optional[str] = None,
+    codopr: Optional[str] = None,
+    codpro: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    """Distribuicao real das OPs (distinct codori+numorp) por SITORP.
+
+    Diferente de /centros, este endpoint NAO filtra por status — devolve
+    todas as situacoes encontradas no periodo, com qtd e percentual.
+    Mantem filtros de mapeamento (unidade/tipo) para coerencia com a tela.
+    """
+    data_ini_eff = data_ini or _prod_data_padrao_ini()
+    data_fim_eff = data_fim or _prod_data_padrao_fim()
+
+    mapa_recursos = _prod_carregar_mapa_recursos(codemp)
+
+    # Passa todas as situacoes via "A,L,F,E,C,S" — _prod_consultar_carga_erp
+    # ja transforma em IN (...). Origem 100 e SITORP=C ja sao excluidas no
+    # cabecalho do MCAP700; aqui queremos TUDO, entao explicitamos.
+    linhas_erp = _prod_consultar_carga_erp(
+        codemp=codemp,
+        data_ini=data_ini_eff,
+        data_fim=data_fim_eff,
+        situacoes="A,L,F,E,C,S",
+        codori=codori,
+        codcre=codcre,
+        codopr=codopr,
+        codpro=codpro,
+        limite=200000,
+    )
+
+    # Aplica filtros de mapeamento (unidade/tipo) — mas considera_carga=None
+    # para nao excluir recursos de logistica/manutencao do count de OPs.
+    linhas = _prod_enriquecer_linhas(
+        linhas_erp,
+        mapa_recursos,
+        unidade_negocio=unidade_negocio,
+        tipo_recurso=tipo_recurso,
+        considera_carga=None,
+    )
+
+    # Conta OPs DISTINTAS por situacao (uma OP tem N operacoes, mas conta 1x)
+    ops_por_situacao = {}
+    ops_total = set()
+    for it in linhas:
+        op_chave = (it.get("codori"), it.get("numorp"))
+        sit = _prod_trim(it.get("sitorp")).upper()
+        if not sit:
+            continue
+        if op_chave in ops_total:
+            # Ja foi contada — pula
+            continue
+        ops_total.add(op_chave)
+        ops_por_situacao.setdefault(sit, set()).add(op_chave)
+
+    total = len(ops_total)
+
+    por_situacao = []
+    for sit, ops in ops_por_situacao.items():
+        qtd = len(ops)
+        pct = round((qtd / total) * 100.0, 2) if total > 0 else 0.0
+        por_situacao.append({
+            "situacao": sit,
+            "descricao": PRODUCAO_SITUACAO_DESCRICAO.get(sit, sit),
+            "qtd": qtd,
+            "percentual": pct,
+        })
+
+    # Ordem fixa: ativas primeiro, depois finalizadas, depois canceladas
+    ordem = {"A": 0, "L": 1, "S": 2, "F": 3, "E": 4, "C": 5}
+    por_situacao.sort(key=lambda x: (ordem.get(x["situacao"], 99), -x["qtd"]))
+
+    return {
+        "filtros": {
+            "codemp": codemp,
+            "data_ini": data_ini_eff,
+            "data_fim": data_fim_eff,
+            "unidade_negocio": unidade_negocio,
+            "tipo_recurso": tipo_recurso,
+            "codori": codori,
+            "codcre": codcre,
+            "codopr": codopr,
+            "codpro": codpro,
+        },
+        "total": total,
+        "por_situacao": por_situacao,
+    }
+
+
+# ============================================================
+# /ocupacao-semanal — heatmap recurso x dia da semana
+# ============================================================
+
+PRODUCAO_DIAS_SEMANA = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado"]
+
+
+def _prod_data_referencia_operacao(linha: dict):
+    """Escolhe a data a usar para distribuir a carga da operacao.
+
+    Prioridade: DTPINI -> DTPFIM -> DATGER. Se vier 31/12/1900 ou None,
+    pula para a proxima.
+    """
+    for chave in ("data_inicio_prevista", "data_fim_prevista", "data_geracao_op"):
+        d = _prod_parse_iso(linha.get(chave))
+        if d and d.year > 1901:  # exclui '1900-01-01'/'1899-12-31' degenerados
+            return d
+    return None
+
+
+@app.get("/api/producao/carga/ocupacao-semanal")
+def consultar_producao_carga_ocupacao_semanal(
+    codemp: int = 1,
+    data_ini: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    situacoes: Optional[str] = "A,L",
+    unidade_negocio: Optional[str] = None,
+    tipo_recurso: Optional[str] = None,
+    codori: Optional[str] = None,
+    codcre: Optional[str] = None,
+    codopr: Optional[str] = None,
+    codpro: Optional[str] = None,
+    considera_carga: bool = True,
+    usuario=Depends(validar_token),
+):
+    """Heatmap de ocupacao por (recurso, dia da semana).
+
+    A carga prevista da operacao eh distribuida no dia da DTPINI (ou
+    fallback). Capacidade do recurso eh divida pela contagem de dias do
+    mesmo weekday no periodo para que ocupacao_pct fique consistente.
+    Apenas Segunda a Sabado sao considerados.
+    """
+    data_ini_eff = data_ini or _prod_data_padrao_ini()
+    data_fim_eff = data_fim or _prod_data_padrao_fim()
+
+    mapa_recursos = _prod_carregar_mapa_recursos(codemp)
+    mapa_capacidade = _prod_carregar_mapa_capacidade(codemp)
+
+    linhas_erp = _prod_consultar_carga_erp(
+        codemp=codemp,
+        data_ini=data_ini_eff,
+        data_fim=data_fim_eff,
+        situacoes=situacoes,
+        codori=codori,
+        codcre=codcre,
+        codopr=codopr,
+        codpro=codpro,
+        limite=100000,
+    )
+    linhas = _prod_enriquecer_linhas(
+        linhas_erp,
+        mapa_recursos,
+        unidade_negocio=unidade_negocio,
+        tipo_recurso=tipo_recurso,
+        considera_carga=considera_carga,
+    )
+
+    # Para cada (codcre, dia_semana) acumula a carga.
+    # Estrutura: dict[codcre][weekday(0-5)] -> carga_min
+    bucket: dict = {}
+    info_recurso: dict = {}
+    for it in linhas:
+        cc = _prod_trim(it.get("codcre"))
+        if not cc:
+            continue
+        info_recurso.setdefault(cc, {
+            "codcre": cc,
+            "descre": _prod_trim(it.get("descre")),
+            "unidade_negocio": _prod_trim(it.get("unidade_negocio")),
+            "tipo_recurso": _prod_trim(it.get("tipo_recurso")),
+        })
+
+        ref = _prod_data_referencia_operacao(it)
+        if not ref:
+            continue
+        weekday = ref.weekday()  # 0..6
+        if weekday >= 6:  # Domingo
+            continue
+        bucket.setdefault(cc, {})
+        bucket[cc][weekday] = bucket[cc].get(weekday, 0.0) + _prod_float(
+            it.get("tempo_previsto_min")
+        )
+
+    # Conta quantos dias de cada weekday existem no periodo (para distribuir
+    # a capacidade do recurso por dia).
+    d_ini = _prod_parse_iso(data_ini_eff)
+    d_fim = _prod_parse_iso(data_fim_eff)
+    dias_por_weekday = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+    if d_ini and d_fim and d_fim >= d_ini:
+        atual = d_ini
+        while atual <= d_fim:
+            wd = atual.weekday()
+            if wd <= 5:
+                dias_por_weekday[wd] = dias_por_weekday.get(wd, 0) + 1
+            atual = atual + timedelta(days=1)
+
+    recursos_out = []
+    for cc, ocup_dict in sorted(bucket.items()):
+        info = info_recurso[cc]
+        cap_row = None
+        for key in _prod_codcre_keys(cc):
+            if key in mapa_capacidade:
+                cap_row = mapa_capacidade[key]
+                break
+
+        # Capacidade DIARIA do recurso (uma vez)
+        if cap_row:
+            minutos_dia = _prod_float(cap_row.get("minutos_dia")) or PRODUCAO_CAPACIDADE_DEFAULT_MIN_DIA
+            qtde = _prod_float(cap_row.get("qtde_recursos")) or PRODUCAO_CAPACIDADE_DEFAULT_QTDE
+            eficiencia = _prod_float(cap_row.get("eficiencia_perc")) or PRODUCAO_CAPACIDADE_DEFAULT_EFICIENCIA
+            considera_sabado = _prod_cap_flag_sabado(cap_row)
+            cap_diaria = minutos_dia * qtde * (eficiencia / 100.0)
+        else:
+            cap_diaria = 0.0
+            considera_sabado = False
+
+        ocupacao = []
+        for wd, label in enumerate(PRODUCAO_DIAS_SEMANA):
+            qtd_dias = dias_por_weekday.get(wd, 0)
+            if wd == 5 and not considera_sabado:
+                cap_periodo = 0.0
+            else:
+                cap_periodo = cap_diaria * qtd_dias
+            carga = round(ocup_dict.get(wd, 0.0), 2)
+            if cap_periodo > 0:
+                ocup_pct = round((carga / cap_periodo) * 100.0, 2)
+                status = _prod_status_ocupacao(carga, cap_periodo)
+            else:
+                ocup_pct = None
+                status = "SEM_CAPACIDADE"
+            ocupacao.append({
+                "dia_semana": label,
+                "carga_prevista_min": carga,
+                "capacidade_disponivel_min": round(cap_periodo, 2) if cap_periodo else None,
+                "ocupacao_pct": ocup_pct,
+                "status_ocupacao": status,
+            })
+
+        recursos_out.append({
+            "codcre": info["codcre"],
+            "descre": info["descre"],
+            "unidade_negocio": info["unidade_negocio"],
+            "tipo_recurso": info["tipo_recurso"],
+            "ocupacao": ocupacao,
+        })
+
+    # Ordena por unidade -> codcre
+    recursos_out.sort(key=lambda r: (r.get("unidade_negocio") or "", r.get("codcre") or ""))
+
+    return {
+        "filtros": {
+            "codemp": codemp,
+            "data_ini": data_ini_eff,
+            "data_fim": data_fim_eff,
+            "situacoes": situacoes or "A,L",
+            "unidade_negocio": unidade_negocio,
+            "tipo_recurso": tipo_recurso,
+            "codori": codori,
+            "codcre": codcre,
+            "codopr": codopr,
+            "codpro": codpro,
+            "considera_carga": considera_carga,
+        },
+        "dias": PRODUCAO_DIAS_SEMANA,
+        "recursos": recursos_out,
+    }
+
+
+@app.get("/api/export/producao-carga-centros")
+def exportar_producao_carga_centros(
+    codemp: int = 1,
+    data_ini: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    situacoes: Optional[str] = "A,L",
+    unidade_negocio: Optional[str] = None,
+    tipo_recurso: Optional[str] = None,
+    codori: Optional[str] = None,
+    codcre: Optional[str] = None,
+    codopr: Optional[str] = None,
+    codpro: Optional[str] = None,
+    considera_carga: bool = True,
+    access_token: Optional[str] = None,
+    usuario=Depends(validar_token_download),
+):
+    """Exporta o agrupamento de carga por centro para XLSX.
+
+    Desabilita comparativo/obras_risco para o export — interessa apenas o
+    grid de dados (mais leve e mais rapido em periodos longos).
+    """
+    resultado = consultar_producao_carga_centros(
+        codemp=codemp,
+        data_ini=data_ini,
+        data_fim=data_fim,
+        situacoes=situacoes,
+        unidade_negocio=unidade_negocio,
+        tipo_recurso=tipo_recurso,
+        codori=codori,
+        codcre=codcre,
+        codopr=codopr,
+        codpro=codpro,
+        considera_carga=considera_carga,
+        incluir_comparativo=False,
+        incluir_obras_risco=False,
+        limite=200000,
+        usuario=usuario,
+    )
+
+    return _xlsx_response(
+        "producao_carga_centros.xlsx",
+        [("Carga Centros", resultado.get("dados") or [], None)],
+    )
+
+
+@app.get("/api/export/producao-carga-recursos")
+def exportar_producao_carga_recursos(
+    codemp: int = 1,
+    data_ini: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    situacoes: Optional[str] = "A,L",
+    unidade_negocio: Optional[str] = None,
+    tipo_recurso: Optional[str] = None,
+    codori: Optional[str] = None,
+    codcre: Optional[str] = None,
+    codopr: Optional[str] = None,
+    codpro: Optional[str] = None,
+    considera_carga: bool = True,
+    access_token: Optional[str] = None,
+    usuario=Depends(validar_token_download),
+):
+    """Exporta a visao GERENCIAL (carga por centro de recurso) em XLSX.
+
+    Sem comparativo (mais leve). Uma linha por recurso, com capacidade
+    e ocupacao quando houver cadastro.
+    """
+    resultado = consultar_producao_carga_recursos(
+        codemp=codemp,
+        data_ini=data_ini,
+        data_fim=data_fim,
+        situacoes=situacoes,
+        unidade_negocio=unidade_negocio,
+        tipo_recurso=tipo_recurso,
+        codori=codori,
+        codcre=codcre,
+        codopr=codopr,
+        codpro=codpro,
+        considera_carga=considera_carga,
+        incluir_comparativo=False,
+        limite=200000,
+        usuario=usuario,
+    )
+
+    return _xlsx_response(
+        "producao_carga_recursos.xlsx",
+        [("Carga Recursos", resultado.get("dados") or [], None)],
+    )
+
+
+@app.get("/api/export/producao-carga-capacidade")
+def exportar_producao_carga_capacidade(
+    codemp: int = 1,
+    data_ini: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    situacoes: Optional[str] = "A,L",
+    unidade_negocio: Optional[str] = None,
+    tipo_recurso: Optional[str] = None,
+    codori: Optional[str] = None,
+    codcre: Optional[str] = None,
+    codopr: Optional[str] = None,
+    codpro: Optional[str] = None,
+    considera_carga: bool = True,
+    access_token: Optional[str] = None,
+    usuario=Depends(validar_token_download),
+):
+    """Exporta CAPACIDADE x OCUPACAO por centro de recurso em XLSX.
+
+    Uma linha por recurso, com os parametros usados (minutos_dia,
+    qtde_recursos, eficiencia_perc, considerar_sabado/domingo) ecoados
+    para auditoria.
+    """
+    resultado = consultar_producao_carga_capacidade(
+        codemp=codemp,
+        data_ini=data_ini,
+        data_fim=data_fim,
+        situacoes=situacoes,
+        unidade_negocio=unidade_negocio,
+        tipo_recurso=tipo_recurso,
+        codori=codori,
+        codcre=codcre,
+        codopr=codopr,
+        codpro=codpro,
+        considera_carga=considera_carga,
+        limite=200000,
+        usuario=usuario,
+    )
+
+    return _xlsx_response(
+        "producao_carga_capacidade.xlsx",
+        [("Capacidade x Ocupacao", resultado.get("dados") or [], None)],
+    )
+
+
+@app.get("/api/export/producao-carga-ocupacao-semanal")
+def exportar_producao_carga_ocupacao_semanal(
+    codemp: int = 1,
+    data_ini: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    situacoes: Optional[str] = "A,L",
+    unidade_negocio: Optional[str] = None,
+    tipo_recurso: Optional[str] = None,
+    codori: Optional[str] = None,
+    codcre: Optional[str] = None,
+    codopr: Optional[str] = None,
+    codpro: Optional[str] = None,
+    considera_carga: bool = True,
+    access_token: Optional[str] = None,
+    usuario=Depends(validar_token_download),
+):
+    """Exporta o heatmap de ocupacao semanal (recurso x dia da semana) em XLSX.
+
+    Achata a estrutura aninhada para uma linha por (codcre, dia_semana),
+    facilitando filtro/sort em Excel. Inclui carga, capacidade, ocupacao
+    em % e status.
+    """
+    resultado = consultar_producao_carga_ocupacao_semanal(
+        codemp=codemp,
+        data_ini=data_ini,
+        data_fim=data_fim,
+        situacoes=situacoes,
+        unidade_negocio=unidade_negocio,
+        tipo_recurso=tipo_recurso,
+        codori=codori,
+        codcre=codcre,
+        codopr=codopr,
+        codpro=codpro,
+        considera_carga=considera_carga,
+        usuario=usuario,
+    )
+
+    linhas_flat = []
+    for recurso in resultado.get("recursos") or []:
+        codcre_v = recurso.get("codcre") or ""
+        descre_v = recurso.get("descre") or ""
+        unidade_v = recurso.get("unidade_negocio") or ""
+        tipo_v = recurso.get("tipo_recurso") or ""
+        for slot in recurso.get("ocupacao") or []:
+            carga_min = _prod_float(slot.get("carga_prevista_min"))
+            cap_min = slot.get("capacidade_disponivel_min")
+            ocup_pct = slot.get("ocupacao_pct")
+            linhas_flat.append({
+                "codcre": codcre_v,
+                "descre": descre_v,
+                "unidade_negocio": unidade_v,
+                "tipo_recurso": tipo_v,
+                "dia_semana": slot.get("dia_semana") or "",
+                "carga_prevista_min": round(carga_min, 2),
+                "carga_prevista_horas": round(carga_min / 60.0, 4),
+                "capacidade_disponivel_min": (
+                    round(_prod_float(cap_min), 2) if cap_min is not None else None
+                ),
+                "ocupacao_pct": (
+                    round(_prod_float(ocup_pct), 2) if ocup_pct is not None else None
+                ),
+                "status_ocupacao": slot.get("status_ocupacao") or "SEM_CAPACIDADE",
+            })
+
+    return _xlsx_response(
+        "producao_carga_ocupacao_semanal.xlsx",
+        [("Ocupacao Semanal", linhas_flat, None)],
+    )
+
+
+@app.get("/api/export/producao-carga-situacoes")
+def exportar_producao_carga_situacoes(
+    codemp: int = 1,
+    data_ini: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    unidade_negocio: Optional[str] = None,
+    tipo_recurso: Optional[str] = None,
+    codori: Optional[str] = None,
+    codcre: Optional[str] = None,
+    codopr: Optional[str] = None,
+    codpro: Optional[str] = None,
+    access_token: Optional[str] = None,
+    usuario=Depends(validar_token_download),
+):
+    """Exporta a distribuicao de OPs por situacao em XLSX.
+
+    Inclui a coluna `percentual_label` (string formatada "41.0%") para
+    facilitar leitura na planilha sem necessidade de formatacao de celula.
+    """
+    resultado = consultar_producao_carga_situacoes(
+        codemp=codemp,
+        data_ini=data_ini,
+        data_fim=data_fim,
+        unidade_negocio=unidade_negocio,
+        tipo_recurso=tipo_recurso,
+        codori=codori,
+        codcre=codcre,
+        codopr=codopr,
+        codpro=codpro,
+        usuario=usuario,
+    )
+
+    total = int(resultado.get("total") or 0)
+    linhas = []
+    for item in resultado.get("por_situacao") or []:
+        pct = _prod_float(item.get("percentual"))
+        linhas.append({
+            "situacao": item.get("situacao") or "",
+            "descricao": item.get("descricao") or "",
+            "qtd_ops": int(item.get("qtd") or 0),
+            "percentual": round(pct, 2),
+            "percentual_label": f"{round(pct, 1)}%",
+            "total_periodo": total,
+        })
+
+    return _xlsx_response(
+        "producao_carga_situacoes.xlsx",
+        [("Situacoes OPs", linhas, None)],
+    )
+
+
+# ============================================================
+# PRODUÇÃO - PROGRAMAÇÃO E SEQUENCIAMENTO (fila + prioridades)
+# ============================================================
+# Esta arquitetura foi simplificada: o algoritmo de programacao,
+# capacidade, gargalos e cenarios agora roda no Lovable Cloud /
+# Edge Function. A FastAPI:
+#
+#   - NAO grava agenda no Supabase.
+#   - NAO calcula capacidade.
+#   - NAO faz mapa de gargalos.
+#
+# A FastAPI apenas devolve a fila de OPs prontas para programar
+# (endpoint /api/producao/programacao/fila), enriquecida com mapa
+# de recursos e, quando configurado, prioridades manuais via
+# producao_prioridade_op no Supabase.
+#
+# Para o pipeline definitivo do ETL, use /api/producao/programacao/
+# fila-erp (mais abaixo) — esse nao acessa Supabase em hipotese
+# nenhuma.
+# ============================================================
+
+PRODUCAO_PRIORIDADE_OP_TABLE = os.getenv(
+    "PRODUCAO_PRIORIDADE_OP_TABLE",
+    "producao_prioridade_op",
+)
+
+
+def _prog_carregar_prioridades(codemp: int = 1) -> dict:
+    """Carrega prioridades manuais por OP. Tolerante a tabela inexistente."""
+    params = {
+        "select": "codemp,codori,numorp,op_chave,prioridade,data_desejada,motivo,ativo",
+        "codemp": f"eq.{int(codemp)}",
+        "ativo": "eq.true",
+        "limit": "5000",
+    }
+    try:
+        rows = _prod_supabase_get(PRODUCAO_PRIORIDADE_OP_TABLE, params=params)
+    except Exception:
+        rows = []
+
+    mapa = {}
+    for r in rows:
+        chave = (
+            int(r.get("codemp") or codemp),
+            _prod_trim(r.get("codori")),
+            int(r.get("numorp") or 0),
+        )
+        mapa[chave] = r
+    return mapa
+
+
+def _prog_preparar_fila(
+    *,
+    codemp: int,
+    data_ini: Optional[str],
+    data_fim: Optional[str],
+    situacoes: Optional[str],
+    unidade_negocio: Optional[str],
+    tipo_recurso: Optional[str],
+    codori: Optional[str],
+    codcre: Optional[str],
+    codopr: Optional[str],
+    codpro: Optional[str],
+    considera_carga: bool,
+    limite: int,
+) -> list:
+    """Constroi a fila ordenada de operacoes prontas para programar.
+
+    Ordem:
+      prioridade ASC -> data_desejada -> data_geracao_op -> unidade ->
+      codcre -> codori -> numorp -> seqrot.
+    """
+    mapa_recursos = _prod_carregar_mapa_recursos(codemp)
+
+    linhas_erp = _prod_consultar_carga_erp(
+        codemp=codemp,
+        data_ini=data_ini,
+        data_fim=data_fim,
+        situacoes=situacoes,
+        codori=codori,
+        codcre=codcre,
+        codopr=codopr,
+        codpro=codpro,
+        limite=limite,
+    )
+
+    linhas = _prod_enriquecer_linhas(
+        linhas_erp,
+        mapa_recursos,
+        unidade_negocio=unidade_negocio,
+        tipo_recurso=tipo_recurso,
+        considera_carga=considera_carga,
+    )
+
+    prioridades = _prog_carregar_prioridades(codemp)
+
+    fila = []
+    for it in linhas:
+        codori_item = _prod_trim(it.get("codori"))
+        numorp_item = int(it.get("numorp") or 0)
+        pri = prioridades.get((int(codemp), codori_item, numorp_item), {})
+
+        novo = dict(it)
+        novo["prioridade"] = int(pri.get("prioridade") or 999)
+        novo["data_desejada"] = pri.get("data_desejada")
+        novo["tempo_previsto_min"] = _prod_float(novo.get("tempo_previsto_min"))
+
+        if novo["tempo_previsto_min"] <= 0:
+            continue
+        fila.append(novo)
+
+    fila.sort(
+        key=lambda x: (
+            int(x.get("prioridade") or 999),
+            str(x.get("data_desejada") or ""),
+            str(x.get("data_geracao_op") or ""),
+            str(x.get("unidade_negocio") or ""),
+            str(x.get("codcre") or ""),
+            str(x.get("codori") or ""),
+            int(x.get("numorp") or 0),
+            int(x.get("seqrot") or 0),
+        )
+    )
+
+    return fila
+
+
+# ============================================================
+# Endpoint - Programação (somente fila)
+# ============================================================
+
+@app.get("/api/producao/programacao/fila")
+def consultar_fila_programacao(
+    codemp: int = 1,
+    data_ini: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    situacoes: Optional[str] = "A,L",
+    unidade_negocio: Optional[str] = None,
+    tipo_recurso: Optional[str] = None,
+    codori: Optional[str] = None,
+    codcre: Optional[str] = None,
+    codopr: Optional[str] = None,
+    codpro: Optional[str] = None,
+    considera_carga: bool = True,
+    limite: int = 50000,
+    usuario=Depends(validar_token),
+):
+    """Fila ordenada de OPs/operacoes prontas para programar."""
+    fila = _prog_preparar_fila(
+        codemp=codemp,
+        data_ini=data_ini,
+        data_fim=data_fim,
+        situacoes=situacoes,
+        unidade_negocio=unidade_negocio,
+        tipo_recurso=tipo_recurso,
+        codori=codori,
+        codcre=codcre,
+        codopr=codopr,
+        codpro=codpro,
+        considera_carga=considera_carga,
+        limite=limite,
+    )
+    return {
+        "total_registros": len(fila),
+        "resumo": _prod_resumo(fila),
+        "dados": fila,
+    }
+
+
+# ============================================================
+# PRODUÇÃO - FILA ERP PARA LOVABLE CLOUD
+#
+# Arquitetura nova:
+#   FastAPI = somente consulta ERP Senior (sem Supabase).
+#   Lovable Cloud / Edge Function = roda o algoritmo de programação,
+#   capacidade, gargalos e cenários sobre as tabelas internas dele.
+#
+# Este endpoint serve como FONTE DE DADOS pura para o Lovable popular a
+# tabela bi_ops_fila (upsert por codemp+codori+numorp+codetg+seqrot+
+# codopr+codcre).
+#
+# Nao acessa Supabase.
+# Nao grava nada.
+# Nao faz programacao.
+#
+# Os endpoints de programacao (/gerar, /agenda, /gargalos-dias,
+# /capacidades) e o parametrizador (/api/producao/carga/parametros-
+# recursos) foram REMOVIDOS — essa logica agora roda integralmente no
+# Lovable Cloud / Edge Function. Os endpoints de Carga de Producao
+# (/api/producao/carga/centros, /recursos, /capacidade, /detalhe,
+# /opcoes, /situacoes, /ocupacao-semanal) continuam disponiveis e
+# nao exigem Supabase — todos tem fallback interno via PRODUCAO_*_PADRAO.
+# ============================================================
+
+# Origens TKE/TKC/TKS sao Estrutural; GENIUS_ORIGENS ja existe no topo
+# do arquivo (110/120/.../250). Aqui apenas espelhamos o conjunto
+# Estrutural para o classificador independente.
+ESTRUTURAL_ORIGENS = ("TKE", "TKC", "TKS")
+
+
+def _erp_trim(valor) -> str:
+    if valor is None:
+        return ""
+    return str(valor).strip()
+
+
+def _erp_float(valor) -> float:
+    try:
+        if valor is None:
+            return 0.0
+        if isinstance(valor, str):
+            valor = valor.replace(",", ".")
+        return float(valor)
+    except Exception:
+        return 0.0
+
+
+def _erp_data_padrao_ini() -> str:
+    hoje = date.today()
+    return date(hoje.year, hoje.month, 1).isoformat()
+
+
+def _erp_data_padrao_fim() -> str:
+    return date.today().isoformat()
+
+
+def _erp_normalizar_valor(valor):
+    if isinstance(valor, Decimal):
+        return float(valor)
+    if isinstance(valor, datetime):
+        return valor.isoformat()
+    if isinstance(valor, date):
+        return valor.isoformat()
+    if isinstance(valor, str):
+        return valor.strip()
+    return valor
+
+
+def _erp_rows_to_dict(cursor, rows) -> list:
+    colunas = [c[0].lower() for c in cursor.description]
+    saida = []
+    for row in rows:
+        item = {}
+        for idx, col in enumerate(colunas):
+            item[col] = _erp_normalizar_valor(row[idx])
+        saida.append(item)
+    return saida
+
+
+def _erp_classificar_unidade(codori: str, codccu: str) -> str:
+    """Regra automatica: GENIUS / ESTRUTURAL / NAO_CLASSIFICADO.
+
+    Prioridade:
+      1) CODCCU 12100..12999 -> GENIUS
+      2) CODCCU 10100..11999 -> ESTRUTURAL
+      3) CODORI TKE/TKC/TKS  -> ESTRUTURAL
+      4) CODORI em GENIUS_ORIGENS -> GENIUS
+      5) sem match -> NAO_CLASSIFICADO
+    """
+    codori = _erp_trim(codori).upper()
+    codccu = _erp_trim(codccu)
+
+    codccu_num = None
+    try:
+        codccu_num = int(codccu)
+    except Exception:
+        codccu_num = None
+
+    if codccu_num is not None:
+        if 12100 <= codccu_num <= 12999:
+            return "GENIUS"
+        if 10100 <= codccu_num <= 11999:
+            return "ESTRUTURAL"
+
+    if codori in ESTRUTURAL_ORIGENS:
+        return "ESTRUTURAL"
+    if codori in GENIUS_ORIGENS:
+        return "GENIUS"
+
+    return "NAO_CLASSIFICADO"
+
+
+def _erp_tipo_recurso_padrao(codcre: str, descre: str) -> str:
+    """Inferencia de tipo de recurso. Pode ser refinado depois pelo ETL."""
+    codcre = _erp_trim(codcre)
+    descre_upper = _erp_trim(descre).upper()
+
+    if codcre in ("90", "95"):
+        return "MANUTENCAO"
+    if codcre in ("1810", "3132"):
+        return "LOGISTICA"
+    if codcre in ("4000",) or "TERCEIR" in descre_upper:
+        return "TERCEIROS"
+    return "PRODUCAO"
+
+
+@app.get("/api/producao/programacao/fila-erp")
+def consultar_fila_erp_para_lovable(
+    codemp: int = 1,
+    data_ini: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    situacoes: Optional[str] = "A,L",
+    codori: Optional[str] = None,
+    codcre: Optional[str] = None,
+    codopr: Optional[str] = None,
+    codpro: Optional[str] = None,
+    limite: Optional[int] = None,
+    limit: Optional[int] = None,
+    usuario=Depends(validar_token_ou_cron_secret),
+):
+    """Fonte de dados do ERP para o ETL/Edge Function do Lovable Cloud.
+
+    Devolve a fila bruta de OPs/operacoes abertas/liberadas (ou outros
+    status informados), com tempos, recurso, CCU e classificacao por
+    regra automatica. O Lovable usa para UPSERT em bi_ops_fila.
+
+    Filtro de data:
+      - Se data_ini E data_fim forem informados, filtra COP.DATGER por
+        essa janela.
+      - Se ALGUM dos dois faltar, NAO aplica filtro de data — devolve
+        TODAS as OPs nas situacoes informadas, mesmo OPs antigas que
+        ainda estao abertas/liberadas (cenario padrao para a tela de
+        Programacao, que precisa enxergar tudo que esta pendente).
+
+    Limite:
+      - Aceita `limite` (padrao) e `limit` (alias compatibilidade) na
+        querystring. Prioridade: limite > limit > 50000.
+      - Clamp em [100, 200000].
+
+    Autenticacao aceita:
+      - Authorization: Bearer <JWT>  (usuario que clica "Atualizar fila")
+      - x-cron-secret: <CRON_SECRET> (pg_cron / Edge Function automatica)
+
+    NAO acessa Supabase. NAO grava. NAO programa.
+    """
+    # Limite: aceita limite ou limit (alias para Edge Function que ainda
+    # use o nome em ingles). Prioriza limite quando ambos vierem.
+    limite_eff = limite if limite is not None else limit
+    if limite_eff is None:
+        limite_eff = 50000
+    limite_eff = max(100, min(int(limite_eff or 50000), 200000))
+
+    # Filtro de data so aplica quando AMBAS as datas vierem.
+    # Sem filtro default — para nao perder OPs antigas em aberto.
+    data_ini_norm = (data_ini or "").strip() or None
+    data_fim_norm = (data_fim or "").strip() or None
+    usar_filtro_data = bool(data_ini_norm and data_fim_norm)
+
+    sit_list = []
+    if situacoes:
+        sit_list = [
+            x.strip().upper()
+            for x in str(situacoes).replace(";", ",").split(",")
+            if x.strip()
+        ]
+    if not sit_list:
+        sit_list = ["A", "L"]
+
+    placeholders_sit = ",".join(["?"] * len(sit_list))
+
+    params = [
+        int(codemp),
+        *sit_list,
+    ]
+
+    where_data = ""
+    if usar_filtro_data:
+        where_data = (
+            "  AND CONVERT(DATE, COP.DATGER) >= ?\n"
+            "  AND CONVERT(DATE, COP.DATGER) <= ?\n"
+        )
+        params.append(data_ini_norm)
+        params.append(data_fim_norm)
+
+    where_extra = ""
+    if codori:
+        where_extra += " AND COP.CODORI = ? "
+        params.append(codori.strip())
+    if codcre:
+        where_extra += " AND OOP.CODCRE = ? "
+        params.append(codcre.strip())
+    if codopr:
+        where_extra += " AND OOP.CODOPR = ? "
+        params.append(codopr.strip())
+    if codpro:
+        where_extra += " AND COP.CODPRO LIKE ? "
+        params.append(f"%{codpro.strip()}%")
+
+    sql = f"""
+        SELECT TOP {limite_eff}
+            COP.CODEMP AS codemp,
+            COP.CODORI AS codori,
+            COP.NUMORP AS numorp,
+            COP.CODPRO AS codpro,
+            COALESCE(PRO.DESPRO, '') AS despro,
+            COP.SITORP AS sitorp,
+            COP.DATGER AS data_geracao_op,
+
+            OOP.CODETG AS codetg,
+            OOP.SEQROT AS seqrot,
+            OOP.CODOPR AS codopr,
+            COALESCE(OPR.DESOPR, '') AS desopr,
+
+            OOP.CODCRE AS codcre,
+            COALESCE(CRE.DESCRE, '') AS descre,
+            COALESCE(CRE.CODCCU, '') AS codccu,
+
+            COALESCE(OOP.QTDPRV, 0) AS qtd_prevista_operacao,
+            COALESCE(OOP.TMPPRP, 0) AS tempo_unitario_min,
+            COALESCE(OOP.TMPFIX, 0) AS tempo_fixo_min,
+            COALESCE(OOP.TMPTPR, 0) AS tempo_total_previsto_original,
+
+            CASE
+                WHEN COALESCE(OOP.TMPTPR, 0) > 0
+                    THEN COALESCE(OOP.TMPTPR, 0)
+                ELSE
+                    COALESCE(OOP.TMPFIX, 0)
+                    + (COALESCE(OOP.TMPPRP, 0) * COALESCE(NULLIF(OOP.QTDPRV, 0), 1))
+            END AS tempo_previsto_min,
+
+            OOP.DTPINI AS data_inicio_prevista_erp,
+            OOP.DTPFIM AS data_fim_prevista_erp
+
+        FROM E900COP COP
+
+        INNER JOIN E900OOP OOP
+            ON OOP.CODEMP = COP.CODEMP
+           AND OOP.CODORI = COP.CODORI
+           AND OOP.NUMORP = COP.NUMORP
+
+        LEFT JOIN E725CRE CRE
+            ON CRE.CODEMP = OOP.CODEMP
+           AND CRE.CODCRE = OOP.CODCRE
+
+        LEFT JOIN E720OPR OPR
+            ON OPR.CODEMP = OOP.CODEMP
+           AND OPR.CODOPR = OOP.CODOPR
+
+        LEFT JOIN E075PRO PRO
+            ON PRO.CODEMP = COP.CODEMP
+           AND PRO.CODPRO = COP.CODPRO
+
+        WHERE COP.CODEMP = ?
+          AND COP.SITORP IN ({placeholders_sit})
+          AND COALESCE(COP.CODORI, '') <> '100'
+        {where_data}
+          {where_extra}
+
+        ORDER BY
+            COP.DATGER DESC,
+            COP.CODORI,
+            COP.NUMORP,
+            OOP.SEQROT
+    """
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+        dados = _erp_rows_to_dict(cursor, rows)
+
+        saida = []
+        for item in dados:
+            codemp_item = int(item.get("codemp") or codemp)
+            codori_item = _erp_trim(item.get("codori"))
+            numorp_item = int(item.get("numorp") or 0)
+            codcre_item = _erp_trim(item.get("codcre"))
+            descre_item = _erp_trim(item.get("descre"))
+            codccu_item = _erp_trim(item.get("codccu"))
+
+            tempo_previsto_min = _erp_float(item.get("tempo_previsto_min"))
+
+            unidade = _erp_classificar_unidade(codori_item, codccu_item)
+            tipo_recurso = _erp_tipo_recurso_padrao(codcre_item, descre_item)
+
+            considera_carga = True
+            if tipo_recurso in ("MANUTENCAO", "LOGISTICA"):
+                considera_carga = False
+
+            codetg_item = int(item.get("codetg") or 0)
+            seqrot_item = int(item.get("seqrot") or 0)
+            codopr_item = _erp_trim(item.get("codopr"))
+
+            saida.append({
+                "codemp": codemp_item,
+                "codori": codori_item,
+                "numorp": numorp_item,
+                "op_chave": f"{codori_item}-{numorp_item}",
+                # chave_upsert pronta pro Edge Function fazer ON CONFLICT
+                # direto, sem precisar montar a string no lado dele.
+                "chave_upsert": (
+                    f"{codemp_item}|{codori_item}|{numorp_item}"
+                    f"|{codetg_item}|{seqrot_item}|{codopr_item}|{codcre_item}"
+                ),
+
+                "codpro": _erp_trim(item.get("codpro")),
+                "despro": _erp_trim(item.get("despro")),
+                "sitorp": _erp_trim(item.get("sitorp")),
+                "data_geracao_op": item.get("data_geracao_op"),
+
+                "codetg": codetg_item,
+                "seqrot": seqrot_item,
+
+                "codopr": codopr_item,
+                "desopr": _erp_trim(item.get("desopr")),
+
+                "codcre": codcre_item,
+                "descre": descre_item,
+                "codccu": codccu_item,
+
+                "unidade_negocio": unidade,
+                "tipo_recurso": tipo_recurso,
+                "origem_mapeamento": "REGRA_API_ERP",
+                "considera_carga": considera_carga,
+
+                "qtd_prevista_operacao": _erp_float(item.get("qtd_prevista_operacao")),
+                "tempo_unitario_min": _erp_float(item.get("tempo_unitario_min")),
+                "tempo_fixo_min": _erp_float(item.get("tempo_fixo_min")),
+                "tempo_total_previsto_original": _erp_float(item.get("tempo_total_previsto_original")),
+                "tempo_previsto_min": tempo_previsto_min,
+                "tempo_previsto_horas": round(tempo_previsto_min / 60.0, 6),
+
+                "data_inicio_prevista_erp": item.get("data_inicio_prevista_erp"),
+                "data_fim_prevista_erp": item.get("data_fim_prevista_erp"),
+
+                # Campos esperados pelo Lovable na tabela bi_ops_fila —
+                # API nao tem a fonte (vem do Lovable Cloud) entao manda null.
+                "prioridade": 999,
+                "data_entrega": None,
+                "obra": None,
+                "cliente": None,
+            })
+
+        carga_total_min = sum(_erp_float(x.get("tempo_previsto_min")) for x in saida)
+        ops = set(x.get("op_chave") for x in saida if x.get("op_chave"))
+        recursos = set(x.get("codcre") for x in saida if x.get("codcre"))
+
+        return {
+            "fonte": "ERP_SENIOR",
+            "destino_sugerido": "bi_ops_fila",
+            "chave_upsert_sugerida": [
+                "codemp", "codori", "numorp",
+                "codetg", "seqrot", "codopr", "codcre",
+            ],
+            "filtros": {
+                "codemp": codemp,
+                # Devolve None quando o filtro de data nao foi aplicado —
+                # transparente para o Lovable identificar que veio a fila
+                # TODA das situacoes informadas.
+                "data_ini": data_ini_norm if usar_filtro_data else None,
+                "data_fim": data_fim_norm if usar_filtro_data else None,
+                "filtro_data_aplicado": usar_filtro_data,
+                "situacoes": situacoes,
+                "codori": codori,
+                "codcre": codcre,
+                "codopr": codopr,
+                "codpro": codpro,
+                "limite": limite_eff,
+            },
+            "resumo": {
+                "qtd_linhas": len(saida),
+                "qtd_ops": len(ops),
+                "qtd_recursos": len(recursos),
+                "carga_prevista_min": round(carga_total_min, 6),
+                "carga_prevista_horas": round(carga_total_min / 60.0, 6),
+            },
+            "dados": saida,
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao consultar fila ERP para programação: {str(e)}",
+        )
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ============================================================
+# BI - TAUX / DIMENSÕES AUXILIARES
+# ERP Senior SQL Server -> FastAPI -> Supabase
+# ============================================================
+
+class BiTauxSyncPayload(BaseModel):
+    tabelas: Optional[List[str]] = None
+    acionado_por: Optional[str] = "MANUAL"
+    limpar_antes: bool = False
+
+
+BI_TAUX_MAP = {
+    "TAUX_AGRUPAMENTO": {
+        "supabase": "bi_taux_agrupamento",
+        "conflict": ["cd_empresa", "cd_agrupamento"],
+        "search": ["cd_agrupamento", "ds_agrupamento"],
+        "sql": """
+            SELECT
+                CAST(CODEMP AS VARCHAR(50)) AS cd_empresa,
+                RTRIM(CAST(CODEMP AS VARCHAR(50))) + '-' + RTRIM(CODAGP) AS cd_agrupamento,
+                SUBSTRING(CODAGP, 1, 3) + '00' AS cd_agrupamento_nv1,
+                DESAGP AS ds_agrupamento,
+                'A' AS cd_situacao
+            FROM E013AGP
+        """,
+    },
+
+    "TAUX_CLIENTE": {
+        "supabase": "bi_taux_cliente",
+        "conflict": ["cd_cliente", "cd_filial"],
+        "search": ["cd_cliente", "nm_cliente", "cd_cnpj_cpf", "ds_cidade"],
+        "sql": """
+            SELECT
+                CAST(CLI.CODCLI AS VARCHAR(50)) AS cd_cliente,
+                UPPER(SUBSTRING(CLI.NOMCLI, 1, 30)) AS nm_cliente,
+                UPPER(CLI.SIGUFS) AS cd_estado,
+                UPPER(CLI.CIDCLI) AS ds_cidade,
+                CAST(CEP.CODIBG AS VARCHAR(50)) AS cd_ibge,
+                UPPER(CLI.ENDCLI) AS ds_endereco,
+                LTRIM(RTRIM(CLI.FONCLI)) AS ds_telefone1,
+                LTRIM(RTRIM(CLI.FONCL2)) AS ds_telefone2,
+                LTRIM(RTRIM(CLI.INTNET)) AS id_email,
+                CAST(HCL.CODRVE AS VARCHAR(50)) AS cd_regfrete,
+                CAST(ISNULL(HRP1.CODREP, 999999) AS VARCHAR(50)) AS cd_representante,
+                '1-' + ISNULL(HRP1.CODRVE, 'XXX') AS cd_regiaorep,
+                CAST(CLI.CODGRE AS VARCHAR(50)) AS cd_grupo_cliente,
+                CLI.CGCCPF AS cd_cnpj_cpf,
+                LTRIM(RTRIM(CAST(CODFOR AS VARCHAR(50)))) AS cd_fornecedor,
+                LTRIM(RTRIM(CAST(CLIREP AS VARCHAR(50)))) AS cd_representante_1,
+                LTRIM(RTRIM(CAST(CLITRA AS VARCHAR(50)))) AS cd_transportador,
+                LTRIM(RTRIM(CAST(CLI.CODRAM AS VARCHAR(50)))) AS cd_ramo,
+                CLI.SITCLI AS cd_situacao,
+                CAST(CAST(CLI.DATCAD AS DATE) AS DATETIME) AS dt_cadastro,
+                CAST(VLRLIM AS FLOAT) AS vl_limite_credito,
+                LTRIM(RTRIM(CONCAT(CLI.CODCLI, HCL.CODFIL))) AS cd_emp_fil,
+                CONCAT(HCL.CODEMP, '-', HCL.CODFIL) AS cd_filial,
+                CASE
+                    WHEN CLIREP <> '0' THEN 'N'
+                    WHEN CLITRA <> '0' THEN 'N'
+                    WHEN CODFOR <> '0' THEN 'N'
+                    ELSE 'S'
+                END AS flag_cliente_final
+            FROM E085CLI CLI
+            LEFT JOIN E008CEP CEP
+                ON CEP.CEPINI = CLI.CEPINI
+            LEFT JOIN E085HCL HCL
+                ON CLI.CODCLI = HCL.CODCLI
+               AND HCL.CODEMP = 1
+            LEFT JOIN E090REP REP1
+                ON ISNULL(HCL.CODREP, 999999) = REP1.CODREP
+            LEFT JOIN E090HRP HRP1
+                ON HRP1.CODEMP = 1
+               AND HRP1.CODREP = REP1.CODREP
+        """,
+    },
+
+    "TAUX_EMPRESA": {
+        "supabase": "bi_taux_empresa",
+        "conflict": ["cd_empresa"],
+        "search": ["cd_empresa", "ds_empresa"],
+        "sql": """
+            SELECT
+                CAST(CODEMP AS VARCHAR(50)) AS cd_empresa,
+                NOMEMP AS ds_empresa,
+                'A' AS cd_situacao
+            FROM E070EMP
+        """,
+    },
+
+    "TAUX_FAMILIA_PRODUTO": {
+        "supabase": "bi_taux_familia_produto",
+        "conflict": ["cd_empresa", "cd_familia"],
+        "search": ["cd_familia", "ds_familia"],
+        "sql": """
+            SELECT
+                CAST(CODEMP AS VARCHAR(50)) AS cd_empresa,
+                CONCAT(CODEMP, '-', CODFAM) AS cd_familia,
+                DESFAM AS ds_familia,
+                TIPPRO AS cd_tp_prod,
+                CONCAT(CODEMP, '-', CODORI) AS cd_origem,
+                'A' AS cd_situacao
+            FROM E012FAM
+        """,
+    },
+
+    "TAUX_FILIAL": {
+        "supabase": "bi_taux_filial",
+        "conflict": ["cd_empresa", "cd_filial"],
+        "search": ["cd_filial", "ds_filial"],
+        "sql": """
+            SELECT
+                CAST(CODEMP AS VARCHAR(50)) AS cd_empresa,
+                CONCAT(CAST(CODEMP AS VARCHAR(50)), '-', CAST(CODFIL AS VARCHAR(50))) AS cd_filial,
+                CAST(SIGFIL AS VARCHAR(500)) AS ds_filial,
+                'A' AS cd_situacao
+            FROM E070FIL
+        """,
+    },
+
+    "TAUX_FORNECEDOR": {
+        "supabase": "bi_taux_fornecedor",
+        "conflict": ["cd_fornecedor"],
+        "search": ["cd_fornecedor", "ds_fornecedor", "cd_cnpj_cpf"],
+        "sql": """
+            SELECT
+                CAST(CODFOR AS VARCHAR(50)) AS cd_fornecedor,
+                NOMFOR AS ds_fornecedor,
+                CGCCPF AS cd_cnpj_cpf,
+                'A' AS cd_situacao
+            FROM E095FOR
+        """,
+    },
+
+    "TAUX_ORIGEM": {
+        "supabase": "bi_taux_origem",
+        "conflict": ["cd_empresa", "cd_origem"],
+        "search": ["cd_origem", "ds_origem"],
+        "sql": """
+            SELECT
+                CAST(CODEMP AS VARCHAR(50)) AS cd_empresa,
+                LTRIM(RTRIM(CAST(CODEMP AS VARCHAR(50)))) + '-' + LTRIM(RTRIM(CODORI)) AS cd_origem,
+                DESORI AS ds_origem,
+                'A' AS cd_situacao
+            FROM E083ORI
+        """,
+    },
+
+    "TAUX_PRODUTO": {
+        "supabase": "bi_taux_produto",
+        "conflict": ["cd_empresa", "cd_produto"],
+        "search": ["cd_produto", "ds_produto", "ds_r_produto"],
+        "sql": """
+            SELECT
+                CAST(PROD.CODEMP AS VARCHAR(50)) AS cd_empresa,
+                CONCAT(PROD.CODEMP, '-', PROD.CODPRO) AS cd_produto,
+                PROD.DESNFV AS ds_produto,
+                LTRIM(RTRIM(PROD.DESNFV)) AS ds_r_produto,
+                CONCAT(PROD.CODEMP, '-', PROD.CODORI) AS cd_origem,
+                CONCAT(V2.CODEMP, '-', COALESCE(V2.CODAGT, PROD.CODAGC)) AS cd_familia,
+                LTRIM(RTRIM(PROD.INDFPR)) AS cd_fabricante,
+                ISNULL(LTRIM(RTRIM(PROD.CODMAR)), '1') AS cd_marca,
+                LTRIM(RTRIM(PROD.SITPRO)) AS cd_situacao,
+                CAST(0 AS FLOAT) AS vl_custo,
+                CAST(0 AS FLOAT) AS vl_preco_venda,
+                CAST(0 AS FLOAT) AS vl_markup,
+                CAST(0 AS FLOAT) AS vl_peso_bruto,
+                CAST(0 AS FLOAT) AS vl_peso_liquido,
+                CONCAT(PROD.CODEMP, '-', LTRIM(RTRIM(PROD.CLAPRO))) AS cd_classe,
+                'PRODUTO' AS cd_tp_produto,
+                CONCAT(PROD.CODEMP, '-', PROD.CODPRO, '-', PROD.DESNFV) AS ds_produto_2
+            FROM E075PRO PROD
+            LEFT JOIN E075DER V2
+                ON PROD.CODEMP = V2.CODEMP
+               AND PROD.CODPRO = V2.CODPRO
+               AND PROD.CODMDP = V2.CODDER
+
+            UNION ALL
+
+            SELECT
+                CAST(SERV.CODEMP AS VARCHAR(50)) AS cd_empresa,
+                CONCAT(SERV.CODEMP, '-', SERV.CODSER) AS cd_produto,
+                LTRIM(RTRIM(SERV.DESSER)) AS ds_produto,
+                LTRIM(RTRIM(SERV.DESNFV)) AS ds_r_produto,
+                'SEM ORIGEM' AS cd_origem,
+                CONCAT(SERV.CODEMP, '-', SERV.CODFAM) AS cd_familia,
+                'SEM FABRICANTE' AS cd_fabricante,
+                'SEM MARCA' AS cd_marca,
+                LTRIM(RTRIM(SERV.SITSER)) AS cd_situacao,
+                CAST(0 AS FLOAT) AS vl_custo,
+                CAST(0 AS FLOAT) AS vl_preco_venda,
+                CAST(0 AS FLOAT) AS vl_markup,
+                CAST(0 AS FLOAT) AS vl_peso_bruto,
+                CAST(0 AS FLOAT) AS vl_peso_liquido,
+                'SEM CLASSE' AS cd_classe,
+                'SERVICO' AS cd_tp_produto,
+                CONCAT(SERV.CODEMP, '-', SERV.CODSER, '-', LTRIM(RTRIM(SERV.DESSER))) AS ds_produto_2
+            FROM E080SER SERV
+        """,
+    },
+
+    "TAUX_PRODUTO_DERIVACAO": {
+        "supabase": "bi_taux_produto_derivacao",
+        "conflict": ["cd_empresa", "cd_produto_derivacao"],
+        "search": ["cd_produto_derivacao", "cd_produto", "ds_derivacao"],
+        "sql": """
+            SELECT
+                CAST(PROD.CODEMP AS VARCHAR(50)) AS cd_empresa,
+                CONCAT(CONCAT(PROD.CODEMP, '-', PROD.CODPRO), COALESCE(DER.CODDER, '')) AS cd_produto_derivacao,
+                DER.CODDER AS cd_derivacao,
+                DER.DESDER AS ds_derivacao,
+                CONCAT(PROD.CODEMP, '-', PROD.CODAGC) AS cd_familia,
+                CAST(DER.PREMED AS FLOAT) AS vl_custo_medio,
+                CAST(DER.PRECUS AS FLOAT) AS vl_custo,
+                CAST(DER.PREREP AS FLOAT) AS vl_preco_reposicao,
+                CAST(DER.PREUEN AS FLOAT) AS vl_preco_ult_entrada,
+                PROD.CODPRO AS cd_produto,
+                'A' AS cd_situacao
+            FROM E075PRO PROD
+            LEFT JOIN E075DER DER
+                ON PROD.CODEMP = DER.CODEMP
+               AND PROD.CODPRO = DER.CODPRO
+        """,
+    },
+
+    "TAUX_REPRESENTANTE": {
+        "supabase": "bi_taux_representante",
+        "conflict": ["cd_empresa", "cd_representante"],
+        "search": ["cd_representante", "ds_representante"],
+        "sql": """
+            SELECT
+                CAST(HRP.CODEMP AS VARCHAR(50)) AS cd_empresa,
+                CAST(REP.CODREP AS VARCHAR(50)) AS cd_representante,
+                UPPER(ISNULL(LTRIM(RTRIM(REP.APEREP)), LTRIM(RTRIM(REP.NOMREP)))) AS ds_representante,
+                LTRIM(RTRIM(CAST(HRP.REPSUP AS VARCHAR(50)))) AS cd_regiao_rep,
+                LTRIM(RTRIM(REP.CGCCPF)) AS cd_cnpj_cpf,
+                LTRIM(RTRIM(REP.TIPREP)) AS cd_tp_representante,
+                LTRIM(RTRIM(REP.SITREP)) AS cd_situacao,
+                LTRIM(RTRIM(CAST(HRP2.REPSUP AS VARCHAR(50)))) AS cd_supervisor
+            FROM E090REP REP
+            LEFT JOIN E090HRP HRP
+                ON HRP.CODEMP = 1
+               AND HRP.CODREP = REP.CODREP
+            LEFT JOIN E090HRP HRP2
+                ON HRP2.CODEMP = 1
+               AND HRP2.CODREP = HRP.REPSUP
+
+            UNION ALL
+
+            SELECT
+                '1' AS cd_empresa,
+                '0' AS cd_representante,
+                'SEM CADASTRO' AS ds_representante,
+                'SEM CADASTRO' AS cd_regiao_rep,
+                'SEM CADASTRO' AS cd_cnpj_cpf,
+                'SEM CADASTRO' AS cd_tp_representante,
+                'SEM CADASTRO' AS cd_situacao,
+                'SEM CADASTRO' AS cd_supervisor
+        """,
+    },
+
+    "TAUX_CENTRO_CUSTOS_3": {
+        "supabase": "bi_taux_centro_custos_3",
+        "conflict": ["cd_centro_custos_3"],
+        "search": ["cd_centro_custos_3", "ds_centro_custos_3"],
+        "sql": """
+            SELECT DISTINCT
+                SUBSTRING(V1.CLACCU, 1, 3) AS cd_centro_custos_3,
+                V2.ABRCCU AS ds_centro_custos_3,
+                SUBSTRING(V1.CLACCU, 1, 1) AS cd_centro_custos_1,
+                SUBSTRING(V1.CLACCU, 1, 2) AS cd_centro_custos_2,
+                'A' AS cd_situacao
+            FROM E044CCU V1
+            INNER JOIN E044CCU V2
+                ON SUBSTRING(V1.CLACCU, 1, 3) = V2.CLACCU
+               AND LEN(V2.CLACCU) = 3
+        """,
+    },
+
+    "TAUX_PLANO_CONTAS": {
+        "supabase": "bi_taux_plano_contas",
+        "conflict": ["cd_empresa", "cd_mascara", "cd_conta_contabil"],
+        "search": ["cd_mascara", "ds_mascara", "cd_conta_contabil"],
+        "sql": """
+            SELECT
+                CAST(CODEMP AS VARCHAR(50)) AS cd_empresa,
+                CLACTA AS cd_mascara,
+                ABRCTA AS ds_mascara,
+                SUBSTRING(CLACTA, 1, 5) AS cd_mascara_1,
+                SUBSTRING(CLACTA, 1, 3) AS cd_mascara_2,
+                SUBSTRING(CLACTA, 1, 2) AS cd_mascara_3,
+                SUBSTRING(CLACTA, 1, 1) AS cd_mascara_4,
+                CAST(CTARED AS VARCHAR(50)) AS cd_conta_contabil,
+                DESCTA AS ds_mascara_1
+            FROM E045PLA
+            WHERE CODEMP = 1
+        """,
+    },
+
+    "TAUX_CENTRO_CUSTOS": {
+        "supabase": "bi_taux_centro_custos",
+        "conflict": ["cd_centro_custos"],
+        "search": ["cd_centro_custos", "ds_centro_custos"],
+        "sql": """
+            SELECT DISTINCT
+                V1.CLACCU AS cd_centro_custos,
+                '(' + CAST(V1.CODCCU AS VARCHAR(50)) + ') - ' + V1.ABRCCU AS ds_centro_custos,
+                SUBSTRING(V1.CLACCU, 1, 1) AS cd_centro_custos_1,
+                SUBSTRING(V1.CLACCU, 1, 2) AS cd_centro_custos_2,
+                SUBSTRING(V1.CLACCU, 1, 3) AS cd_centro_custos_3,
+                LEN(V1.CLACCU) AS flag_nivel,
+                'A' AS cd_situacao
+            FROM E044CCU V1
+            WHERE V1.CLACCU LIKE '5%'
+        """,
+    },
+
+    "TAUX_LOCAL_SN": {
+        "supabase": "bi_taux_local_sn",
+        "conflict": ["cd_local"],
+        "search": ["cd_local", "ds_local"],
+        "sql": """
+            WITH LOCAL_ATUAL AS (
+                SELECT V1.*
+                FROM R016HIE V1
+                INNER JOIN (
+                    SELECT
+                        CONCAT(CODLOC, MAX(DATINI)) AS ULT_COD
+                    FROM R016HIE
+                    GROUP BY CODLOC
+                ) V2
+                    ON CONCAT(V1.CODLOC, V1.DATINI) = V2.ULT_COD
+            )
+            SELECT DISTINCT
+                CAST(R016ORN.NUMLOC AS VARCHAR(50)) AS cd_local,
+                R016ORN.NOMLOC AS ds_local,
+                SUBSTRING(R016HIE.CODLOC, 1, 11) AS cd_msc_local_nv1,
+                CAST(NV1.NUMLOC AS VARCHAR(50)) AS cd_local_nv1,
+                SUBSTRING(R016HIE.CODLOC, 1, 9) AS cd_msc_local_nv2,
+                CAST(NV2.NUMLOC AS VARCHAR(50)) AS cd_local_nv2,
+                SUBSTRING(R016HIE.CODLOC, 1, 7) AS cd_msc_local_nv3,
+                CAST(NV3.NUMLOC AS VARCHAR(50)) AS cd_local_nv3,
+                SUBSTRING(R016HIE.CODLOC, 1, 3) AS cd_msc_local_nv4,
+                CAST(NV4.NUMLOC AS VARCHAR(50)) AS cd_local_nv4
+            FROM R016ORN
+            LEFT JOIN LOCAL_ATUAL R016HIE
+                ON R016ORN.NUMLOC = R016HIE.NUMLOC
+            LEFT JOIN LOCAL_ATUAL NV1
+                ON SUBSTRING(R016HIE.CODLOC, 1, 11) = NV1.CODLOC
+            LEFT JOIN LOCAL_ATUAL NV2
+                ON SUBSTRING(R016HIE.CODLOC, 1, 9) = NV2.CODLOC
+            LEFT JOIN LOCAL_ATUAL NV3
+                ON SUBSTRING(R016HIE.CODLOC, 1, 7) = NV3.CODLOC
+            LEFT JOIN LOCAL_ATUAL NV4
+                ON SUBSTRING(R016HIE.CODLOC, 1, 3) = NV4.CODLOC
+        """,
+    },
+
+    "TAUX_ORIGEM_LCTO": {
+        "supabase": "bi_taux_origem_lcto",
+        "conflict": ["cd_origem_lcto"],
+        "search": ["cd_origem_lcto", "ds_origem_lcto"],
+        "sql": """
+            SELECT
+                KEYNAM AS cd_origem_lcto,
+                CASE
+                    WHEN KEYNAM = 'VRB' THEN 'Folha de Pagamento'
+                    WHEN KEYNAM = 'CPR' THEN 'Compras'
+                    WHEN KEYNAM = 'REC' THEN 'Contas a Receber'
+                    WHEN KEYNAM = 'TES' THEN 'Tesouraria'
+                    WHEN KEYNAM = 'PAG' THEN 'Contas a Pagar'
+                    WHEN KEYNAM = 'EST' THEN 'Estoque'
+                    WHEN KEYNAM = 'MAN' THEN 'Manual'
+                    WHEN KEYNAM = 'IMP' THEN 'Impostos'
+                    WHEN KEYNAM = 'VEN' THEN 'Vendas'
+                    WHEN KEYNAM = 'PAT' THEN 'Patrimônio'
+                    ELSE VALKEY
+                END AS ds_origem_lcto
+            FROM R996LSF
+            WHERE LSTNAM = 'LOriLct'
+        """,
+    },
+
+    "TAUX_USUARIO": {
+        "supabase": "bi_taux_usuario",
+        "conflict": ["cd_usuario"],
+        "search": ["cd_usuario", "ds_usuario"],
+        "sql": """
+            SELECT
+                CONVERT(VARCHAR, CODEMP) + '-' + CONVERT(VARCHAR, CODUSU) AS cd_usuario,
+                CONVERT(VARCHAR, NOMUSU) AS ds_usuario
+            FROM E099USU
+
+            UNION ALL
+
+            SELECT
+                '0' AS cd_usuario,
+                'Sem usuário' AS ds_usuario
+        """,
+    },
+
+    "TAUX_PROD": {
+        "supabase": "bi_taux_prod",
+        "conflict": ["cd_empresa", "codpro"],
+        "search": ["codpro", "despro"],
+        "sql": """
+            SELECT
+                CAST(CODEMP AS VARCHAR(50)) AS cd_empresa,
+                CODPRO AS codpro,
+                DESPRO AS despro
+            FROM E075PRO
+        """,
+    },
+}
+
+
+def _bi_json_value(valor):
+    if valor is None:
+        return None
+    if isinstance(valor, Decimal):
+        return float(valor)
+    if isinstance(valor, (datetime, date)):
+        return valor.isoformat()
+    if isinstance(valor, str):
+        return valor.strip()
+    return valor
+
+
+def _bi_sqlserver_rows(sql: str) -> List[dict]:
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        cols = [c[0].lower() for c in cursor.description]
+        rows = []
+        for row in cursor.fetchall():
+            rows.append({
+                cols[i]: _bi_json_value(row[i])
+                for i in range(len(cols))
+            })
+        return rows
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _chunks(lista: list, tamanho: int = 500):
+    for i in range(0, len(lista), tamanho):
+        yield lista[i:i + tamanho]
+
+
+@app.post("/api/bi/taux/sync")
+def sincronizar_bi_taux(
+    payload: BiTauxSyncPayload = Body(default_factory=BiTauxSyncPayload),
+    usuario=Depends(validar_token_ou_cron_secret),
+):
+    tabelas = payload.tabelas or list(BI_TAUX_MAP.keys())
+    resultado = []
+
+    for nome in tabelas:
+        nome_norm = str(nome or "").strip().upper()
+        if not nome_norm.startswith("TAUX_"):
+            nome_norm = "TAUX_" + nome_norm
+
+        if nome_norm not in BI_TAUX_MAP:
+            resultado.append({
+                "tabela": nome_norm,
+                "status": "IGNORADA",
+                "erro": "Tabela não mapeada na API.",
+            })
+            continue
+
+        cfg = BI_TAUX_MAP[nome_norm]
+        sb_table = cfg["supabase"]
+        log_id = None
+
+        # Log é BEST-EFFORT: não pode derrubar o sync. Tenta com tabela_supabase;
+        # se a coluna não existir na bi_taux_sync_log (42703), tenta sem ela.
+        _log_base = {
+            "nome_tabela": nome_norm,
+            "tabela_supabase": sb_table,
+            "status": "INICIADO",
+            "acionado_por": str(payload.acionado_por or usuario or "MANUAL"),
+        }
+        for _attempt in (_log_base, {k: v for k, v in _log_base.items() if k != "tabela_supabase"}):
+            try:
+                log = _sb_post("bi_taux_sync_log", _attempt)
+                if isinstance(log, list) and log:
+                    log_id = log[0].get("id")
+                break
+            except Exception as _log_exc:
+                print(f"[TAUX] log inicial {nome_norm}: {str(_log_exc)[:160]}")
+
+        try:
+            rows = _bi_sqlserver_rows(cfg["sql"])
+            now_iso = datetime.utcnow().isoformat() + "Z"
+
+            for r in rows:
+                r["sincronizado_em"] = now_iso
+
+            if payload.limpar_antes:
+                _sb_delete(sb_table, {"id": "not.is.null"})
+
+            inseridas = 0
+            for bloco in _chunks(rows, 500):
+                inseridas += _supabase_upsert(
+                    sb_table,
+                    bloco,
+                    cfg["conflict"],
+                )
+
+            if log_id:
+                _sb_patch(
+                    "bi_taux_sync_log",
+                    {"id": f"eq.{log_id}"},
+                    {
+                        "status": "CONCLUIDO",
+                        "qtd_linhas": inseridas,
+                        "finalizado_em": datetime.utcnow().isoformat() + "Z",
+                    },
+                )
+
+            resultado.append({
+                "taux": nome_norm,
+                "tabela_supabase": sb_table,
+                "status": "CONCLUIDO",
+                "qtd_linhas": inseridas,
+            })
+
+        except Exception as exc:
+            erro = str(exc)
+            if log_id:
+                try:
+                    _sb_patch(
+                        "bi_taux_sync_log",
+                        {"id": f"eq.{log_id}"},
+                        {
+                            "status": "ERRO",
+                            "erro": erro[:4000],
+                            "finalizado_em": datetime.utcnow().isoformat() + "Z",
+                        },
+                    )
+                except Exception:
+                    pass
+
+            resultado.append({
+                "taux": nome_norm,
+                "tabela_supabase": sb_table,
+                "status": "ERRO",
+                "erro": erro,
+            })
+
+    return {
+        "status": "FINALIZADO",
+        "acionado_por": usuario,
+        "resultado": resultado,
+    }
+
+
+@app.get("/api/bi/taux/status")
+def status_bi_taux(usuario=Depends(validar_token)):
+    dados = []
+
+    for nome, cfg in BI_TAUX_MAP.items():
+        tabela = cfg["supabase"]
+        try:
+            rows, total = _bi_supabase_get(
+                tabela,
+                params={"select": "id,sincronizado_em"},
+                limit=1,
+                order="sincronizado_em.desc",
+            )
+
+            ultima_sync = rows[0].get("sincronizado_em") if rows else None
+
+            dados.append({
+                "taux": nome,
+                "tabela_supabase": tabela,
+                "total_registros": total,
+                "ultima_sincronizacao": ultima_sync,
+                "status": "OK",
+            })
+
+        except Exception as exc:
+            dados.append({
+                "taux": nome,
+                "tabela_supabase": tabela,
+                "total_registros": 0,
+                "ultima_sincronizacao": None,
+                "status": "ERRO",
+                "erro": str(exc),
+            })
+
+    return {"dados": dados}
+
+
+@app.get("/api/bi/taux/log")
+def log_bi_taux(
+    limit: int = 100,
+    usuario=Depends(validar_token),
+):
+    limit = max(1, min(int(limit or 100), 500))
+
+    rows, total = _bi_supabase_get(
+        "bi_taux_sync_log",
+        params={"select": "*"},
+        limit=limit,
+        order="iniciado_em.desc",
+    )
+
+    return {
+        "total_registros": total,
+        "dados": rows,
+    }
+
+
+@app.get("/api/bi/taux/{nome_taux}")
+def listar_bi_taux(
+    nome_taux: str,
+    q: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    usuario=Depends(validar_token),
+):
+    nome_norm = str(nome_taux or "").strip().upper()
+
+    if not nome_norm.startswith("TAUX_"):
+        nome_norm = "TAUX_" + nome_norm
+
+    if nome_norm not in BI_TAUX_MAP:
+        raise HTTPException(status_code=404, detail="TAUX não mapeada.")
+
+    cfg = BI_TAUX_MAP[nome_norm]
+    tabela = cfg["supabase"]
+
+    limit = max(1, min(int(limit or 100), 500))
+    offset = max(0, int(offset or 0))
+
+    params = {"select": "*"}
+
+    if q:
+        termo = str(q).strip()
+        if termo:
+            partes = []
+            for col in cfg.get("search", []):
+                partes.append(f"{col}.ilike.*{termo}*")
+            if partes:
+                params["or"] = "(" + ",".join(partes) + ")"
+
+    rows, total = _bi_supabase_get(
+        tabela,
+        params=params,
+        limit=limit,
+        offset=offset,
+    )
+
+    return {
+        "taux": nome_norm,
+        "tabela_supabase": tabela,
+        "total_registros": total,
+        "limit": limit,
+        "offset": offset,
+        "dados": rows,
     }
 
 
