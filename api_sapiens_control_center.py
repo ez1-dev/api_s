@@ -68,6 +68,7 @@ _ONPREM_DB_DEFAULTS = {
     "port":     "1433",
     "database": "sapiens",
     "user":     "sapiens",
+    "password": "0n%lV'g0F94",
     "trust":    "yes",
 }
 _CLOUD_DB_DEFAULTS = {
@@ -76,6 +77,7 @@ _CLOUD_DB_DEFAULTS = {
     "port":     "1433",
     "database": "",
     "user":     "",
+    "password": "0n%lV'g0F94",
     "trust":    "yes",
 }
 EMPRESA_PADRAO = 1
