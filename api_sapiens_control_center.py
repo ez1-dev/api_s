@@ -16480,6 +16480,9 @@ def _consultar_dados_impressao_op(
         quebrar_op_flag = str(quebrar_por_operacao or "N").upper().strip() == "S"
         imprimir_obs_flag = str(imprimir_observacoes or "N").upper().strip() == "S"
 
+
+
+        
         # Layout dos componentes: se houver mais de LIMITE itens, o Lovable
         # deve renderizar a Relacao de Componentes Necessarios em pagina
         # separada (com cabecalho da OP repetido). API so devolve a flag —
@@ -16510,6 +16513,7 @@ def _consultar_dados_impressao_op(
                 "limite_componentes_primeira_pagina": LIMITE_COMPONENTES_PRIMEIRA_PAGINA,
                 "quebrar_componentes_em_pagina_separada": quebrar_componentes_flag,
                 "posicao_componentes_quando_quebrar": "APOS_OPERACOES",
+                "desenhos_por_quebra_componentes": quebrar_componentes_flag,
             },
             "layout_observacoes": {
                 "total_observacoes": total_observacoes,
