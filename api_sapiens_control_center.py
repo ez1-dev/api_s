@@ -14588,21 +14588,23 @@ def tempo_para_minutos(valor):
 
     Regra atual (alinhada ao MCAP700 / planilha de operacao):
     - tmp_unit do banco vem em minutos. Nao multiplicar por 60.
-    - Exemplos: 5 -> 5 min, 90 -> 90 min, 0.5 -> 1 min (arredonda).
+    - Exemplos: 5 -> 5 min, 90 -> 90 min, 0.67 -> 0.67 min (com decimais).
 
-    Devolve int (minutos arredondados para o mais proximo).
+    Devolve Decimal com 2 casas decimais para manter precisao.
     """
     minutos = numero_para_decimal(valor)
-    return int(minutos.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    return minutos.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 def formatar_minutos(minutos):
-    """Formata minutos como string. Ex: 60 -> "60 min", 0 -> "0 min"."""
+    """Formata minutos como string. Ex: 60 -> "60 min", 0.67 -> "0.67 min"."""
     try:
-        minutos_int = int(minutos or 0)
+        valor = Decimal(str(minutos or 0))
+        # Remove trailing zeros e ponto desnecessario
+        valor_str = str(valor.quantize(Decimal("0.01")).normalize())
     except Exception:
-        minutos_int = 0
-    return f"{minutos_int} min"
+        valor_str = "0"
+    return f"{valor_str} min"
 
 
 def calcular_tempos_operacao_em_minutos(tmp_unit, quantidade_op):
@@ -14614,17 +14616,16 @@ def calcular_tempos_operacao_em_minutos(tmp_unit, quantidade_op):
     tmp_unit_min = tempo_para_minutos(tmp_unit)
     quantidade = numero_para_decimal(quantidade_op)
 
-    tmp_total_decimal = (Decimal(tmp_unit_min) * quantidade).quantize(
-        Decimal("1"),
+    tmp_total_decimal = (tmp_unit_min * quantidade).quantize(
+        Decimal("0.01"),
         rounding=ROUND_HALF_UP,
     )
-    tmp_total_min = int(tmp_total_decimal)
 
     return {
         "tmp_unit_min": tmp_unit_min,
-        "tmp_total_min": tmp_total_min,
+        "tmp_total_min": tmp_total_decimal,
         "tmp_unit_formatado": formatar_minutos(tmp_unit_min),
-        "tmp_total_formatado": formatar_minutos(tmp_total_min),
+        "tmp_total_formatado": formatar_minutos(tmp_total_decimal),
     }
 
 
