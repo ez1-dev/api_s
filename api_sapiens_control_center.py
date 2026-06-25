@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Body, Query, Request, Header
+from fastapi import FastAPI, HTTPException, Depends, Body, Query, Request, Header, BackgroundTasks
 from fastapi.responses import HTMLResponse, StreamingResponse, Response, FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,6 +20,11 @@ import json
 import re
 import unicodedata
 import mimetypes
+import hashlib
+import threading
+import traceback
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import quote
 
@@ -267,6 +272,10 @@ async def log_requisicoes_middleware(request, call_next):
     inicio = _time_mod.perf_counter()
     method = request.method
     query = str(request.url.query or "")
+    # Downloads autenticados por query string (?access_token=...) nunca
+    # podem vazar o token no log — mascara antes de qualquer truncamento.
+    if "access_token=" in query:
+        query = re.sub(r"access_token=[^&]+", "access_token=***", query)
     if len(query) > 200:
         query = query[:197] + "..."
     cliente = request.client.host if request.client else ""
@@ -12049,6 +12058,20 @@ class ConsultaNumeroSeriePayload(BaseModel):
     limite: int = 30
 
 
+class OPComplementarManterGSPayload(BaseModel):
+    codigo_empresa: int = EMPRESA_PADRAO
+    numero_op_nova: int
+    origem_op_nova: Optional[str] = "250"
+    numero_op_origem: Optional[int] = None
+    origem_op_origem: Optional[str] = None
+    numero_serie: Optional[str] = None
+    confirmar: bool = False
+    justificativa: str
+    forcar_vinculo: bool = False
+    manutencao: bool = False
+    tipo_vinculo: Optional[str] = "NORMAL"
+    permitir_mesmo_gs_outro_produto: bool = False
+
 
 def _cursor_rows_to_dict(cursor, rows):
     columns = [col[0] for col in cursor.description]
@@ -12104,6 +12127,27 @@ def _garantir_tabela_vinculo_op(cursor):
             CREATE INDEX IX_USU_TNSOP_PEDIDO ON dbo.USU_TNSOP (USU_CODEMP, USU_NUMPED, USU_SEQIPD);
             CREATE INDEX IX_USU_TNSOP_NUMSEP ON dbo.USU_TNSOP (USU_CODEMP, USU_CODPRO, USU_CODDER, USU_NUMSEP);
         END
+        """
+    )
+
+    # Campos de manutenção/reaproveitamento (ALTER idempotente — cobre a tabela
+    # que já existia sem eles) + índice por GS/situação.
+    cursor.execute(
+        """
+        IF COL_LENGTH('dbo.USU_TNSOP', 'USU_TIPVIN') IS NULL
+            ALTER TABLE dbo.USU_TNSOP ADD USU_TIPVIN VARCHAR(20) NULL;
+        IF COL_LENGTH('dbo.USU_TNSOP', 'USU_MANUT') IS NULL
+            ALTER TABLE dbo.USU_TNSOP ADD USU_MANUT VARCHAR(1) NULL;
+        IF COL_LENGTH('dbo.USU_TNSOP', 'USU_JUSVIN') IS NULL
+            ALTER TABLE dbo.USU_TNSOP ADD USU_JUSVIN VARCHAR(500) NULL;
+        IF COL_LENGTH('dbo.USU_TNSOP', 'USU_CODPROORI') IS NULL
+            ALTER TABLE dbo.USU_TNSOP ADD USU_CODPROORI VARCHAR(14) NULL;
+        IF COL_LENGTH('dbo.USU_TNSOP', 'USU_CODDERORI') IS NULL
+            ALTER TABLE dbo.USU_TNSOP ADD USU_CODDERORI VARCHAR(7) NULL;
+        IF NOT EXISTS (SELECT 1 FROM sys.indexes
+                       WHERE name = 'IX_USU_TNSOP_GS'
+                         AND object_id = OBJECT_ID('dbo.USU_TNSOP'))
+            CREATE INDEX IX_USU_TNSOP_GS ON dbo.USU_TNSOP (USU_CODEMP, USU_NUMSEP, USU_SITREG);
         """
     )
 
@@ -12380,6 +12424,509 @@ def _buscar_contexto_numero_serie(cursor, codigo_empresa: int, numero_pedido: Op
             valor = valor.strip()
         item[col] = valor
     return item
+
+
+def _buscar_op_contexto_gs(
+    cursor,
+    codigo_empresa: int,
+    numero_op: int,
+    origem_op: Optional[str] = None,
+    situacao_op: Optional[str] = None,
+) -> Optional[dict]:
+    # No Senior a OP é chave composta (CODEMP + CODORI + NUMORP): o mesmo NUMORP
+    # existe em várias origens. Sem filtrar CODORI, pega a origem errada.
+    # situacao_op (ex.: 'L'=Liberada) filtra SITORP quando informado — use só
+    # para a OP nova; a OP origem costuma estar Finalizada.
+    origem_op = (origem_op or "").strip()
+    situacao_op = (situacao_op or "").strip()
+    filtro_origem = " AND C.CODORI = ?" if origem_op else ""
+    filtro_situacao = " AND C.SITORP = ?" if situacao_op else ""
+    params = [codigo_empresa, numero_op]
+    if origem_op:
+        params.append(origem_op)
+    if situacao_op:
+        params.append(situacao_op)
+
+    cursor.execute(
+        f"""
+        SELECT TOP 1
+            C.CODEMP,
+            C.CODORI,
+            C.NUMORP,
+            C.NUMPED,
+            C.CODPRO,
+            C.SITORP,
+            COALESCE(Q.SEQIPD, 0) AS SEQIPD,
+            COALESCE(Q.CODDER, '') AS CODDER,
+            COALESCE(P.DESPRO, '') AS DESPRO,
+            COALESCE(P.CODAGP, '') AS CODAGP,
+            COALESCE(I.USU_NUMSEP, '') AS USU_NUMSEP
+        FROM E900COP C
+        LEFT JOIN E900QDO Q
+            ON Q.CODEMP = C.CODEMP
+           AND Q.CODORI = C.CODORI
+           AND Q.NUMORP = C.NUMORP
+           AND Q.CODPRO = C.CODPRO
+        LEFT JOIN E075PRO P
+            ON P.CODEMP = C.CODEMP
+           AND P.CODPRO = C.CODPRO
+        LEFT JOIN E120IPD I
+            ON I.CODEMP = C.CODEMP
+           AND I.NUMPED = C.NUMPED
+           AND I.SEQIPD = Q.SEQIPD
+        WHERE C.CODEMP = ?
+          AND C.NUMORP = ?
+          {filtro_origem}{filtro_situacao}
+        ORDER BY
+            CASE WHEN Q.SEQIPD IS NOT NULL THEN 0 ELSE 1 END,
+            C.CODORI
+        """,
+        params,
+    )
+
+    row = cursor.fetchone()
+    if not row:
+        return None
+
+    return {
+        "codigo_empresa": int(row[0] or 0),
+        "origem_op": (row[1] or "").strip(),
+        "numero_op": int(row[2] or 0),
+        "numero_pedido": int(row[3] or 0),
+        "codigo_produto": (row[4] or "").strip(),
+        "situacao_op": (row[5] or "").strip(),
+        "item_pedido": int(row[6] or 0),
+        "derivacao": (row[7] or "").strip(),
+        "descricao_produto": (row[8] or "").strip(),
+        "codagp": (row[9] or "").strip(),
+        "numero_serie_atual": (row[10] or "").strip(),
+    }
+
+
+def _buscar_gs_por_op_origem(
+    cursor,
+    codigo_empresa: int,
+    numero_op_origem: Optional[int],
+    origem_op_origem: Optional[str],
+    numero_serie_manual: Optional[str],
+) -> str:
+    numero_serie = _normalizar_numero_serie(numero_serie_manual or "")
+    if numero_serie:
+        return numero_serie
+
+    if not numero_op_origem:
+        raise HTTPException(
+            status_code=400,
+            detail="Informe o GS manualmente ou informe a OP de origem para localizar o GS original.",
+        )
+
+    contexto_origem = _buscar_op_contexto_gs(
+        cursor, codigo_empresa, numero_op_origem, origem_op_origem
+    )
+    if contexto_origem and contexto_origem.get("numero_serie_atual"):
+        return _normalizar_numero_serie(contexto_origem["numero_serie_atual"])
+
+    origem_op_origem = (origem_op_origem or "").strip()
+
+    if origem_op_origem and _tabela_vinculo_op_existe(cursor):
+        cursor.execute(
+            """
+            SELECT TOP 1 COALESCE(USU_NUMSEP, '')
+            FROM dbo.USU_TNSOP
+            WHERE USU_CODEMP = ?
+              AND USU_CODORI = ?
+              AND USU_NUMORP = ?
+              AND COALESCE(USU_SITREG, 'A') = 'A'
+            """,
+            [codigo_empresa, origem_op_origem, numero_op_origem],
+        )
+        row = cursor.fetchone()
+        if row and (row[0] or "").strip():
+            return _normalizar_numero_serie(row[0])
+
+    raise HTTPException(
+        status_code=404,
+        detail="Não foi possível localizar o GS original. Informe o GS manualmente.",
+    )
+
+
+def _validar_op_complementar_manter_gs(
+    cursor,
+    payload: OPComplementarManterGSPayload,
+) -> dict:
+    payload.codigo_empresa = EMPRESA_PADRAO
+
+    origem_op_nova = (payload.origem_op_nova or "250").strip()
+
+    # Busca na chave composta CODEMP+CODORI+NUMORP (a origem evita pegar outra
+    # OP com o mesmo NUMORP). A exigência SITORP='L' é validada logo abaixo, p/
+    # dar mensagem com a situação real em vez de um 404 cego.
+    op_nova = _buscar_op_contexto_gs(
+        cursor,
+        payload.codigo_empresa,
+        payload.numero_op_nova,
+        origem_op_nova,
+    )
+
+    if not op_nova:
+        raise HTTPException(
+            status_code=404,
+            detail=f"OP {payload.numero_op_nova} origem {origem_op_nova} não localizada.",
+        )
+
+    origem_op = (op_nova.get("origem_op") or "").strip()
+    numero_pedido = int(op_nova.get("numero_pedido") or 0)
+    item_pedido = int(op_nova.get("item_pedido") or 0)
+    codigo_produto = (op_nova.get("codigo_produto") or "").strip()
+    derivacao = (op_nova.get("derivacao") or "").strip()
+    situacao_op = (op_nova.get("situacao_op") or "").strip().upper()
+
+    if origem_op != "250":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Rotina permitida apenas para OP origem 250. Origem encontrada: {origem_op or '-'}."
+        )
+
+    if numero_pedido <= 0 or item_pedido <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "A OP origem 250 precisa estar vinculada a pedido/item. "
+                "A regra de montagem da série usa o GS gravado em E120IPD.USU_NUMSEP."
+            ),
+        )
+
+    if situacao_op != "L":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"OP {origem_op}/{payload.numero_op_nova} está em situação "
+                f"{situacao_op or '-'}. A rotina permite somente OP liberada (L)."
+            ),
+        )
+
+    numero_serie = _buscar_gs_por_op_origem(
+        cursor,
+        payload.codigo_empresa,
+        payload.numero_op_origem,
+        payload.origem_op_origem,
+        payload.numero_serie,
+    )
+
+    if not numero_serie.startswith("GS-"):
+        raise HTTPException(
+            status_code=400,
+            detail="Para origem 250, o número de série deve iniciar com GS-.",
+        )
+
+    # GS pode ser reaproveitado de outro produto/derivação (OP complementar):
+    # 1) confere se bate exatamente com o produto/derivação da OP nova;
+    # 2) confere se o GS existe ativo em QUALQUER produto/derivação.
+    cursor.execute(
+        """
+        SELECT TOP 1 USU_CODPRO, COALESCE(USU_CODDER, '') AS USU_CODDER
+        FROM USU_T075SEP
+        WHERE USU_CODEMP = ?
+          AND USU_CODPRO = ?
+          AND COALESCE(USU_CODDER, '') = ?
+          AND USU_NUMSEP = ?
+          AND COALESCE(USU_ATIVO, 'N') = 'S'
+        """,
+        [payload.codigo_empresa, codigo_produto, derivacao, numero_serie],
+    )
+    serie_exata = cursor.fetchone()
+
+    # Etapa 2: o GS é "existente no ERP" se estiver ATIVO na USU_T075SEP OU no
+    # histórico de estoque (E210MVP movimentação / E210DLS lote-série). Assim um
+    # GS de máquina antiga, que saiu do estoque e não está mais na USU_T075SEP,
+    # pode ser reaproveitado na OP complementar. Prioridade: cadastro > histórico.
+    cursor.execute(
+        """
+        SELECT TOP 1 fonte, cd_produto, cd_derivacao FROM (
+            SELECT TOP 1 'USU_T075SEP' AS fonte, USU_CODPRO AS cd_produto,
+                   COALESCE(USU_CODDER, '') AS cd_derivacao, 1 AS ord
+            FROM USU_T075SEP
+            WHERE USU_CODEMP = ? AND USU_NUMSEP = ? AND COALESCE(USU_ATIVO, 'N') = 'S'
+            UNION ALL
+            SELECT TOP 1 'E210MVP', CODPRO, COALESCE(CODDER, ''), 2
+            FROM E210MVP WHERE CODEMP = ? AND NUMSEP = ?
+            UNION ALL
+            SELECT TOP 1 'E210DLS', CODPRO, COALESCE(CODDER, ''), 3
+            FROM E210DLS WHERE CODEMP = ? AND NUMSEP = ?
+        ) x
+        ORDER BY ord
+        """,
+        [payload.codigo_empresa, numero_serie,
+         payload.codigo_empresa, numero_serie,
+         payload.codigo_empresa, numero_serie],
+    )
+    serie_global = cursor.fetchone()
+
+    existe_serie_ativa = serie_global is not None
+    serie_bate_produto_nova_op = serie_exata is not None
+    fonte_gs = (serie_global[0] or "").strip() if serie_global else ""
+    produto_origem_gs = (serie_global[1] or "").strip() if serie_global else ""
+    derivacao_origem_gs = (serie_global[2] or "").strip() if serie_global else ""
+
+    if not existe_serie_ativa and not payload.forcar_vinculo:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "GS não encontrado como ativo na USU_T075SEP (em nenhum produto/derivação). "
+                "Confirme o número do GS, cadastre-o, ou use forcar_vinculo=true em exceção controlada."
+            ),
+        )
+
+    cursor.execute(
+        """
+        SELECT TOP 1 NUMPED, SEQIPD
+        FROM E120IPD
+        WHERE CODEMP = ?
+          AND CODPRO = ?
+          AND COALESCE(CODDER, '') = ?
+          AND COALESCE(USU_NUMSEP, '') = ?
+          AND NOT (NUMPED = ? AND SEQIPD = ?)
+        """,
+        [
+            payload.codigo_empresa,
+            codigo_produto,
+            derivacao,
+            numero_serie,
+            numero_pedido,
+            item_pedido,
+        ],
+    )
+
+    conflito = cursor.fetchone()
+
+    return {
+        "op_nova": op_nova,
+        "numero_serie": numero_serie,
+        "existe_serie_ativa": existe_serie_ativa,
+        "serie_bate_produto_nova_op": serie_bate_produto_nova_op,
+        "fonte_gs": fonte_gs,
+        "produto_origem_gs": produto_origem_gs,
+        "derivacao_origem_gs": derivacao_origem_gs,
+        "alerta": (
+            None if serie_bate_produto_nova_op
+            else (
+                "GS NÃO existe na USU_T075SEP nem no histórico de estoque (E210MVP/E210DLS) "
+                "— vínculo forçado (forcar_vinculo)."
+                if not existe_serie_ativa
+                else (
+                    f"GS encontrado no histórico de estoque ({fonte_gs}), produto "
+                    f"{produto_origem_gs}/{derivacao_origem_gs}. Reaproveitamento de GS em OP complementar."
+                    if fonte_gs in ("E210MVP", "E210DLS")
+                    else "GS ativo na USU_T075SEP em outro produto/derivação. Reaproveitamento de GS."
+                )
+            )
+        ),
+        "conflito": {
+            "existe": conflito is not None,
+            "numero_pedido": int(conflito[0] or 0) if conflito else None,
+            "item_pedido": int(conflito[1] or 0) if conflito else None,
+        },
+    }
+
+
+def _ns_rows_to_dict(cursor, rows):
+    colunas = [col[0] for col in cursor.description]
+    saida = []
+    for row in rows:
+        item = {}
+        for idx, col in enumerate(colunas):
+            valor = row[idx]
+            if isinstance(valor, str):
+                valor = valor.strip()
+            elif isinstance(valor, Decimal):
+                valor = float(valor)
+            elif isinstance(valor, (datetime, date)):
+                valor = valor.isoformat()
+            item[col] = valor
+        saida.append(item)
+    return saida
+
+
+def _ns_query_segura(cursor, sql: str, params: list, nome: str):
+    """Roda uma consulta isolada do histórico do GS. Erro numa fonte não
+    derruba o endpoint — retorna ([], 'fonte: erro') e segue para as demais."""
+    try:
+        cursor.execute(sql, params)
+        if cursor.description is None:
+            return [], None
+        return _ns_rows_to_dict(cursor, cursor.fetchall()), None
+    except Exception as exc:
+        return [], f"{nome}: {str(exc)[:300]}"
+
+
+@app.get("/api/numero-serie/gs-historico")
+def consultar_historico_gs(
+    numero_serie: str,
+    codigo_empresa: int = EMPRESA_PADRAO,
+    origem_op_nova: Optional[str] = None,
+    numero_op_nova: Optional[int] = None,
+    usuario=Depends(validar_token),
+):
+    """Histórico completo de um GS no ERP (cadastro, reservas, vínculos OP,
+    movimentação de estoque, logs) + validação se ele está vinculado na OP nova.
+    Não grava nada — consulta read-only para a tela de rastreabilidade."""
+    codigo_empresa = EMPRESA_PADRAO
+    gs = _normalizar_numero_serie(numero_serie or "")
+    if not gs:
+        raise HTTPException(status_code=400, detail="Informe o GS para consultar o histórico.")
+    origem_op_nova = (origem_op_nova or "").strip()
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        erros = []
+
+        cadastro, erro = _ns_query_segura(cursor, """
+            SELECT 'USU_T075SEP' AS fonte, USU_CODEMP, USU_CODPRO,
+                   COALESCE(USU_CODDER, '') AS USU_CODDER, USU_NUMSEP,
+                   COALESCE(USU_ATIVO, '') AS USU_ATIVO, USU_DATGER, USU_HORGER, USU_USUGER
+            FROM USU_T075SEP
+            WHERE USU_CODEMP = ? AND UPPER(LTRIM(RTRIM(USU_NUMSEP))) = UPPER(?)
+            ORDER BY USU_DATGER DESC, USU_HORGER DESC
+        """, [codigo_empresa, gs], "USU_T075SEP")
+        if erro:
+            erros.append(erro)
+
+        reservas, erro = _ns_query_segura(cursor, """
+            SELECT 'E120IPD' AS fonte, I.CODEMP, I.CODFIL, I.NUMPED, I.SEQIPD, I.CODPRO,
+                   COALESCE(I.CODDER, '') AS CODDER, COALESCE(I.USU_NUMSEP, '') AS USU_NUMSEP, P.SITPED
+            FROM E120IPD I
+            LEFT JOIN E120PED P
+                ON P.CODEMP = I.CODEMP AND P.CODFIL = I.CODFIL AND P.NUMPED = I.NUMPED
+            WHERE I.CODEMP = ? AND UPPER(LTRIM(RTRIM(COALESCE(I.USU_NUMSEP, '')))) = UPPER(?)
+            ORDER BY I.NUMPED DESC, I.SEQIPD DESC
+        """, [codigo_empresa, gs], "E120IPD")
+        if erro:
+            erros.append(erro)
+
+        vinculos_op, erro = _ns_query_segura(cursor, """
+            IF OBJECT_ID('dbo.USU_TNSOP', 'U') IS NOT NULL
+            BEGIN
+                SELECT 'USU_TNSOP' AS fonte, USU_CODEMP, USU_CODORI, USU_NUMORP, USU_NUMPED,
+                       USU_SEQIPD, USU_CODPRO, COALESCE(USU_CODDER, '') AS USU_CODDER, USU_NUMSEP,
+                       COALESCE(USU_SITREG, '') AS USU_SITREG, USU_DATGER, USU_DATALT
+                FROM dbo.USU_TNSOP
+                WHERE USU_CODEMP = ? AND UPPER(LTRIM(RTRIM(USU_NUMSEP))) = UPPER(?)
+                ORDER BY USU_DATGER DESC
+            END
+        """, [codigo_empresa, gs], "USU_TNSOP")
+        if erro:
+            erros.append(erro)
+
+        e000cse, erro = _ns_query_segura(cursor, """
+            SELECT 'E000CSE' AS fonte, CODEMP, CODPRO, COALESCE(CODDER, '') AS CODDER,
+                   NUMSEP, CODPED, PEDPAR
+            FROM E000CSE
+            WHERE CODEMP = ? AND UPPER(LTRIM(RTRIM(COALESCE(NUMSEP, '')))) = UPPER(?)
+        """, [codigo_empresa, gs], "E000CSE")
+        if erro:
+            erros.append(erro)
+
+        movimentos, erro = _ns_query_segura(cursor, """
+            SELECT 'E210MVP' AS fonte, CODEMP, CODPRO, COALESCE(CODDER, '') AS CODDER, CODDEP,
+                   DATMOV, SEQMOV, CODTNS, ESTEOS, ORIORP, NUMDOC,
+                   COALESCE(CODLOT, '') AS CODLOT, COALESCE(NUMSEP, '') AS NUMSEP, QTDMOV, OBSMVP
+            FROM E210MVP
+            WHERE CODEMP = ?
+              AND (UPPER(LTRIM(RTRIM(COALESCE(NUMSEP, '')))) = UPPER(?)
+                OR UPPER(LTRIM(RTRIM(COALESCE(CODLOT, '')))) = UPPER(?))
+            ORDER BY DATMOV DESC, SEQMOV DESC
+        """, [codigo_empresa, gs, gs], "E210MVP")
+        if erro:
+            erros.append(erro)
+
+        detalhes_lote_serie, erro = _ns_query_segura(cursor, """
+            IF OBJECT_ID('dbo.E210DLS', 'U') IS NOT NULL
+            BEGIN
+                SELECT TOP 200 'E210DLS' AS fonte, CODEMP, CODPRO, COALESCE(CODDER, '') AS CODDER,
+                       CODDEP, COALESCE(NUMSEP, '') AS NUMSEP, COALESCE(CODLOT, '') AS CODLOT,
+                       SEQENT, DATENT, DATMVE, SEQMVE, DATMVS, SEQMVS, SITDLS, QTDEST, QTDRES, QTDBLO
+                FROM dbo.E210DLS
+                WHERE CODEMP = ?
+                  AND (UPPER(LTRIM(RTRIM(COALESCE(NUMSEP, '')))) = UPPER(?)
+                    OR UPPER(LTRIM(RTRIM(COALESCE(CODLOT, '')))) = UPPER(?))
+                ORDER BY DATENT DESC, SEQENT DESC
+            END
+        """, [codigo_empresa, gs, gs], "E210DLS")
+        if erro:
+            erros.append(erro)
+
+        logs, erro = _ns_query_segura(cursor, """
+            IF OBJECT_ID('dbo.USU_T075SEP_LOG', 'U') IS NOT NULL
+            BEGIN
+                SELECT TOP 100 'USU_T075SEP_LOG' AS fonte, USU_IDLOG, USU_DATHOR, USU_USUARIO,
+                       USU_ACAO, USU_ESCOPO, USU_CODEMP, USU_NUMSEP, USU_NUMPED, USU_SEQIPD,
+                       USU_NUMORP, USU_CODORI, USU_CODPRO, USU_CODDER, USU_DETALHE
+                FROM dbo.USU_T075SEP_LOG
+                WHERE USU_CODEMP = ? AND UPPER(LTRIM(RTRIM(USU_NUMSEP))) = UPPER(?)
+                ORDER BY USU_DATHOR DESC
+            END
+        """, [codigo_empresa, gs], "USU_T075SEP_LOG")
+        if erro:
+            erros.append(erro)
+
+        validacao_op_nova = []
+        if numero_op_nova:
+            origem_val = origem_op_nova or "250"
+            validacao_op_nova, erro = _ns_query_segura(cursor, """
+                SELECT 'VALIDACAO_OP_NOVA' AS fonte, C.CODEMP, C.CODORI, C.NUMORP, C.NUMPED,
+                       C.CODPRO AS CODPRO_OP, C.SITORP, Q.SEQIPD,
+                       COALESCE(Q.CODDER, '') AS CODDER_OP, I.CODPRO AS CODPRO_PEDIDO,
+                       COALESCE(I.CODDER, '') AS CODDER_PEDIDO, COALESCE(I.USU_NUMSEP, '') AS USU_NUMSEP
+                FROM E900COP C
+                LEFT JOIN E900QDO Q
+                    ON Q.CODEMP = C.CODEMP AND Q.CODORI = C.CODORI
+                   AND Q.NUMORP = C.NUMORP AND Q.CODPRO = C.CODPRO
+                LEFT JOIN E120IPD I
+                    ON I.CODEMP = C.CODEMP AND I.NUMPED = C.NUMPED AND I.SEQIPD = Q.SEQIPD
+                WHERE C.CODEMP = ? AND C.CODORI = ? AND C.NUMORP = ?
+                  AND UPPER(LTRIM(RTRIM(COALESCE(I.USU_NUMSEP, '')))) = UPPER(?)
+            """, [codigo_empresa, origem_val, numero_op_nova, gs], "VALIDACAO_OP_NOVA")
+            if erro:
+                erros.append(erro)
+
+        fontes = []
+        for nome, dados in (("USU_T075SEP", cadastro), ("E120IPD", reservas),
+                            ("USU_TNSOP", vinculos_op), ("E000CSE", e000cse),
+                            ("E210MVP", movimentos), ("E210DLS", detalhes_lote_serie),
+                            ("USU_T075SEP_LOG", logs)):
+            if dados:
+                fontes.append(nome)
+
+        return {
+            "codigo_empresa": codigo_empresa,
+            "numero_serie": gs,
+            "existe_no_erp": len(fontes) > 0,
+            "fontes_encontradas": fontes,
+            "vinculo_op_nova_confirmado": len(validacao_op_nova) > 0,
+            "resumo": {
+                "qtd_cadastro_gs": len(cadastro),
+                "qtd_reservas_e120ipd": len(reservas),
+                "qtd_vinculos_usu_tnsop": len(vinculos_op),
+                "qtd_e000cse": len(e000cse),
+                "qtd_movimentos_e210mvp": len(movimentos),
+                "qtd_detalhes_e210dls": len(detalhes_lote_serie),
+                "qtd_logs_api": len(logs),
+            },
+            "dados": {
+                "cadastro": cadastro,
+                "reservas": reservas,
+                "vinculos_op": vinculos_op,
+                "e000cse": e000cse,
+                "movimentos": movimentos,
+                "detalhes_lote_serie": detalhes_lote_serie,
+                "logs": logs,
+                "validacao_op_nova": validacao_op_nova,
+            },
+            "erros_consulta": erros,
+        }
+    finally:
+        conn.close()
 
 
 @app.get('/api/numero-serie/contexto')
@@ -12830,6 +13377,441 @@ def reservar_numero_serie(payload: ReservaNumeroSeriePayload, usuario=Depends(va
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=f'Erro ao vincular número de série: {str(e)}')
+    finally:
+        conn.close()
+
+
+@app.get("/api/numero-serie/op-complementar/contexto")
+def consultar_contexto_op_complementar_gs(
+    numero_op_nova: int,
+    origem_op_nova: Optional[str] = "250",
+    numero_op_origem: Optional[int] = None,
+    origem_op_origem: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+
+        op_nova = _buscar_op_contexto_gs(
+            cursor, EMPRESA_PADRAO, numero_op_nova, (origem_op_nova or "250").strip()
+        )
+        if not op_nova:
+            raise HTTPException(status_code=404, detail="OP nova não localizada.")
+
+        gs_origem = ""
+        if numero_op_origem:
+            try:
+                gs_origem = _buscar_gs_por_op_origem(
+                    cursor,
+                    EMPRESA_PADRAO,
+                    numero_op_origem,
+                    origem_op_origem,
+                    None,
+                )
+            except HTTPException:
+                gs_origem = ""
+
+        return {
+            "op_nova": op_nova,
+            "numero_op_origem": numero_op_origem,
+            "origem_op_origem": origem_op_origem,
+            "gs_origem": gs_origem,
+            "pode_manter_gs": (
+                op_nova.get("origem_op") == "250"
+                and (op_nova.get("situacao_op") or "").upper() == "L"
+                and int(op_nova.get("numero_pedido") or 0) > 0
+                and int(op_nova.get("item_pedido") or 0) > 0
+            ),
+            "orientacao": (
+                "Para manter o GS, grave o GS original no item do pedido da nova OP "
+                "antes da finalização."
+            ),
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/numero-serie/op-complementar/simular")
+def simular_manter_gs_op_complementar(
+    payload: OPComplementarManterGSPayload,
+    usuario=Depends(validar_token),
+):
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        validacao = _validar_op_complementar_manter_gs(cursor, payload)
+
+        return {
+            "simulacao": "OK",
+            "mensagem": (
+                "Validação concluída. A execução gravará o GS original no item "
+                "do pedido da nova OP para que a regra de montagem da série reutilize esse GS."
+            ),
+            **validacao,
+        }
+    finally:
+        conn.close()
+
+
+def _validar_vinculo_gs(cursor, codigo_empresa, origem_op_nova, numero_op_nova, numero_serie):
+    """Confere LENDO o banco se o GS ficou realmente vinculado na OP nova.
+    A prova principal é o GS no item do pedido da OP (E120IPD via E900COP/QDO),
+    que é o campo lido pela regra CHA-900BLSOP01 na finalização."""
+    origem = (origem_op_nova or "250").strip()
+
+    cursor.execute("""
+        SELECT TOP 1 1
+        FROM E900COP C
+        INNER JOIN E900QDO Q
+            ON Q.CODEMP = C.CODEMP AND Q.CODORI = C.CODORI
+           AND Q.NUMORP = C.NUMORP AND Q.CODPRO = C.CODPRO
+        INNER JOIN E120IPD I
+            ON I.CODEMP = C.CODEMP AND I.NUMPED = C.NUMPED AND I.SEQIPD = Q.SEQIPD
+        WHERE C.CODEMP = ? AND C.CODORI = ? AND C.NUMORP = ?
+          AND UPPER(LTRIM(RTRIM(COALESCE(I.USU_NUMSEP, '')))) = UPPER(?)
+    """, [codigo_empresa, origem, numero_op_nova, numero_serie])
+    e120ipd_confirmado = cursor.fetchone() is not None
+
+    usu_tnsop_confirmado = False
+    if _tabela_vinculo_op_existe(cursor):
+        cursor.execute("""
+            SELECT TOP 1 1 FROM dbo.USU_TNSOP
+            WHERE USU_CODEMP = ? AND USU_CODORI = ? AND USU_NUMORP = ?
+              AND UPPER(LTRIM(RTRIM(USU_NUMSEP))) = UPPER(?)
+              AND COALESCE(USU_SITREG, 'A') = 'A'
+        """, [codigo_empresa, origem, numero_op_nova, numero_serie])
+        usu_tnsop_confirmado = cursor.fetchone() is not None
+
+    cursor.execute("""
+        SELECT TOP 1 1 FROM E000CSE
+        WHERE CODEMP = ? AND UPPER(LTRIM(RTRIM(COALESCE(NUMSEP, '')))) = UPPER(?)
+    """, [codigo_empresa, numero_serie])
+    e000cse_confirmado = cursor.fetchone() is not None
+
+    cursor.execute("""
+        SELECT TOP 1 1 FROM (
+            SELECT 1 AS x FROM E210MVP
+            WHERE CODEMP = ? AND UPPER(LTRIM(RTRIM(COALESCE(NUMSEP, '')))) = UPPER(?)
+            UNION ALL
+            SELECT 1 FROM E210DLS
+            WHERE CODEMP = ? AND UPPER(LTRIM(RTRIM(COALESCE(NUMSEP, '')))) = UPPER(?)
+        ) h
+    """, [codigo_empresa, numero_serie, codigo_empresa, numero_serie])
+    historico_estoque_encontrado = cursor.fetchone() is not None
+
+    return {
+        "vinculo_confirmado": e120ipd_confirmado,
+        "e120ipd_confirmado": e120ipd_confirmado,
+        "usu_tnsop_confirmado": usu_tnsop_confirmado,
+        "e000cse_confirmado": e000cse_confirmado,
+        "historico_estoque_encontrado": historico_estoque_encontrado,
+    }
+
+
+@app.get("/api/numero-serie/op-complementar/validar-vinculo")
+def validar_vinculo_op_complementar(
+    numero_serie: str,
+    numero_op_nova: int,
+    origem_op_nova: Optional[str] = "250",
+    codigo_empresa: int = EMPRESA_PADRAO,
+    usuario=Depends(validar_token),
+):
+    """Conferência de vínculo do GS na OP nova (read-only)."""
+    gs = _normalizar_numero_serie(numero_serie or "")
+    if not gs:
+        raise HTTPException(status_code=400, detail="Informe o GS.")
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        return _validar_vinculo_gs(
+            cursor, EMPRESA_PADRAO, (origem_op_nova or "250"), numero_op_nova, gs
+        )
+    finally:
+        conn.close()
+
+
+@app.post("/api/numero-serie/op-complementar/manter-gs")
+def manter_gs_op_complementar(
+    payload: OPComplementarManterGSPayload,
+    usuario=Depends(validar_token),
+):
+    payload.codigo_empresa = EMPRESA_PADRAO
+
+    justificativa = (payload.justificativa or "").strip()
+    if len(justificativa) < 20:
+        raise HTTPException(
+            status_code=400,
+            detail="Informe uma justificativa com pelo menos 20 caracteres.",
+        )
+
+    if not payload.confirmar:
+        raise HTTPException(
+            status_code=400,
+            detail="Envie confirmar=true para executar a manutenção do GS.",
+        )
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        validacao = _validar_op_complementar_manter_gs(cursor, payload)
+
+        if validacao["conflito"]["existe"]:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"GS {validacao['numero_serie']} já está vinculado ao pedido "
+                    f"{validacao['conflito']['numero_pedido']} item "
+                    f"{validacao['conflito']['item_pedido']}. "
+                    "Desvincule antes de reutilizar na OP complementar."
+                ),
+            )
+
+        op_nova = validacao["op_nova"]
+        numero_serie = validacao["numero_serie"]
+
+        numero_pedido = int(op_nova.get("numero_pedido") or 0)
+        item_pedido = int(op_nova.get("item_pedido") or 0)
+        codigo_produto = (op_nova.get("codigo_produto") or "").strip()
+        derivacao = (op_nova.get("derivacao") or "").strip()
+        origem_op = (op_nova.get("origem_op") or "").strip()
+        numero_op = int(op_nova.get("numero_op") or 0)
+
+        manutencao = bool(payload.manutencao)
+        tipo_vinculo = "MANUTENCAO" if manutencao else (payload.tipo_vinculo or "NORMAL").strip().upper()
+        flag_manutencao = "S" if manutencao else "N"
+        produto_origem_gs = (validacao.get("produto_origem_gs") or "").strip()
+        derivacao_origem_gs = (validacao.get("derivacao_origem_gs") or "").strip()
+        justificativa_vinc = (payload.justificativa or "").strip()[:500]
+
+        # 1) Grava o GS no item do pedido.
+        # É este ponto que a regra CHA-900BLSOP01 usa para reutilizar o GS.
+        cursor.execute(
+            """
+            UPDATE E120IPD
+               SET USU_NUMSEP = ?
+             WHERE CODEMP = ?
+               AND NUMPED = ?
+               AND SEQIPD = ?
+            """,
+            [
+                numero_serie,
+                payload.codigo_empresa,
+                numero_pedido,
+                item_pedido,
+            ],
+        )
+
+        item_pedido_atualizado = int(cursor.rowcount or 0)
+        if item_pedido_atualizado <= 0:
+            raise HTTPException(
+                status_code=404,
+                detail="Não foi possível atualizar E120IPD.USU_NUMSEP no item da nova OP.",
+            )
+
+        # 2) Atualiza E000CSE pelo NUMSEP (o GS pode estar cadastrado em produto
+        # diferente da OP nova; por isso NÃO filtra por produto/derivação).
+        cursor.execute(
+            """
+            UPDATE E000CSE
+               SET CODPED = ?,
+                   PEDPAR = ?
+             WHERE CODEMP = ?
+               AND NUMSEP = ?
+            """,
+            [
+                str(numero_pedido),
+                str(item_pedido),
+                payload.codigo_empresa,
+                numero_serie,
+            ],
+        )
+
+        e000cse_atualizada = int(cursor.rowcount or 0)
+
+        # 3) Mantém vínculo customizado OP x GS, se a tabela existir/for usada.
+        tnsop_atualizada = 0
+        try:
+            _garantir_tabela_vinculo_op(cursor)
+
+            agora = datetime.now()
+            horalt = int(agora.strftime("%H%M%S"))
+
+            cursor.execute(
+                """
+                UPDATE dbo.USU_TNSOP
+                   SET USU_SITREG = 'I',
+                       USU_DATALT = ?,
+                       USU_HORALT = ?,
+                       USU_USUALT = 0
+                 WHERE USU_CODEMP = ?
+                   AND USU_NUMSEP = ?
+                   AND COALESCE(USU_SITREG, 'A') = 'A'
+                   AND NOT (USU_CODORI = ? AND USU_NUMORP = ?)
+                """,
+                [
+                    agora,
+                    horalt,
+                    payload.codigo_empresa,
+                    numero_serie,
+                    origem_op,
+                    numero_op,
+                ],
+            )
+
+            cursor.execute(
+                """
+                UPDATE dbo.USU_TNSOP
+                   SET USU_NUMPED = ?,
+                       USU_SEQIPD = ?,
+                       USU_CODPRO = ?,
+                       USU_CODDER = ?,
+                       USU_NUMSEP = ?,
+                       USU_SITREG = 'A',
+                       USU_TIPVIN = ?,
+                       USU_MANUT = ?,
+                       USU_JUSVIN = ?,
+                       USU_CODPROORI = ?,
+                       USU_CODDERORI = ?,
+                       USU_DATALT = ?,
+                       USU_HORALT = ?,
+                       USU_USUALT = 0
+                 WHERE USU_CODEMP = ?
+                   AND USU_CODORI = ?
+                   AND USU_NUMORP = ?
+                """,
+                [
+                    numero_pedido,
+                    item_pedido,
+                    codigo_produto,
+                    derivacao,
+                    numero_serie,
+                    tipo_vinculo,
+                    flag_manutencao,
+                    justificativa_vinc,
+                    produto_origem_gs,
+                    derivacao_origem_gs,
+                    agora,
+                    horalt,
+                    payload.codigo_empresa,
+                    origem_op,
+                    numero_op,
+                ],
+            )
+
+            tnsop_atualizada = int(cursor.rowcount or 0)
+
+            if tnsop_atualizada <= 0:
+                cursor.execute(
+                    """
+                    INSERT INTO dbo.USU_TNSOP
+                    (
+                        USU_CODEMP, USU_CODORI, USU_NUMORP,
+                        USU_NUMPED, USU_SEQIPD,
+                        USU_CODPRO, USU_CODDER, USU_NUMSEP,
+                        USU_SITREG,
+                        USU_TIPVIN, USU_MANUT, USU_JUSVIN, USU_CODPROORI, USU_CODDERORI,
+                        USU_DATGER, USU_HORGER, USU_USUGER,
+                        USU_DATALT, USU_HORALT, USU_USUALT
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'A', ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0)
+                    """,
+                    [
+                        payload.codigo_empresa,
+                        origem_op,
+                        numero_op,
+                        numero_pedido,
+                        item_pedido,
+                        codigo_produto,
+                        derivacao,
+                        numero_serie,
+                        tipo_vinculo,
+                        flag_manutencao,
+                        justificativa_vinc,
+                        produto_origem_gs,
+                        derivacao_origem_gs,
+                        agora,
+                        horalt,
+                        agora,
+                        horalt,
+                    ],
+                )
+                tnsop_atualizada = int(cursor.rowcount or 0)
+
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Falha ao atualizar vínculo customizado USU_TNSOP: {exc}",
+            )
+
+        # 4) Auditoria
+        _registrar_audit_numero_serie(
+            cursor=cursor,
+            usuario=usuario,
+            acao="MANTER_GS_OP",
+            escopo="OP_COMPLEMENTAR",
+            codigo_empresa=payload.codigo_empresa,
+            numero_serie=numero_serie,
+            numero_pedido=numero_pedido,
+            item_pedido=item_pedido,
+            numero_op=numero_op,
+            origem_op=origem_op,
+            codigo_produto=codigo_produto,
+            derivacao=derivacao,
+            detalhe=(
+                f"GS mantido na OP complementar. "
+                f"OP nova={origem_op}/{numero_op}; "
+                f"OP origem={payload.origem_op_origem or ''}/{payload.numero_op_origem or ''}; "
+                f"Justificativa={justificativa}"
+            ),
+        )
+
+        conn.commit()
+
+        # Validação pós-gravação: prova, lendo o banco, que o GS ficou no item
+        # do pedido da OP nova (não confiar só no rowcount do UPDATE).
+        validacoes = _validar_vinculo_gs(
+            cursor, payload.codigo_empresa, origem_op, numero_op, numero_serie
+        )
+        vinculo_confirmado = bool(validacoes.get("vinculo_confirmado"))
+
+        return {
+            "sucesso": True,
+            "vinculo_confirmado": vinculo_confirmado,
+            "manutencao": manutencao,
+            "tipo_vinculo": tipo_vinculo,
+            "mensagem": (
+                f"GS {numero_serie} reservado e CONFIRMADO na OP {origem_op}/{numero_op}"
+                f"{' como MANUTENÇÃO' if manutencao else ''}. A finalização deverá reutilizar esse GS (regra CHA-900BLSOP01)."
+                if vinculo_confirmado else
+                f"A reserva do GS {numero_serie} foi processada, mas NÃO foi possível confirmar o "
+                f"vínculo em E120IPD.USU_NUMSEP da OP {origem_op}/{numero_op}. Verifique manualmente."
+            ),
+            "numero_serie": numero_serie,
+            "op_nova": op_nova,
+            "origem_op_nova": origem_op,
+            "numero_op_nova": numero_op,
+            "pedido": numero_pedido,
+            "item_pedido": item_pedido,
+            "produto_op_nova": codigo_produto,
+            "derivacao": derivacao,
+            "atualizacoes": {
+                "e120ipd_usu_numsep": item_pedido_atualizado,
+                "e000cse": e000cse_atualizada,
+                "usu_tnsop": tnsop_atualizada,
+            },
+            "validacoes": validacoes,
+        }
+
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao manter GS na OP complementar: {exc}",
+        )
     finally:
         conn.close()
 
@@ -14588,23 +15570,21 @@ def tempo_para_minutos(valor):
 
     Regra atual (alinhada ao MCAP700 / planilha de operacao):
     - tmp_unit do banco vem em minutos. Nao multiplicar por 60.
-    - Exemplos: 5 -> 5 min, 90 -> 90 min, 0.67 -> 0.67 min (com decimais).
+    - Exemplos: 5 -> 5 min, 90 -> 90 min, 0.5 -> 1 min (arredonda).
 
-    Devolve Decimal com 2 casas decimais para manter precisao.
+    Devolve int (minutos arredondados para o mais proximo).
     """
     minutos = numero_para_decimal(valor)
-    return minutos.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return int(minutos.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
 def formatar_minutos(minutos):
-    """Formata minutos como string. Ex: 60 -> "60 min", 0.67 -> "0.67 min"."""
+    """Formata minutos como string. Ex: 60 -> "60 min", 0 -> "0 min"."""
     try:
-        valor = Decimal(str(minutos or 0))
-        # Remove trailing zeros e ponto desnecessario
-        valor_str = str(valor.quantize(Decimal("0.01")).normalize())
+        minutos_int = int(minutos or 0)
     except Exception:
-        valor_str = "0"
-    return f"{valor_str} min"
+        minutos_int = 0
+    return f"{minutos_int} min"
 
 
 def calcular_tempos_operacao_em_minutos(tmp_unit, quantidade_op):
@@ -14616,16 +15596,17 @@ def calcular_tempos_operacao_em_minutos(tmp_unit, quantidade_op):
     tmp_unit_min = tempo_para_minutos(tmp_unit)
     quantidade = numero_para_decimal(quantidade_op)
 
-    tmp_total_decimal = (tmp_unit_min * quantidade).quantize(
-        Decimal("0.01"),
+    tmp_total_decimal = (Decimal(tmp_unit_min) * quantidade).quantize(
+        Decimal("1"),
         rounding=ROUND_HALF_UP,
     )
+    tmp_total_min = int(tmp_total_decimal)
 
     return {
         "tmp_unit_min": tmp_unit_min,
-        "tmp_total_min": tmp_total_decimal,
+        "tmp_total_min": tmp_total_min,
         "tmp_unit_formatado": formatar_minutos(tmp_unit_min),
-        "tmp_total_formatado": formatar_minutos(tmp_total_decimal),
+        "tmp_total_formatado": formatar_minutos(tmp_total_min),
     }
 
 
@@ -15060,6 +16041,50 @@ DESENHO_THUMB_MAX_PX = 600
 DESENHO_THUMB_QUALITY = 70
 DESENHO_THUMB_PDF_DPI = 96
 
+# ============================================================================
+# Cache em disco dos desenhos JA normalizados em A4 (JPEG pronto).
+#
+# Normalizar (rasterizar PDF, recortar margem branca, encaixar em A4) custa
+# CPU a cada chamada — e a impressao em massa repete os mesmos desenhos.
+# O resultado e deterministico para (arquivo mtime+size, pagina, DPI,
+# qualidade, versao do pipeline), entao e seguro cachear em disco:
+# - Auto-invalidacao: desenho alterado no share muda mtime/size -> chave nova.
+# - DESENHO_A4_CACHE_VERSAO: troque ao mudar a logica de normalizacao para
+#   aposentar todo o cache antigo (mesmo padrao do ":autorotate-v2" do front).
+# - Artefatos orfaos sao removidos por TTL (ver _limpar_cache_desenhos_a4_antigo).
+# ============================================================================
+# Aceita os dois nomes de env var (PASTA_CACHE_DESENHOS_A4 e o legado
+# PASTA_CACHE_A4). Use disco LOCAL do servidor da API — nunca share UNC:
+# o ganho do cache vem de ler JPEG pronto sem atravessar a rede. O default
+# relativo resolve para a pasta de onde a API foi iniciada (local).
+PASTA_CACHE_DESENHOS_A4 = Path(
+    os.getenv("PASTA_CACHE_DESENHOS_A4")
+    or os.getenv("PASTA_CACHE_A4")
+    or "./cache_desenhos_a4"
+)
+try:
+    PASTA_CACHE_DESENHOS_A4.mkdir(parents=True, exist_ok=True)
+except Exception as _exc_pasta_cache_a4:
+    print(f"[CACHE-A4] Aviso: nao foi possivel criar {PASTA_CACHE_DESENHOS_A4}: {_exc_pasta_cache_a4}")
+
+DESENHO_A4_CACHE_JPEG_QUALITY = 90
+DESENHO_A4_CACHE_VERSAO = "v1"
+CACHE_DESENHOS_A4_TTL_DIAS = 30
+
+# DPIs aceitos na impressao em massa (PDF job):
+# - 120 "rapida": minimo legivel para chao de fabrica, maximo de velocidade.
+# - 150 "normal": PADRAO do job — equilibrio entre peso e nitidez.
+# - 200 "alta":   mesma resolucao da visualizacao em tela.
+# A visualizacao (/impressao-a4/pagina) segue fixa em DESENHO_A4_DPI=200.
+DESENHO_A4_DPI_RAPIDO = 120
+DESENHO_A4_DPI_NORMAL = 150
+DESENHO_A4_DPI_PADRAO_JOB = DESENHO_A4_DPI_NORMAL
+
+
+def _dimensoes_a4_px(dpi: int):
+    """(largura, altura) de uma folha A4 retrato em pixels no DPI dado."""
+    return int(8.27 * dpi), int(11.69 * dpi)
+
 
 def _normalizar_imagem_para_a4(caminho: Path):
     """Gera uma imagem A4 retrato (JPEG) com o desenho centralizado e escalado.
@@ -15327,12 +16352,17 @@ def _recortar_margem_branca(img):
     return rgb.crop((left, top, right, bottom))
 
 
-def _encaixar_em_a4_retrato(img):
+def _encaixar_em_a4_retrato(img, largura_px: Optional[int] = None,
+                            altura_px: Optional[int] = None):
     """Encaixa uma imagem (ja recortada) em uma folha A4 retrato branca.
 
     - Rotaciona 90deg se a imagem ainda estiver em paisagem.
     - Escala proporcionalmente para caber na area util (descontada a margem).
     - Centraliza e pinta sobre fundo branco A4.
+
+    `largura_px`/`altura_px` permitem gerar a folha em outro DPI (ex.: 150
+    DPI na impressao em massa). Sem informar, mantem o padrao 200 DPI —
+    callers existentes nao mudam.
     """
     if Image is None:
         raise HTTPException(
@@ -15340,13 +16370,18 @@ def _encaixar_em_a4_retrato(img):
             detail="Pillow nao esta instalado. Instale Pillow para normalizar desenhos.",
         )
 
+    folha_w = int(largura_px or A4_WIDTH_PX)
+    folha_h = int(altura_px or A4_HEIGHT_PX)
+    # Margem proporcional ao tamanho da folha (~0,25 pol em qualquer DPI)
+    margem = max(1, int(A4_MARGIN_PX * folha_w / A4_WIDTH_PX))
+
     img = img.convert("RGB")
 
     if img.width > img.height:
         img = img.rotate(90, expand=True)
 
-    area_w = A4_WIDTH_PX - (A4_MARGIN_PX * 2)
-    area_h = A4_HEIGHT_PX - (A4_MARGIN_PX * 2)
+    area_w = folha_w - (margem * 2)
+    area_h = folha_h - (margem * 2)
 
     escala = min(area_w / img.width, area_h / img.height)
     nova_w = max(1, int(img.width * escala))
@@ -15354,9 +16389,9 @@ def _encaixar_em_a4_retrato(img):
 
     img_redim = img.resize((nova_w, nova_h), Image.LANCZOS)
 
-    folha = Image.new("RGB", (A4_WIDTH_PX, A4_HEIGHT_PX), "white")
-    pos_x = (A4_WIDTH_PX - nova_w) // 2
-    pos_y = (A4_HEIGHT_PX - nova_h) // 2
+    folha = Image.new("RGB", (folha_w, folha_h), "white")
+    pos_x = (folha_w - nova_w) // 2
+    pos_y = (folha_h - nova_h) // 2
     folha.paste(img_redim, (pos_x, pos_y))
 
     return folha
@@ -15396,11 +16431,12 @@ def _contar_paginas_desenho(caminho: Path) -> int:
     )
 
 
-def _carregar_desenho_como_imagem(caminho: Path, pagina: int = 1):
+def _carregar_desenho_como_imagem(caminho: Path, pagina: int = 1,
+                                  dpi: int = DESENHO_A4_DPI):
     """Carrega uma pagina do desenho como Pillow.Image RGB.
 
     - JPG/PNG: lê direto (com correcao EXIF). Apenas pagina=1 e valida.
-    - PDF: rasteriza via PyMuPDF (fitz) em DESENHO_A4_DPI.
+    - PDF: rasteriza via PyMuPDF (fitz) no `dpi` informado (padrao 200).
     """
     if Image is None:
         raise HTTPException(
@@ -15438,7 +16474,7 @@ def _carregar_desenho_como_imagem(caminho: Path, pagina: int = 1):
                 )
 
             page = doc[pagina - 1]
-            zoom = DESENHO_A4_DPI / 72.0
+            zoom = (dpi or DESENHO_A4_DPI) / 72.0
             matrix = fitz.Matrix(zoom, zoom)
             pix = page.get_pixmap(matrix=matrix, alpha=False)
             img_bytes = pix.tobytes("png")
@@ -15453,6 +16489,127 @@ def _carregar_desenho_como_imagem(caminho: Path, pagina: int = 1):
     )
 
 
+def _arquivo_cache_desenho_a4(caminho: Path, pagina: int, dpi: int) -> Path:
+    """Caminho deterministico do JPEG A4 cacheado para (arquivo, pagina, dpi).
+
+    O nome embute um hash de nome+mtime+size+pagina+dpi+qualidade+versao do
+    pipeline — desenho atualizado no share gera chave nova e o artefato
+    antigo vira orfao (removido depois pela limpeza por TTL). O prefixo
+    legivel facilita inspecionar a pasta de cache a olho nu.
+    """
+    st = caminho.stat()
+    base = (
+        f"{caminho.name}|{int(st.st_mtime)}|{st.st_size}|p{pagina}"
+        f"|dpi{dpi}|q{DESENHO_A4_CACHE_JPEG_QUALITY}|{DESENHO_A4_CACHE_VERSAO}"
+    )
+    sufixo = hashlib.md5(base.encode("utf-8")).hexdigest()[:10]
+    stem = re.sub(r"[^A-Za-z0-9_.-]", "_", caminho.stem)[:60]
+    return PASTA_CACHE_DESENHOS_A4 / f"{stem}__p{pagina}__dpi{dpi}__{sufixo}.jpg"
+
+
+def _gerar_pagina_desenho_a4_jpeg(caminho: Path, pagina: int, dpi: int) -> bytes:
+    """Pipeline completo de normalizacao (sem cache): carrega/rasteriza a
+    pagina, recorta margem branca e encaixa em folha A4 retrato JPEG."""
+    largura_px, altura_px = _dimensoes_a4_px(dpi)
+    img = _carregar_desenho_como_imagem(caminho, pagina=pagina, dpi=dpi)
+    img = _recortar_margem_branca(img)
+    folha = _encaixar_em_a4_retrato(img, largura_px, altura_px)
+    saida = io.BytesIO()
+    folha.save(
+        saida, format="JPEG",
+        quality=DESENHO_A4_CACHE_JPEG_QUALITY, optimize=True,
+    )
+    return saida.getvalue()
+
+
+def obter_arquivo_pagina_desenho_a4_cacheada(caminho: Path, pagina: int = 1,
+                                             dpi: int = DESENHO_A4_DPI):
+    """Garante a pagina A4 normalizada no cache e devolve o CAMINHO dela.
+
+    Retorno: (arquivo_cache, jpeg_bytes, origem)
+    - HIT:            (Path, None, "HIT")   — JPEG pronto em disco.
+    - MISS gravado:   (Path, bytes, "MISS") — gerado agora e cacheado.
+    - MISS sem cache: (None, bytes, "MISS") — pasta de cache indisponivel;
+      o caller usa os bytes direto (stream) como fallback.
+
+    Quem so precisa do caminho (PDF job: insert_image por filename, sem
+    materializar bytes no heap do Python) usa esta funcao; quem precisa
+    dos bytes (endpoint HTTP) usa o wrapper obter_pagina_desenho_a4_cacheada.
+    Escrita atomica (tmp com nome unico + os.replace) — segura com os
+    workers paralelos do job (conteudo identico, ultimo vence).
+    """
+    try:
+        arquivo_cache = _arquivo_cache_desenho_a4(caminho, pagina, dpi)
+    except Exception:
+        # stat() falhou (share instavel?) — deixa o pipeline normal levantar
+        # o erro real, sem envolver o cache.
+        return None, _gerar_pagina_desenho_a4_jpeg(caminho, pagina, dpi), "MISS"
+
+    try:
+        if arquivo_cache.exists() and arquivo_cache.stat().st_size > 0:
+            return arquivo_cache, None, "HIT"
+    except Exception:
+        pass
+
+    jpeg_bytes = _gerar_pagina_desenho_a4_jpeg(caminho, pagina, dpi)
+
+    tmp = None
+    try:
+        tmp = arquivo_cache.with_name(
+            f"{arquivo_cache.name}.{uuid.uuid4().hex[:6]}.tmp"
+        )
+        tmp.write_bytes(jpeg_bytes)
+        os.replace(tmp, arquivo_cache)
+        return arquivo_cache, jpeg_bytes, "MISS"
+    except Exception:
+        # Best-effort: sem cache segue funcionando (so mais lento).
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return None, jpeg_bytes, "MISS"
+
+
+def obter_pagina_desenho_a4_cacheada(caminho: Path, pagina: int = 1,
+                                     dpi: int = DESENHO_A4_DPI):
+    """Devolve (jpeg_bytes, "HIT"|"MISS") da pagina A4 normalizada (cache).
+
+    Wrapper de obter_arquivo_pagina_desenho_a4_cacheada para quem precisa
+    dos BYTES — ex.: o endpoint /impressao-a4/pagina.
+    """
+    arquivo_cache, jpeg_bytes, origem = obter_arquivo_pagina_desenho_a4_cacheada(
+        caminho, pagina=pagina, dpi=dpi,
+    )
+    if jpeg_bytes is None and arquivo_cache is not None:
+        jpeg_bytes = arquivo_cache.read_bytes()
+    return jpeg_bytes, origem
+
+
+def _limpar_cache_desenhos_a4_antigo():
+    """Best-effort: apaga artefatos de cache com mtime alem do TTL.
+
+    mtime do artefato = momento da gravacao (hits nao renovam) — um desenho
+    ainda em uso some apos o TTL e e regerado na proxima chamada, o que e
+    aceitavel. Tambem varre .tmp orfaos de gravacoes interrompidas. Nunca
+    levanta excecao para o caller.
+    """
+    try:
+        limite = datetime.now() - timedelta(days=CACHE_DESENHOS_A4_TTL_DIAS)
+        for arq in PASTA_CACHE_DESENHOS_A4.iterdir():
+            if not arq.is_file():
+                continue
+            if arq.suffix.lower() not in (".jpg", ".tmp"):
+                continue
+            try:
+                if datetime.fromtimestamp(arq.stat().st_mtime) < limite:
+                    arq.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 @app.get("/api/producao/ordem-producao/desenho/impressao-a4/pagina")
 def obter_desenho_ordem_producao_impressao_a4_pagina(
     arquivo: str,
@@ -15461,15 +16618,17 @@ def obter_desenho_ordem_producao_impressao_a4_pagina(
 ):
     """Devolve UMA pagina do desenho ja como JPEG A4 retrato pronta para impressao.
 
-    Pipeline:
+    Pipeline (com cache em disco — ver obter_pagina_desenho_a4_cacheada):
       1) Carrega a pagina como imagem (rasteriza se for PDF).
       2) Recorta margens brancas externas (resolve o caso "desenho pequeno no
          centro da folha").
       3) Rotaciona se a area util sair em paisagem.
       4) Escala proporcionalmente e centraliza em uma folha A4 retrato branca.
-      5) Serializa em JPEG e devolve via StreamingResponse.
+      5) Serializa em JPEG; o resultado fica cacheado em PASTA_CACHE_DESENHOS_A4
+         e e reaproveitado enquanto o arquivo original nao mudar.
 
     O front deve renderizar a resposta como <img> dentro de uma folha A4 fixa.
+    Header X-A4-Cache indica HIT (veio do cache) ou MISS (normalizou agora).
     """
     caminho = _resolver_arquivo_desenho(arquivo)
 
@@ -15488,25 +16647,26 @@ def obter_desenho_ordem_producao_impressao_a4_pagina(
         )
 
     try:
-        img_original = _carregar_desenho_como_imagem(caminho, pagina=pagina)
-        img_cortada = _recortar_margem_branca(img_original)
-        img_a4 = _encaixar_em_a4_retrato(img_cortada)
+        jpeg_bytes, origem_cache = obter_pagina_desenho_a4_cacheada(
+            caminho, pagina=pagina, dpi=DESENHO_A4_DPI,
+        )
 
-        saida = io.BytesIO()
-        img_a4.save(saida, format="JPEG", quality=92, optimize=True)
-        saida.seek(0)
-
-        return StreamingResponse(
-            saida,
+        return Response(
+            content=jpeg_bytes,
             media_type="image/jpeg",
             headers={
-                "Cache-Control": "no-store",
+                # public+max-age e seguro aqui: as URLs que o front recebe
+                # (localizar_desenhos_produto/manifest) levam &v={mtime} como
+                # cache-buster — desenho atualizado muda a URL. O antigo
+                # no-store forcava re-download/reprocessamento em massa.
+                "Cache-Control": "public, max-age=86400",
                 "X-Original-File": caminho.name,
                 "X-A4-Normalized": "S",
                 "X-A4-Page": str(pagina),
                 "X-A4-Width": str(A4_WIDTH_PX),
                 "X-A4-Height": str(A4_HEIGHT_PX),
                 "X-A4-DPI": str(DESENHO_A4_DPI),
+                "X-A4-Cache": origem_cache,
             },
         )
     except HTTPException:
@@ -16481,9 +17641,6 @@ def _consultar_dados_impressao_op(
         quebrar_op_flag = str(quebrar_por_operacao or "N").upper().strip() == "S"
         imprimir_obs_flag = str(imprimir_observacoes or "N").upper().strip() == "S"
 
-
-
-        
         # Layout dos componentes: se houver mais de LIMITE itens, o Lovable
         # deve renderizar a Relacao de Componentes Necessarios em pagina
         # separada (com cabecalho da OP repetido). API so devolve a flag —
@@ -16514,7 +17671,6 @@ def _consultar_dados_impressao_op(
                 "limite_componentes_primeira_pagina": LIMITE_COMPONENTES_PRIMEIRA_PAGINA,
                 "quebrar_componentes_em_pagina_separada": quebrar_componentes_flag,
                 "posicao_componentes_quando_quebrar": "APOS_OPERACOES",
-                "desenhos_por_quebra_componentes": quebrar_componentes_flag,
             },
             "layout_observacoes": {
                 "total_observacoes": total_observacoes,
@@ -16995,6 +18151,1373 @@ def consultar_ordens_producao_impressao_selecionadas(
 
 
 # ============================================================
+# IMPRESSÃO EM MASSA POR JOB — PDF ÚNICO GERADO NO BACKEND
+#
+# Motivo: carregar 1 desenho A4 por <img> funciona, mas 244 OPs ao mesmo
+# tempo derrubam navegador/ngrok (Failed to fetch / 502). Aqui o front
+# manda UMA requisição com a lista de OPs, o backend monta o PDF completo
+# (folha de dados + desenhos A4 normalizados) em segundo plano e o
+# usuário baixa um único arquivo no final.
+#
+# Fluxo:
+#   POST /api/producao/ordem-producao/impressao/pdf-job               -> job_id
+#   POST /api/producao/ordem-producao/impressao/pdf-job/aquecer-cache -> job_id
+#        (so normaliza desenhos no cache, sem montar PDF — "Preparar desenhos")
+#   GET  /api/producao/ordem-producao/impressao/pdf-job/{id}/status
+#   GET  /api/producao/ordem-producao/impressao/pdf-job/{id}/download
+#
+# Os desenhos NAO passam por HTTP — são lidos direto do share
+# PASTA_DESENHOS_OP_PADRAO e normalizados pelo MESMO pipeline do endpoint
+# /desenho/impressao-a4/pagina, com cache em disco compartilhado
+# (obter_pagina_desenho_a4_cacheada): a 1ª geração paga a normalização,
+# as seguintes leem o JPEG A4 pronto. A normalização roda em paralelo
+# controlado (IMPRESSAO_OP_JOB_WORKERS_DESENHO) e o status expõe etapas
+# (BUSCANDO_OPS -> NORMALIZANDO_DESENHOS -> MONTANDO_PDF ->
+# GRAVANDO_ARQUIVO) com mensagem de progresso para o front.
+# ============================================================
+
+IMPRESSAO_OP_JOBS: Dict[str, dict] = {}
+_IMPRESSAO_OP_JOBS_LOCK = threading.Lock()
+
+# Fila interna: 1 job de PDF por vez. O usuário pode selecionar quantas OPs
+# quiser — quem segura a concorrência (SQL Server, share UNC dos desenhos,
+# memória da API) é este semáforo, não um limite na UI.
+_IMPRESSAO_OP_JOB_SEMAFORO = threading.Semaphore(1)
+
+PASTA_JOBS_IMPRESSAO_OP = Path(
+    os.getenv("PASTA_JOBS_IMPRESSAO_OP", "./jobs_impressao_op")
+)
+try:
+    PASTA_JOBS_IMPRESSAO_OP.mkdir(parents=True, exist_ok=True)
+except Exception as _exc_pasta_jobs:
+    print(f"[PDF-JOB OP] Aviso: nao foi possivel criar {PASTA_JOBS_IMPRESSAO_OP}: {_exc_pasta_jobs}")
+
+# Jobs concluídos/com erro são limpos (memória + PDF em disco) após o TTL.
+IMPRESSAO_OP_JOB_TTL_HORAS = 24
+# Backstop anti-abuso (não é limite de UI — 244, 500, 1000 OPs passam).
+IMPRESSAO_OP_JOB_MAX_OPS = 2000
+# Workers da normalização paralela de desenhos dentro de um job.
+# Regra prática: servidor fraco 2, médio 4, bom 6. Override por env var.
+try:
+    IMPRESSAO_OP_JOB_WORKERS_DESENHO = max(1, min(16, int(
+        os.getenv("IMPRESSAO_OP_JOB_WORKERS_DESENHO", "4")
+    )))
+except Exception:
+    IMPRESSAO_OP_JOB_WORKERS_DESENHO = 4
+
+# Layout da folha de dados da OP no PDF (pontos; A4_*_PT já definidos acima)
+_PDF_JOB_MARGEM = 24.0
+_PDF_JOB_FONTE = "helv"
+_PDF_JOB_FONTE_NEGRITO = "hebo"
+_PDF_JOB_LINHA_ALTURA_FATOR = 1.35
+
+_PDF_JOB_ID_RE = re.compile(r"^imp-op-\d{8}-\d{6}-[0-9a-f]{8}$")
+
+
+class _OPPdfJobItem(BaseModel):
+    """Item do payload do PDF job — uma OP selecionada na grid.
+
+    Aceita as duas convenções de nome usadas pelos fronts:
+    codemp/codori/numorp (Lovable) e cod_emp/cod_ori/num_orp (padrão da API).
+    """
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    cod_emp: int = Field(default=1, validation_alias=AliasChoices("codemp", "cod_emp"))
+    cod_ori: str = Field(validation_alias=AliasChoices("codori", "cod_ori"))
+    num_orp: int = Field(validation_alias=AliasChoices("numorp", "num_orp"))
+
+
+class _ImpressaoOPPdfJobPayload(BaseModel):
+    """Payload do POST /impressao/pdf-job.
+
+    Flags aceitam bool (true/false) ou string ("S"/"N") — normalizadas
+    via _pdf_job_flag para manter tolerância com clientes diferentes.
+    """
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    ops: List[_OPPdfJobItem] = Field(default_factory=list)
+    incluir_desenhos: Any = True
+    incluir_componentes: Any = True
+    incluir_operacoes: Any = True
+    imprimir_observacoes: Any = True
+    cod_etg: Optional[int] = None
+    cod_cre: Optional[str] = None
+    # Qualidade dos desenhos no PDF: "rapida"=120 DPI, "normal"=150 DPI
+    # (PADRÃO da impressão em massa), "alta"=200 DPI (mesma da tela).
+    qualidade: Any = None
+    # DPI direto (120/150/200) — alternativa ao `qualidade`; se ambos
+    # vierem, `dpi` vence. Ausente/inválido cai no padrão 150.
+    dpi: Any = None
+
+
+def _pdf_job_flag(valor, padrao: bool = True) -> bool:
+    """Normaliza bool/"S"/"N"/"true"/"1"/etc. para bool."""
+    if valor is None:
+        return padrao
+    if isinstance(valor, bool):
+        return valor
+    texto = str(valor).strip().upper()
+    if texto in ("S", "SIM", "TRUE", "1", "Y", "YES"):
+        return True
+    if texto in ("N", "NAO", "NÃO", "FALSE", "0", "NO"):
+        return False
+    return padrao
+
+
+def _pdf_job_dpi(qualidade=None, dpi=None) -> int:
+    """Resolve o DPI do job para um valor seguro (120, 150 ou 200).
+
+    `dpi` explícito tem precedência (aceita int ou string); senão
+    `qualidade` ("rapida"=120, "normal"=150, "alta"=200). Ausente ou
+    inválido cai no PADRÃO de massa (150) — nunca levanta exceção.
+    """
+    try:
+        dpi_int = int(dpi) if dpi is not None else None
+    except Exception:
+        dpi_int = None
+    if dpi_int in (DESENHO_A4_DPI_RAPIDO, DESENHO_A4_DPI_NORMAL, DESENHO_A4_DPI):
+        return dpi_int
+    texto = str(qualidade or "").strip().lower()
+    if texto in ("rapida", "rápida", "120"):
+        return DESENHO_A4_DPI_RAPIDO
+    if texto in ("normal", "150"):
+        return DESENHO_A4_DPI_NORMAL
+    if texto in ("alta", "200"):
+        return DESENHO_A4_DPI
+    return DESENHO_A4_DPI_PADRAO_JOB
+
+
+def _pdf_job_fmt_data(valor) -> str:
+    """Formata date/datetime como dd/mm/aaaa; passa adiante o que não for data."""
+    if valor is None:
+        return "-"
+    try:
+        return valor.strftime("%d/%m/%Y")
+    except Exception:
+        texto = str(valor).strip()
+        return texto if texto else "-"
+
+
+def _pdf_job_fmt_qtd(valor) -> str:
+    """Quantidade sem zeros à direita e com vírgula decimal (padrão BR)."""
+    if valor is None:
+        return ""
+    try:
+        texto = format(Decimal(str(valor)).normalize(), "f")
+    except Exception:
+        return str(valor)
+    if "." in texto:
+        texto = texto.rstrip("0").rstrip(".")
+    return texto.replace(".", ",")
+
+
+def _pdf_job_quebrar_texto(texto, largura: float, tamanho: float, fonte: str = _PDF_JOB_FONTE):
+    """Quebra `texto` em linhas que caibam em `largura` pontos (fonte helv).
+
+    Respeita quebras de linha existentes ("\\n") e força quebra por
+    caractere quando uma palavra sozinha é maior que a coluna. Caracteres
+    fora do Latin-1 (fontes base-14 do PDF) viram '?' em vez de estourar.
+    """
+    bruto_completo = str(texto if texto is not None else "")
+    bruto_completo = (
+        bruto_completo.encode("latin-1", "replace").decode("latin-1")
+    )
+    linhas: list = []
+    for bruto in (bruto_completo.splitlines() or [""]):
+        bruto = bruto.rstrip()
+        if not bruto:
+            linhas.append("")
+            continue
+        atual = ""
+        for palavra in bruto.split(" "):
+            candidato = f"{atual} {palavra}".strip()
+            if fitz.get_text_length(candidato, fontname=fonte, fontsize=tamanho) <= largura:
+                atual = candidato
+                continue
+            if atual:
+                linhas.append(atual)
+            # Palavra maior que a coluna -> quebra por caractere
+            while (
+                len(palavra) > 1
+                and fitz.get_text_length(palavra, fontname=fonte, fontsize=tamanho) > largura
+            ):
+                corte = len(palavra)
+                while corte > 1 and fitz.get_text_length(
+                    palavra[:corte], fontname=fonte, fontsize=tamanho
+                ) > largura:
+                    corte -= 1
+                linhas.append(palavra[:corte])
+                palavra = palavra[corte:]
+            atual = palavra
+        if atual:
+            linhas.append(atual)
+    return linhas or [""]
+
+
+class _PdfJobEscritor:
+    """Escritor sequencial de páginas A4 retrato para o PDF job (PyMuPDF).
+
+    Mantém um cursor vertical e cria nova página automaticamente quando o
+    conteúdo não cabe. A folha de dados da OP (cabeçalho, operações,
+    componentes, observações) é escrita por aqui como texto vetorial;
+    desenhos entram como página-imagem separada (fora desta classe).
+    """
+
+    def __init__(self, doc):
+        self.doc = doc
+        self.page = None
+        self.y = 0.0
+
+    @property
+    def largura_util(self) -> float:
+        return A4_WIDTH_PT - (2 * _PDF_JOB_MARGEM)
+
+    def _espaco_restante(self) -> float:
+        return (A4_HEIGHT_PT - _PDF_JOB_MARGEM) - self.y
+
+    def nova_pagina(self):
+        self.page = self.doc.new_page(width=A4_WIDTH_PT, height=A4_HEIGHT_PT)
+        self.y = _PDF_JOB_MARGEM
+
+    def garantir(self, altura: float):
+        if self.page is None or self._espaco_restante() < altura:
+            self.nova_pagina()
+
+    def espaco(self, altura: float = 4.0):
+        self.y += altura
+
+    def separador(self):
+        self.garantir(6.0)
+        self.page.draw_line(
+            fitz.Point(_PDF_JOB_MARGEM, self.y + 2),
+            fitz.Point(A4_WIDTH_PT - _PDF_JOB_MARGEM, self.y + 2),
+            color=(0, 0, 0),
+            width=0.6,
+        )
+        self.y += 6.0
+
+    def paragrafo(self, texto, tamanho: float = 8.0, negrito: bool = False,
+                  recuo: float = 0.0, espaco_apos: float = 2.0):
+        fonte = _PDF_JOB_FONTE_NEGRITO if negrito else _PDF_JOB_FONTE
+        largura = self.largura_util - recuo
+        alt_linha = tamanho * _PDF_JOB_LINHA_ALTURA_FATOR
+        for linha in _pdf_job_quebrar_texto(texto, largura, tamanho, fonte):
+            self.garantir(alt_linha)
+            if linha:
+                self.page.insert_text(
+                    fitz.Point(_PDF_JOB_MARGEM + recuo, self.y + tamanho),
+                    linha,
+                    fontname=fonte,
+                    fontsize=tamanho,
+                    color=(0, 0, 0),
+                )
+            self.y += alt_linha
+        self.y += espaco_apos
+
+    def tabela(self, colunas, linhas, tamanho: float = 7.0):
+        """Tabela simples com quebra de texto por célula.
+
+        `colunas`: lista de (titulo, largura_relativa) — larguras são
+        normalizadas para ocupar exatamente a largura útil da página.
+        Cabeçalho é repetido quando a tabela muda de página. Linha mais
+        alta que uma página inteira é desenhada assim mesmo (o excedente
+        é cortado pela borda — caso extremo aceito).
+        """
+        if not linhas:
+            return
+
+        total_w = sum(float(w) for _, w in colunas) or 1.0
+        fator = self.largura_util / total_w
+        larguras = [float(w) * fator for _, w in colunas]
+        titulos = [t for t, _ in colunas]
+        alt_linha = tamanho * _PDF_JOB_LINHA_ALTURA_FATOR
+        pad = 2.0
+
+        def _preparar(celulas, fonte):
+            cels = []
+            for i, cel in enumerate(celulas):
+                cels.append(_pdf_job_quebrar_texto(
+                    cel, max(4.0, larguras[i] - (2 * pad)), tamanho, fonte,
+                ))
+            altura = (max(len(c) for c in cels) * alt_linha) + (2 * pad)
+            return cels, altura
+
+        def _desenhar(cels, altura, fonte, fundo=False):
+            y0 = self.y
+            if fundo:
+                self.page.draw_rect(
+                    fitz.Rect(_PDF_JOB_MARGEM, y0,
+                              _PDF_JOB_MARGEM + self.largura_util, y0 + altura),
+                    color=None,
+                    fill=(0.92, 0.92, 0.92),
+                )
+            x = _PDF_JOB_MARGEM
+            for i, linhas_cel in enumerate(cels):
+                for j, linha in enumerate(linhas_cel):
+                    if linha:
+                        self.page.insert_text(
+                            fitz.Point(x + pad, y0 + pad + tamanho + (j * alt_linha)),
+                            linha,
+                            fontname=fonte,
+                            fontsize=tamanho,
+                            color=(0, 0, 0),
+                        )
+                x += larguras[i]
+            self.page.draw_line(
+                fitz.Point(_PDF_JOB_MARGEM, y0 + altura),
+                fitz.Point(_PDF_JOB_MARGEM + self.largura_util, y0 + altura),
+                color=(0.55, 0.55, 0.55),
+                width=0.4,
+            )
+            self.y = y0 + altura
+
+        cab_cels, cab_alt = _preparar(titulos, _PDF_JOB_FONTE_NEGRITO)
+        self.garantir(cab_alt + alt_linha)
+        _desenhar(cab_cels, cab_alt, _PDF_JOB_FONTE_NEGRITO, fundo=True)
+
+        for linha in linhas:
+            cels, altura = _preparar(linha, _PDF_JOB_FONTE)
+            if self._espaco_restante() < altura and altura < (A4_HEIGHT_PT - 2 * _PDF_JOB_MARGEM):
+                self.nova_pagina()
+                _desenhar(cab_cels, cab_alt, _PDF_JOB_FONTE_NEGRITO, fundo=True)
+            _desenhar(cels, altura, _PDF_JOB_FONTE)
+
+
+def _pdf_job_render_op(escritor: "_PdfJobEscritor", dados_op: dict, *,
+                       incluir_componentes: bool, incluir_operacoes: bool,
+                       imprimir_observacoes: bool):
+    """Escreve a folha de dados de UMA OP (padrão MCAP700 simplificado).
+
+    Cada OP começa em página nova. Os desenhos NÃO são tratados aqui —
+    entram como páginas-imagem logo depois (ver _pdf_job_inserir_desenhos).
+    """
+    cab = dados_op.get("cabecalho") or {}
+
+    escritor.nova_pagina()
+    escritor.paragrafo("ORDEM DE PRODUÇÃO", tamanho=13, negrito=True, espaco_apos=1.0)
+    escritor.paragrafo(
+        f"O.P.: {cab.get('num_orp_exibicao') or cab.get('num_orp') or ''}"
+        f"    Origem: {cab.get('cod_ori') or ''}"
+        f"    Situação: {cab.get('situacao_descricao') or ''}",
+        tamanho=9.5, negrito=True,
+    )
+    escritor.separador()
+
+    escritor.paragrafo(f"Produto: {cab.get('produto_descricao') or ''}", tamanho=9)
+    escritor.paragrafo(
+        f"Derivação: {cab.get('derivacao') or '-'}"
+        f"    Quantidade: {_pdf_job_fmt_qtd(cab.get('quantidade'))} {cab.get('unidade_medida') or ''}"
+        f"    Pedido: {cab.get('pedido') or '-'}",
+        tamanho=9,
+    )
+    escritor.paragrafo(
+        f"Data geração: {_pdf_job_fmt_data(cab.get('data_geracao'))}"
+        f"    Início previsto: {_pdf_job_fmt_data(cab.get('inicio_previsto'))}"
+        f"    Período: {cab.get('periodo') or '-'}",
+        tamanho=9,
+    )
+    escritor.paragrafo(
+        f"Revisão: {cab.get('revisao_label') or '-'}"
+        f"    Rev. desenho: {cab.get('revisao') or '-'}"
+        f"    Agrupamento: {cab.get('agrupamento') or '-'}",
+        tamanho=9,
+    )
+    escritor.paragrafo(
+        f"Código de barras O.P.: {cab.get('codigo_barras_op') or ''}",
+        tamanho=8, espaco_apos=1.0,
+    )
+    escritor.separador()
+
+    if incluir_operacoes:
+        operacoes = dados_op.get("operacoes") or []
+        escritor.paragrafo("OPERAÇÕES", tamanho=10, negrito=True, espaco_apos=1.5)
+        if operacoes:
+            colunas = [
+                ("Etg", 26), ("Seq", 26), ("Oper.", 42),
+                ("Descrição / Narrativas", 200), ("CRE", 42),
+                ("Tmp Unit", 50), ("Tmp Total", 52), ("Próx. Operação", 100),
+            ]
+            linhas_ops = []
+            for oper in operacoes:
+                descricao = str(oper.get("descricao_operacao") or "").strip()
+                extras = [
+                    str(n).strip() for n in (oper.get("narrativas") or [])
+                    if str(n or "").strip()
+                ]
+                obs_oper = str(oper.get("observacao_operacao") or "").strip()
+                if obs_oper:
+                    extras.append(f"Obs: {obs_oper}")
+                if oper.get("fornecedor"):
+                    extras.append(
+                        f"Fornecedor: {oper.get('fornecedor')} - "
+                        f"{str(oper.get('nome_fornecedor') or '').strip()}"
+                    )
+                if oper.get("servico"):
+                    extras.append(
+                        f"Serviço: {oper.get('servico')} - "
+                        f"{str(oper.get('descricao_servico') or '').strip()}"
+                    )
+                if extras:
+                    descricao = "\n".join(([descricao] if descricao else []) + extras)
+                linhas_ops.append([
+                    oper.get("cod_etg"), oper.get("seq_rot"), oper.get("cod_opr"),
+                    descricao, oper.get("cod_cre"),
+                    oper.get("tmp_unit_formatado"), oper.get("tmp_total_formatado"),
+                    oper.get("proxima_operacao_label") or "-",
+                ])
+            escritor.tabela(colunas, linhas_ops)
+        else:
+            escritor.paragrafo("Nenhuma operação encontrada para os filtros informados.", tamanho=8)
+        escritor.espaco(6.0)
+
+    if incluir_componentes:
+        componentes = dados_op.get("componentes") or []
+        escritor.paragrafo("RELAÇÃO DE COMPONENTES NECESSÁRIOS", tamanho=10, negrito=True, espaco_apos=1.5)
+        if componentes:
+            colunas = [
+                ("Etg", 26), ("Seq", 26), ("Código", 66), ("Der", 32),
+                ("Descrição", 230), ("Qtd Prevista", 58), ("UM", 28), ("Dep", 40),
+            ]
+            linhas_cmp = [
+                [
+                    cmp.get("cod_etg"), cmp.get("seq_cmp"),
+                    cmp.get("codigo_componente"),
+                    cmp.get("derivacao_componente") or "-",
+                    cmp.get("descricao_componente"),
+                    _pdf_job_fmt_qtd(cmp.get("quantidade_prevista")),
+                    cmp.get("unidade_medida"), cmp.get("deposito"),
+                ]
+                for cmp in componentes
+            ]
+            escritor.tabela(colunas, linhas_cmp)
+        else:
+            escritor.paragrafo("Nenhum componente encontrado.", tamanho=8)
+        escritor.espaco(6.0)
+
+    if imprimir_observacoes:
+        observacoes = dados_op.get("observacoes") or []
+        obs_cab = [
+            str(cab.get(campo) or "").strip()
+            for campo in ("observacao_1", "observacao_2")
+            if str(cab.get(campo) or "").strip()
+        ]
+        if observacoes or obs_cab:
+            escritor.paragrafo("OBSERVAÇÕES", tamanho=10, negrito=True, espaco_apos=1.5)
+            for texto_obs in obs_cab:
+                escritor.paragrafo(texto_obs, tamanho=8, recuo=4.0)
+            for obs in observacoes:
+                escritor.paragrafo(
+                    f"{str(obs.get('tipo_observacao') or '').strip()} "
+                    f"{obs.get('sequencia') or ''} - {str(obs.get('observacao') or '').strip()}",
+                    tamanho=8, recuo=4.0,
+                )
+            escritor.espaco(6.0)
+
+    escritor.separador()
+    escritor.paragrafo(dados_op.get("mensagem_responsabilidade") or "", tamanho=7)
+
+
+def _pdf_job_resolver_desenhos(desenhos, avisos: list, contexto: str):
+    """Resolve a lista de desenhos da OP em [(nome, caminho, total_paginas)].
+
+    Valida existência no share e conta páginas UMA vez (PDF multipágina) —
+    a normalização paralela e a montagem reutilizam o resultado. Desenho
+    com problema vira aviso e fica fora da lista.
+    """
+    resolvidos = []
+    pasta = Path(PASTA_DESENHOS_OP_PADRAO)
+
+    for desenho in desenhos or []:
+        nome = os.path.basename(str(desenho.get("nome_arquivo") or "").strip())
+        if not nome:
+            continue
+        caminho = pasta / nome
+        try:
+            if not caminho.exists() or not caminho.is_file():
+                avisos.append(f"{contexto}: desenho não encontrado no share: {nome}")
+                continue
+            total_paginas = _contar_paginas_desenho(caminho)
+        except HTTPException as exc:
+            avisos.append(f"{contexto}: erro no desenho {nome}: {exc.detail}")
+            continue
+        except Exception as exc:
+            avisos.append(f"{contexto}: erro no desenho {nome}: {exc}")
+            continue
+        resolvidos.append((nome, caminho, total_paginas))
+
+    return resolvidos
+
+
+def _pdf_job_inserir_desenhos(doc, desenhos_resolvidos, avisos: list,
+                              contexto: str, dpi: Optional[int] = None,
+                              falhas_normalizacao=None) -> int:
+    """Insere os desenhos (já resolvidos) como páginas-imagem A4 no PDF.
+
+    Usa o CAMINHO do JPEG cacheado (insert_image por filename): a leitura
+    fica na camada C do MuPDF, sem materializar os bytes de cada página no
+    heap do Python — relevante em jobs de centenas de OPs. Fallback para
+    stream só quando a pasta de cache está indisponível. Página que já
+    falhou na normalização (em `falhas_normalizacao`) é pulada sem aviso
+    duplicado; falha nova vira aviso. Retorna as páginas inseridas.
+    """
+    dpi = _pdf_job_dpi(dpi=dpi)
+    paginas = 0
+    falhas = falhas_normalizacao or set()
+    rect_a4 = fitz.Rect(0, 0, A4_WIDTH_PT, A4_HEIGHT_PT)
+
+    for nome, caminho, total_paginas in desenhos_resolvidos or []:
+        for num_pag in range(1, total_paginas + 1):
+            if (str(caminho), num_pag) in falhas:
+                continue
+            try:
+                arquivo_cache, jpeg_bytes, _ = obter_arquivo_pagina_desenho_a4_cacheada(
+                    caminho, pagina=num_pag, dpi=dpi,
+                )
+            except HTTPException as exc:
+                avisos.append(
+                    f"{contexto}: erro no desenho {nome} pág. {num_pag}: {exc.detail}"
+                )
+                continue
+            except Exception as exc:
+                avisos.append(
+                    f"{contexto}: erro no desenho {nome} pág. {num_pag}: {exc}"
+                )
+                continue
+
+            pagina_pdf = doc.new_page(width=A4_WIDTH_PT, height=A4_HEIGHT_PT)
+            if arquivo_cache is not None:
+                pagina_pdf.insert_image(rect_a4, filename=str(arquivo_cache))
+            else:
+                pagina_pdf.insert_image(rect_a4, stream=jpeg_bytes)
+            paginas += 1
+
+    return paginas
+
+
+def gerar_pdf_ops_com_desenhos(*, ops, arquivo_saida: str, incluir_desenhos: bool,
+                               incluir_componentes: bool, incluir_operacoes: bool,
+                               imprimir_observacoes: bool, cod_etg, cod_cre,
+                               job_id: str, dpi: Optional[int] = None):
+    """Gera o PDF único do job em etapas, com progresso real no status.
+
+    1) BUSCANDO_OPS          — consultas SQL sequenciais (1 conexão pyodbc).
+    2) NORMALIZANDO_DESENHOS — desenhos -> JPEG A4 no cache em disco, em
+       paralelo controlado (IMPRESSAO_OP_JOB_WORKERS_DESENHO workers), com
+       dedup de arquivos repetidos entre OPs.
+    3) MONTANDO_PDF          — folha de dados + páginas de desenho do cache.
+    4) GRAVANDO_ARQUIVO      — save atômico (.tmp -> os.replace).
+
+    Sem desenhos a etapa 2 é pulada. Roda em background (thread do
+    BackgroundTasks) e atualiza IMPRESSAO_OP_JOBS[job_id] direto. OP
+    inválida vira `descartadas`; desenho com problema vira `avisos` —
+    nada derruba o job inteiro.
+    """
+    if fitz is None:
+        raise RuntimeError(
+            "PyMuPDF (fitz) não está instalado na API. Instale pymupdf para gerar o PDF em massa."
+        )
+    if Image is None:
+        raise RuntimeError(
+            "Pillow não está instalado na API. Instale Pillow para gerar o PDF em massa."
+        )
+
+    dpi = _pdf_job_dpi(dpi=dpi)
+    job = IMPRESSAO_OP_JOBS.get(job_id) or {}
+    descartadas: list = []
+    avisos: list = []
+    total = len(ops)
+
+    # Listas vivas: o status enxerga descartes/avisos em tempo real.
+    job["descartadas"] = descartadas
+    job["avisos"] = avisos
+
+    # Faixas de percentual por etapa (sem desenhos, a consulta vai até 50%)
+    pct_consulta_fim = 30 if incluir_desenhos else 50
+    pct_normaliza_fim = 80
+    pct_montagem_fim = 99
+
+    # Tempo gasto por etapa (segundos) — exposto no status para o front.
+    tempos_etapas: dict = {}
+    job["tempos_etapas"] = tempos_etapas
+    cronometro = {"etapa": None, "inicio": 0.0}
+
+    def _fechar_etapa():
+        if cronometro["etapa"] is not None:
+            tempos_etapas[cronometro["etapa"]] = round(
+                _time_mod.perf_counter() - cronometro["inicio"], 1,
+            )
+
+    def _etapa(nome: str, mensagem: str):
+        _fechar_etapa()
+        cronometro["etapa"] = nome
+        cronometro["inicio"] = _time_mod.perf_counter()
+        job["etapa"] = nome
+        job["mensagem"] = mensagem
+
+    conn = get_connection()
+    doc = fitz.open()
+    doc_fechado = False
+    try:
+        # ============================================================
+        # Etapa 1 — consultas SQL (sequencial: 1 conexão pyodbc)
+        # ============================================================
+        _etapa("BUSCANDO_OPS", f"Buscando dados de {total} OPs...")
+        ops_dados: list = []
+
+        for idx, op in enumerate(ops, start=1):
+            cod_ori = str(op.get("cod_ori") or "").strip()
+            num_orp = op.get("num_orp")
+            cod_emp = int(op.get("cod_emp") or 1)
+            contexto = f"OP {cod_ori}/{num_orp}"
+            job["op_atual"] = contexto
+
+            if not cod_ori or not num_orp:
+                descartadas.append({
+                    "cod_emp": cod_emp, "cod_ori": cod_ori, "num_orp": num_orp,
+                    "motivo": "Origem ou número da OP vazio",
+                })
+            elif cod_ori == "100":
+                descartadas.append({
+                    "cod_emp": cod_emp, "cod_ori": cod_ori, "num_orp": num_orp,
+                    "motivo": "Origem 100 não é impressa",
+                })
+            else:
+                try:
+                    dados_op = _consultar_dados_impressao_op(
+                        cod_emp=cod_emp,
+                        cod_ori=cod_ori,
+                        num_orp=int(num_orp),
+                        listar_componentes="S" if incluir_componentes else "N",
+                        listar_desenho="N",
+                        cod_etg=cod_etg,
+                        cod_cre=cod_cre,
+                        conn=conn,
+                        incluir_desenhos="S" if incluir_desenhos else "N",
+                        quebrar_por_operacao="N",
+                        imprimir_observacoes="S" if imprimir_observacoes else "N",
+                    )
+                except Exception as exc:
+                    dados_op = None
+                    descartadas.append({
+                        "cod_emp": cod_emp, "cod_ori": cod_ori, "num_orp": num_orp,
+                        "motivo": f"Erro ao consultar: {exc}",
+                    })
+                else:
+                    if not dados_op:
+                        descartadas.append({
+                            "cod_emp": cod_emp, "cod_ori": cod_ori, "num_orp": num_orp,
+                            "motivo": "OP não encontrada ou cancelada",
+                        })
+
+                if dados_op:
+                    desenhos_resolvidos = []
+                    if incluir_desenhos:
+                        desenhos_resolvidos = _pdf_job_resolver_desenhos(
+                            dados_op.get("desenhos") or [], avisos, contexto,
+                        )
+                    ops_dados.append({
+                        "contexto": contexto,
+                        "dados": dados_op,
+                        "desenhos_resolvidos": desenhos_resolvidos,
+                    })
+
+            job["processadas"] = idx
+            job["percentual"] = int(idx * pct_consulta_fim / total) if total else pct_consulta_fim
+            job["mensagem"] = f"Buscando dados da OP {idx} de {total}"
+
+        # ============================================================
+        # Etapa 2 — normalização paralela dos desenhos (popula o cache)
+        # ============================================================
+        falhas_normalizacao: set = set()
+        if incluir_desenhos:
+            # Dedup: o mesmo desenho pode estar em várias OPs — normaliza 1x.
+            tarefas: dict = {}
+            for item in ops_dados:
+                for nome, caminho, total_paginas in item["desenhos_resolvidos"]:
+                    for num_pag in range(1, total_paginas + 1):
+                        tarefas[(str(caminho), num_pag)] = (nome, caminho, num_pag)
+
+            total_tarefas = len(tarefas)
+            _etapa(
+                "NORMALIZANDO_DESENHOS",
+                f"Normalizando {total_tarefas} páginas de desenho ({dpi} DPI)...",
+            )
+
+            if total_tarefas:
+                feitas = 0
+                with ThreadPoolExecutor(
+                    max_workers=IMPRESSAO_OP_JOB_WORKERS_DESENHO
+                ) as pool:
+                    # Versao "arquivo": HIT nao le os bytes do JPEG a toa —
+                    # so confirma que o artefato existe no cache.
+                    futuros = {
+                        pool.submit(
+                            obter_arquivo_pagina_desenho_a4_cacheada,
+                            caminho, num_pag, dpi,
+                        ): (nome, caminho, num_pag)
+                        for (nome, caminho, num_pag) in tarefas.values()
+                    }
+                    for futuro in as_completed(futuros):
+                        nome, caminho, num_pag = futuros[futuro]
+                        feitas += 1
+                        try:
+                            futuro.result()
+                        except HTTPException as exc:
+                            falhas_normalizacao.add((str(caminho), num_pag))
+                            avisos.append(f"Desenho {nome} pág. {num_pag}: {exc.detail}")
+                        except Exception as exc:
+                            falhas_normalizacao.add((str(caminho), num_pag))
+                            avisos.append(f"Desenho {nome} pág. {num_pag}: {exc}")
+                        job["percentual"] = pct_consulta_fim + int(
+                            feitas * (pct_normaliza_fim - pct_consulta_fim) / total_tarefas
+                        )
+                        job["mensagem"] = (
+                            f"Normalizando desenhos {feitas} de {total_tarefas}"
+                        )
+
+        # ============================================================
+        # Etapa 3 — montagem do PDF (folhas de dados + páginas do cache)
+        # ============================================================
+        _etapa("MONTANDO_PDF", "Montando o PDF final...")
+        pct_montagem_ini = pct_normaliza_fim if incluir_desenhos else pct_consulta_fim
+        escritor = _PdfJobEscritor(doc)
+        total_validas = len(ops_dados)
+
+        for i, item in enumerate(ops_dados, start=1):
+            job["op_atual"] = item["contexto"]
+            _pdf_job_render_op(
+                escritor, item["dados"],
+                incluir_componentes=incluir_componentes,
+                incluir_operacoes=incluir_operacoes,
+                imprimir_observacoes=imprimir_observacoes,
+            )
+            if incluir_desenhos:
+                _pdf_job_inserir_desenhos(
+                    doc, item["desenhos_resolvidos"], avisos,
+                    item["contexto"], dpi, falhas_normalizacao,
+                )
+            job["percentual"] = pct_montagem_ini + int(
+                i * (pct_montagem_fim - pct_montagem_ini) / total_validas
+            )
+            job["mensagem"] = f"Montando PDF: OP {i} de {total_validas}"
+
+        if doc.page_count == 0:
+            raise RuntimeError(
+                "Nenhuma OP válida para gerar o PDF — todas foram descartadas "
+                f"({len(descartadas)} de {total}). Veja 'descartadas' no status."
+            )
+
+        # ============================================================
+        # Etapa 4 — gravação atômica do arquivo final
+        # ============================================================
+        _etapa("GRAVANDO_ARQUIVO", "Gravando arquivo final...")
+        job["op_atual"] = None
+        job["percentual"] = pct_montagem_fim
+        job["paginas_pdf"] = doc.page_count
+
+        # Grava em .tmp e renomeia — o download nunca enxerga PDF parcial.
+        arquivo_tmp = f"{arquivo_saida}.tmp"
+        doc.save(arquivo_tmp, deflate=True, garbage=3)
+        doc.close()
+        doc_fechado = True
+        os.replace(arquivo_tmp, arquivo_saida)
+        _fechar_etapa()
+    finally:
+        if not doc_fechado:
+            try:
+                doc.close()
+            except Exception:
+                pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def processar_job_impressao_op_pdf(job_id: str, payload: dict,
+                                   arquivo_saida: str, usuario: str):
+    """Orquestra o job em background: fila (semáforo), geração e status."""
+    job = IMPRESSAO_OP_JOBS.get(job_id)
+    if not job:
+        return
+
+    adquiriu = False
+    try:
+        # Fila interna — 1 job por vez. Status segue PENDENTE; a etapa
+        # mostra ao usuário que está aguardando outro job terminar.
+        job["etapa"] = "AGUARDANDO_FILA"
+        job["mensagem"] = "Aguardando a vez na fila de geração..."
+        _IMPRESSAO_OP_JOB_SEMAFORO.acquire()
+        adquiriu = True
+
+        job["status"] = "PROCESSANDO"
+        job["iniciado_em"] = datetime.now().isoformat()
+
+        dpi = _pdf_job_dpi(payload.get("qualidade"), payload.get("dpi"))
+        job["dpi"] = dpi
+
+        gerar_pdf_ops_com_desenhos(
+            ops=payload.get("ops") or [],
+            arquivo_saida=arquivo_saida,
+            incluir_desenhos=_pdf_job_flag(payload.get("incluir_desenhos"), True),
+            incluir_componentes=_pdf_job_flag(payload.get("incluir_componentes"), True),
+            incluir_operacoes=_pdf_job_flag(payload.get("incluir_operacoes"), True),
+            imprimir_observacoes=_pdf_job_flag(payload.get("imprimir_observacoes"), True),
+            cod_etg=payload.get("cod_etg"),
+            cod_cre=payload.get("cod_cre"),
+            job_id=job_id,
+            dpi=dpi,
+        )
+
+        try:
+            job["tamanho_bytes"] = Path(arquivo_saida).stat().st_size
+        except Exception:
+            job["tamanho_bytes"] = None
+
+        job["percentual"] = 100
+        job["op_atual"] = None
+        job["etapa"] = "CONCLUIDO"
+        job["mensagem"] = "PDF pronto para download."
+        job["status"] = "CONCLUIDO"
+        job["concluido_em"] = datetime.now().isoformat()
+
+    except Exception as exc:
+        job["status"] = "ERRO"
+        job["etapa"] = "ERRO"
+        job["erro"] = str(exc)
+        job["mensagem"] = f"Erro ao gerar o PDF: {exc}"
+        job["concluido_em"] = datetime.now().isoformat()
+        print("[ERRO JOB IMPRESSAO OP PDF]")
+        print(f"job_id={job_id}")
+        print(traceback.format_exc())
+    finally:
+        if adquiriu:
+            _IMPRESSAO_OP_JOB_SEMAFORO.release()
+
+
+def _consultar_cod_pro_op(conn, cod_emp: int, cod_ori: str, num_orp: int):
+    """Busca apenas o CodPro da OP — consulta leve para o aquecimento de
+    cache (não precisa de componentes/operações/observações).
+
+    Aplica as mesmas regras do MCAP700: origem 100 e canceladas ficam fora.
+    Retorna o código do produto ou None.
+    """
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT COP.CodPro
+        FROM E900COP COP
+        WHERE COP.CodEmp = ?
+          AND COP.CodOri = ?
+          AND COP.NumOrp = ?
+          AND COP.CodOri <> '100'
+          AND COP.SitOrp <> 'C'
+        """,
+        [cod_emp, cod_ori, num_orp],
+    )
+    row = cursor.fetchone()
+    if not row or row[0] is None:
+        return None
+    return str(row[0]).strip() or None
+
+
+def gerar_aquecimento_cache_desenhos(*, ops, job_id: str, dpi: Optional[int] = None):
+    """Job de AQUECIMENTO: normaliza os desenhos das OPs direto no cache,
+    SEM montar PDF. Depois disso, o "Gerar PDF" das mesmas OPs encontra
+    tudo como HIT na etapa de desenhos e fica muito mais rápido.
+
+    Etapas: BUSCANDO_OPS (0-40%) -> NORMALIZANDO_DESENHOS (40-99%).
+    OP inválida vira `descartadas`; desenho com problema vira `avisos`.
+    Ao final expõe cache_hits/cache_miss no status.
+    """
+    if fitz is None or Image is None:
+        raise RuntimeError(
+            "Pillow/pymupdf não instalados na API — aquecimento de cache indisponível."
+        )
+
+    dpi = _pdf_job_dpi(dpi=dpi)
+    job = IMPRESSAO_OP_JOBS.get(job_id) or {}
+    descartadas: list = []
+    avisos: list = []
+    total = len(ops)
+
+    job["descartadas"] = descartadas
+    job["avisos"] = avisos
+
+    tempos_etapas: dict = {}
+    job["tempos_etapas"] = tempos_etapas
+    cronometro = {"etapa": None, "inicio": 0.0}
+
+    def _fechar_etapa():
+        if cronometro["etapa"] is not None:
+            tempos_etapas[cronometro["etapa"]] = round(
+                _time_mod.perf_counter() - cronometro["inicio"], 1,
+            )
+
+    def _etapa(nome: str, mensagem: str):
+        _fechar_etapa()
+        cronometro["etapa"] = nome
+        cronometro["inicio"] = _time_mod.perf_counter()
+        job["etapa"] = nome
+        job["mensagem"] = mensagem
+
+    conn = get_connection()
+    try:
+        _etapa("BUSCANDO_OPS", f"Localizando desenhos de {total} OPs...")
+        tarefas: dict = {}
+
+        for idx, op in enumerate(ops, start=1):
+            cod_ori = str(op.get("cod_ori") or "").strip()
+            num_orp = op.get("num_orp")
+            cod_emp = int(op.get("cod_emp") or 1)
+            contexto = f"OP {cod_ori}/{num_orp}"
+            job["op_atual"] = contexto
+
+            cod_pro = None
+            if not cod_ori or not num_orp or cod_ori == "100":
+                descartadas.append({
+                    "cod_emp": cod_emp, "cod_ori": cod_ori, "num_orp": num_orp,
+                    "motivo": "OP inválida para aquecimento (origem/número)",
+                })
+            else:
+                try:
+                    cod_pro = _consultar_cod_pro_op(conn, cod_emp, cod_ori, int(num_orp))
+                except Exception as exc:
+                    descartadas.append({
+                        "cod_emp": cod_emp, "cod_ori": cod_ori, "num_orp": num_orp,
+                        "motivo": f"Erro ao consultar: {exc}",
+                    })
+                else:
+                    if not cod_pro:
+                        descartadas.append({
+                            "cod_emp": cod_emp, "cod_ori": cod_ori, "num_orp": num_orp,
+                            "motivo": "OP não encontrada ou cancelada",
+                        })
+
+            if cod_pro:
+                desenhos = localizar_desenhos_produto(cod_pro)
+                resolvidos = _pdf_job_resolver_desenhos(desenhos, avisos, contexto)
+                for nome, caminho, total_paginas in resolvidos:
+                    for num_pag in range(1, total_paginas + 1):
+                        tarefas[(str(caminho), num_pag)] = (nome, caminho, num_pag)
+
+            job["processadas"] = idx
+            job["percentual"] = int(idx * 40 / total) if total else 40
+            job["mensagem"] = f"Localizando desenhos da OP {idx} de {total}"
+
+        total_tarefas = len(tarefas)
+        job["total_desenhos"] = total_tarefas
+        _etapa(
+            "NORMALIZANDO_DESENHOS",
+            f"Normalizando {total_tarefas} páginas de desenho ({dpi} DPI)...",
+        )
+
+        hits = 0
+        miss = 0
+        if total_tarefas:
+            feitas = 0
+            with ThreadPoolExecutor(
+                max_workers=IMPRESSAO_OP_JOB_WORKERS_DESENHO
+            ) as pool:
+                futuros = {
+                    pool.submit(
+                        obter_arquivo_pagina_desenho_a4_cacheada,
+                        caminho, num_pag, dpi,
+                    ): (nome, caminho, num_pag)
+                    for (nome, caminho, num_pag) in tarefas.values()
+                }
+                for futuro in as_completed(futuros):
+                    nome, caminho, num_pag = futuros[futuro]
+                    feitas += 1
+                    try:
+                        _, _, origem = futuro.result()
+                        if origem == "HIT":
+                            hits += 1
+                        else:
+                            miss += 1
+                    except HTTPException as exc:
+                        avisos.append(f"Desenho {nome} pág. {num_pag}: {exc.detail}")
+                    except Exception as exc:
+                        avisos.append(f"Desenho {nome} pág. {num_pag}: {exc}")
+                    job["percentual"] = 40 + int(feitas * 59 / total_tarefas)
+                    job["mensagem"] = (
+                        f"Normalizando desenhos {feitas} de {total_tarefas}"
+                    )
+
+        job["cache_hits"] = hits
+        job["cache_miss"] = miss
+        job["op_atual"] = None
+        _fechar_etapa()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def processar_job_aquecimento_cache(job_id: str, payload: dict, usuario: str):
+    """Orquestra o job de aquecimento em background (mesma fila do PDF)."""
+    job = IMPRESSAO_OP_JOBS.get(job_id)
+    if not job:
+        return
+
+    adquiriu = False
+    try:
+        job["etapa"] = "AGUARDANDO_FILA"
+        job["mensagem"] = "Aguardando a vez na fila de geração..."
+        _IMPRESSAO_OP_JOB_SEMAFORO.acquire()
+        adquiriu = True
+
+        job["status"] = "PROCESSANDO"
+        job["iniciado_em"] = datetime.now().isoformat()
+
+        dpi = _pdf_job_dpi(payload.get("qualidade"), payload.get("dpi"))
+        job["dpi"] = dpi
+
+        gerar_aquecimento_cache_desenhos(
+            ops=payload.get("ops") or [],
+            job_id=job_id,
+            dpi=dpi,
+        )
+
+        job["percentual"] = 100
+        job["etapa"] = "CONCLUIDO"
+        job["mensagem"] = (
+            f"Cache pronto: {job.get('cache_miss') or 0} páginas normalizadas agora, "
+            f"{job.get('cache_hits') or 0} já estavam em cache."
+        )
+        job["status"] = "CONCLUIDO"
+        job["concluido_em"] = datetime.now().isoformat()
+
+    except Exception as exc:
+        job["status"] = "ERRO"
+        job["etapa"] = "ERRO"
+        job["erro"] = str(exc)
+        job["mensagem"] = f"Erro no aquecimento de cache: {exc}"
+        job["concluido_em"] = datetime.now().isoformat()
+        print("[ERRO JOB AQUECIMENTO CACHE A4]")
+        print(f"job_id={job_id}")
+        print(traceback.format_exc())
+    finally:
+        if adquiriu:
+            _IMPRESSAO_OP_JOB_SEMAFORO.release()
+
+
+def _limpar_jobs_impressao_op_antigos():
+    """Housekeeping: remove jobs finalizados além do TTL (memória + disco).
+
+    Também varre PDFs órfãos na pasta (sobras de execuções anteriores da
+    API, cujos jobs já não existem em memória). Best-effort — nunca
+    levanta exceção para o caller.
+    """
+    agora = datetime.now()
+    limite = agora - timedelta(hours=IMPRESSAO_OP_JOB_TTL_HORAS)
+
+    with _IMPRESSAO_OP_JOBS_LOCK:
+        for job_id in list(IMPRESSAO_OP_JOBS.keys()):
+            job = IMPRESSAO_OP_JOBS.get(job_id) or {}
+            if job.get("status") not in ("CONCLUIDO", "ERRO"):
+                continue
+            try:
+                criado_em = datetime.fromisoformat(str(job.get("criado_em")))
+            except Exception:
+                criado_em = agora
+            if criado_em >= limite:
+                continue
+            arquivo = job.get("arquivo")
+            IMPRESSAO_OP_JOBS.pop(job_id, None)
+            if arquivo:
+                try:
+                    Path(arquivo).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    try:
+        for arq in PASTA_JOBS_IMPRESSAO_OP.glob("imp-op-*.pdf"):
+            try:
+                if datetime.fromtimestamp(arq.stat().st_mtime) < limite:
+                    arq.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _job_impressao_op_publico(job: dict) -> dict:
+    """Visão do job para o front — sem o caminho físico do arquivo."""
+    publico = {k: v for k, v in job.items() if k != "arquivo"}
+    if job.get("status") == "CONCLUIDO":
+        publico["url_download"] = (
+            "/api/producao/ordem-producao/impressao/pdf-job/"
+            f"{job.get('job_id')}/download"
+        )
+    return publico
+
+
+@app.post("/api/producao/ordem-producao/impressao/pdf-job")
+def criar_job_impressao_op_pdf(
+    payload: _ImpressaoOPPdfJobPayload,
+    background_tasks: BackgroundTasks,
+    usuario=Depends(validar_token),
+):
+    """Cria o job de impressão em massa: 1 PDF único com N OPs + desenhos.
+
+    O front manda a lista de OPs selecionadas (sem limite de UI) e
+    acompanha via /status; o processamento pesado roda em segundo plano,
+    serializado por um semáforo interno (1 job por vez).
+    """
+    if fitz is None or Image is None:
+        faltando = []
+        if Image is None:
+            faltando.append("Pillow")
+        if fitz is None:
+            faltando.append("pymupdf")
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Impressão em massa indisponível — instale na API: "
+                + ", ".join(faltando)
+            ),
+        )
+
+    if not payload.ops:
+        raise HTTPException(status_code=422, detail="Nenhuma OP selecionada.")
+
+    if len(payload.ops) > IMPRESSAO_OP_JOB_MAX_OPS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Máximo de {IMPRESSAO_OP_JOB_MAX_OPS} OPs por job. "
+                "Divida a seleção em mais de um job."
+            ),
+        )
+
+    _limpar_jobs_impressao_op_antigos()
+    _limpar_cache_desenhos_a4_antigo()
+
+    try:
+        PASTA_JOBS_IMPRESSAO_OP.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Não foi possível criar a pasta de jobs ({PASTA_JOBS_IMPRESSAO_OP}): {exc}",
+        )
+
+    job_id = (
+        "imp-op-"
+        + datetime.now().strftime("%Y%m%d-%H%M%S-")
+        + uuid.uuid4().hex[:8]
+    )
+    arquivo_saida = PASTA_JOBS_IMPRESSAO_OP / f"{job_id}.pdf"
+
+    dpi_job = _pdf_job_dpi(payload.qualidade, payload.dpi)
+
+    with _IMPRESSAO_OP_JOBS_LOCK:
+        IMPRESSAO_OP_JOBS[job_id] = {
+            "job_id": job_id,
+            "tipo": "PDF",
+            "status": "PENDENTE",
+            "etapa": "PENDENTE",
+            "mensagem": "Job criado. Aguardando processamento...",
+            "total_ops": len(payload.ops),
+            "processadas": 0,
+            "percentual": 0,
+            "op_atual": None,
+            "qualidade": "normal" if dpi_job == DESENHO_A4_DPI_NORMAL else "alta",
+            "dpi": dpi_job,
+            "paginas_pdf": None,
+            "tamanho_bytes": None,
+            "descartadas": [],
+            "avisos": [],
+            "arquivo": str(arquivo_saida),
+            "erro": None,
+            "usuario": usuario,
+            "criado_em": datetime.now().isoformat(),
+            "iniciado_em": None,
+            "concluido_em": None,
+        }
+
+    background_tasks.add_task(
+        processar_job_impressao_op_pdf,
+        job_id,
+        payload.model_dump(),
+        str(arquivo_saida),
+        usuario,
+    )
+
+    return {
+        "job_id": job_id,
+        "tipo": "PDF",
+        "status": "PENDENTE",
+        "total_ops": len(payload.ops),
+        "dpi": dpi_job,
+        "mensagem": "Geração do PDF iniciada. Acompanhe pelo endpoint de status.",
+        "url_status": (
+            f"/api/producao/ordem-producao/impressao/pdf-job/{job_id}/status"
+        ),
+    }
+
+
+@app.post("/api/producao/ordem-producao/impressao/pdf-job/aquecer-cache")
+def criar_job_aquecimento_cache_desenhos(
+    payload: _ImpressaoOPPdfJobPayload,
+    background_tasks: BackgroundTasks,
+    usuario=Depends(validar_token),
+):
+    """Aquece o cache A4 dos desenhos das OPs selecionadas, SEM montar PDF.
+
+    Uso: botão "Preparar desenhos" no front, antes do "Gerar PDF" — a
+    primeira geração fica rápida porque os desenhos já estarão
+    normalizados em disco. Mesmo payload do /pdf-job (usa `ops` e
+    `qualidade`/`dpi`; as flags de conteúdo são ignoradas). Acompanhe
+    pelo MESMO endpoint de status; job de aquecimento não tem download.
+    """
+    if fitz is None or Image is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Aquecimento indisponível — instale Pillow e pymupdf na API.",
+        )
+
+    if not payload.ops:
+        raise HTTPException(status_code=422, detail="Nenhuma OP selecionada.")
+
+    if len(payload.ops) > IMPRESSAO_OP_JOB_MAX_OPS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Máximo de {IMPRESSAO_OP_JOB_MAX_OPS} OPs por job. "
+                "Divida a seleção em mais de um job."
+            ),
+        )
+
+    _limpar_jobs_impressao_op_antigos()
+    _limpar_cache_desenhos_a4_antigo()
+
+    job_id = (
+        "imp-op-"
+        + datetime.now().strftime("%Y%m%d-%H%M%S-")
+        + uuid.uuid4().hex[:8]
+    )
+    dpi_job = _pdf_job_dpi(payload.qualidade, payload.dpi)
+
+    with _IMPRESSAO_OP_JOBS_LOCK:
+        IMPRESSAO_OP_JOBS[job_id] = {
+            "job_id": job_id,
+            "tipo": "AQUECER_CACHE",
+            "status": "PENDENTE",
+            "etapa": "PENDENTE",
+            "mensagem": "Job criado. Aguardando processamento...",
+            "total_ops": len(payload.ops),
+            "processadas": 0,
+            "percentual": 0,
+            "op_atual": None,
+            "qualidade": (
+                "rapida" if dpi_job == DESENHO_A4_DPI_RAPIDO
+                else "normal" if dpi_job == DESENHO_A4_DPI_NORMAL
+                else "alta"
+            ),
+            "dpi": dpi_job,
+            "total_desenhos": None,
+            "cache_hits": None,
+            "cache_miss": None,
+            "descartadas": [],
+            "avisos": [],
+            "arquivo": None,
+            "erro": None,
+            "usuario": usuario,
+            "criado_em": datetime.now().isoformat(),
+            "iniciado_em": None,
+            "concluido_em": None,
+        }
+
+    background_tasks.add_task(
+        processar_job_aquecimento_cache,
+        job_id,
+        payload.model_dump(),
+        usuario,
+    )
+
+    return {
+        "job_id": job_id,
+        "tipo": "AQUECER_CACHE",
+        "status": "PENDENTE",
+        "total_ops": len(payload.ops),
+        "dpi": dpi_job,
+        "mensagem": "Aquecimento do cache iniciado. Acompanhe pelo endpoint de status.",
+        "url_status": (
+            f"/api/producao/ordem-producao/impressao/pdf-job/{job_id}/status"
+        ),
+    }
+
+
+@app.get("/api/producao/ordem-producao/impressao/pdf-job/{job_id}/status")
+def consultar_status_job_impressao_op_pdf(
+    job_id: str,
+    usuario=Depends(validar_token),
+):
+    """Status do job — o front consulta a cada ~3s enquanto PROCESSANDO."""
+    job = IMPRESSAO_OP_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Job de impressão não encontrado. Jobs expiram após "
+                f"{IMPRESSAO_OP_JOB_TTL_HORAS}h ou ao reiniciar a API."
+            ),
+        )
+    return _job_impressao_op_publico(job)
+
+
+@app.get("/api/producao/ordem-producao/impressao/pdf-job/{job_id}/download")
+def baixar_job_impressao_op_pdf(
+    job_id: str,
+    usuario=Depends(validar_token_download),
+):
+    """Download do PDF final. Aceita Bearer ou ?access_token= (window.open).
+
+    Se a API reiniciou depois do job concluir, o registro em memória some
+    mas o PDF continua no disco — neste caso o download ainda funciona
+    (job_id validado por regex antes de tocar o filesystem).
+    """
+    job = IMPRESSAO_OP_JOBS.get(job_id)
+
+    if job:
+        if job.get("tipo") == "AQUECER_CACHE":
+            raise HTTPException(
+                status_code=409,
+                detail="Job de aquecimento de cache não gera arquivo para download.",
+            )
+        if job.get("status") == "ERRO":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Job terminou com erro: {job.get('erro')}",
+            )
+        if job.get("status") != "CONCLUIDO":
+            raise HTTPException(
+                status_code=409,
+                detail="PDF ainda não está pronto para download.",
+            )
+        arquivo = job.get("arquivo")
+    else:
+        if not _PDF_JOB_ID_RE.match(job_id or ""):
+            raise HTTPException(status_code=404, detail="Job de impressão não encontrado.")
+        arquivo = str(PASTA_JOBS_IMPRESSAO_OP / f"{job_id}.pdf")
+
+    if not arquivo or not Path(arquivo).exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Arquivo PDF final não encontrado (job expirado ou removido).",
+        )
+
+    return FileResponse(
+        path=arquivo,
+        media_type="application/pdf",
+        filename=f"impressao_ops_{job_id}.pdf",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+# ============================================================
 # OPÇÕES PARA FILTROS DA IMPRESSÃO DE OP (autocomplete/combo)
 # ============================================================
 
@@ -17010,7 +19533,7 @@ def listar_opcoes_impressao_ordem_producao(
     cod_etg: Optional[str] = None,
     cod_cre: Optional[str] = None,
     q: Optional[str] = None,
-    limite_ops: Optional[str] = "80",
+    limite_ops: Optional[str] = "1000",
     usuario=Depends(validar_token),
 ):
     """
@@ -17040,8 +19563,8 @@ def listar_opcoes_impressao_ordem_producao(
     num_orp = _to_int_or_none(num_orp, "num_orp", default=None)
     num_ped = _to_int_or_none(num_ped, "num_ped", default=None)
     cod_etg = _to_int_or_none(cod_etg, "cod_etg", default=None)
-    limite_ops_int = _to_int_or_none(limite_ops, "limite_ops", default=80) or 80
-    limite_ops = max(1, min(limite_ops_int, 500))
+    limite_ops_int = _to_int_or_none(limite_ops, "limite_ops", default=1000) or 1000
+    limite_ops = max(1, min(limite_ops_int, 5000))
 
     if cod_ori is not None:
         cod_ori = str(cod_ori).strip() or None
@@ -30442,7 +32965,7 @@ def etl_listar_execucoes(
 #   - tabelas novas: etl_tarefas, etl_acoes, etl_acao_execucoes, bi_faturamento
 #   - colunas V2 adicionadas em etl_execucoes: tarefa_id, nome_tarefa,
 #     parametros (jsonb), finalizado_em, total_linhas, mensagem, erro
-#   - etl_logs reaproveitado (ordenação por data_hora, coluna já existente)
+#   - etl_logs reaproveitado (ordenação por created_at)
 # ============================================================
 
 # Alias de compatibilidade: o desenho V2 referencia _etl_log; o logger
@@ -30497,6 +33020,28 @@ def _sb_post(table: str, payload, prefer: str = "return=representation"):
             detail=f"Supabase POST {table}: {resp.status_code} {(resp.text or '')[:500]}",
         )
     return resp.json() if resp.text else []
+
+
+def _sb_upsert(table: str, rows: list, on_conflict: str):
+    """Upsert em massa no Supabase (POST + Prefer: resolution=merge-duplicates).
+    `on_conflict` = colunas da constraint UNIQUE (ex.: 'cd_conta_contabil,cd_centro_custos').
+    Reaproveita _supabase_headers (NÃO o redefine)."""
+    if not rows:
+        return {"success": True, "total": 0, "message": "Nada para sincronizar."}
+    _supabase_required()
+    resp = requests.post(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        params={"on_conflict": on_conflict},
+        json=rows,
+        headers=_supabase_headers("resolution=merge-duplicates,return=minimal"),
+        timeout=120,
+    )
+    if resp.status_code not in (200, 201, 204):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase UPSERT {table}: {resp.status_code} {(resp.text or '')[:500]}",
+        )
+    return {"success": True, "total": len(rows), "message": "Upsert concluído."}
 
 
 def _sb_patch(table: str, filters: dict, payload: dict,
@@ -30658,6 +33203,41 @@ def etl_tarefa_acoes(nome_tarefa: str, usuario=Depends(validar_token)):
     return {"tarefa": tarefa["nome_tarefa"], "dados": acoes}
 
 
+@app.get("/api/etl/tarefas/{nome_tarefa}/logs")
+def etl_tarefa_logs(
+    nome_tarefa: str,
+    limit: int = 20,
+    usuario=Depends(validar_token),
+):
+    """Últimas execuções da tarefa + ações/logs da execução mais recente.
+    Conveniência p/ a tela de Atualização (BI > Contabilidade)."""
+    tarefa = _etl_buscar_tarefa(nome_tarefa)
+    limit = max(1, min(int(limit or 20), 100))
+    execucoes = _sb_get("etl_execucoes", {
+        "select": "*",
+        "nome_tarefa": f"eq.{tarefa['nome_tarefa']}",
+        "order": "iniciado_em.desc",
+        "limit": str(limit),
+    })
+    ultima = execucoes[0] if execucoes else None
+    acoes, logs = [], []
+    if ultima and ultima.get("id"):
+        ex_id = ultima["id"]
+        acoes = _sb_get("etl_acao_execucoes", {
+            "select": "*", "execucao_id": f"eq.{ex_id}", "order": "ordem.asc",
+        })
+        logs = _sb_get("etl_logs", {
+            "select": "*", "execucao_id": f"eq.{ex_id}", "order": "created_at.asc",
+        })
+    return {
+        "tarefa": tarefa["nome_tarefa"],
+        "execucoes": execucoes,
+        "ultima_execucao": ultima,
+        "acoes": acoes,
+        "logs": logs,
+    }
+
+
 @app.get("/api/etl/execucoes/{execucao_id}/logs")
 def etl_execucao_logs(execucao_id: str, usuario=Depends(validar_token)):
     acoes = _sb_get("etl_acao_execucoes", {
@@ -30665,11 +33245,11 @@ def etl_execucao_logs(execucao_id: str, usuario=Depends(validar_token)):
         "execucao_id": f"eq.{execucao_id}",
         "order": "ordem.asc",
     })
-    # etl_logs reaproveitado do V1: coluna de tempo é data_hora.
+    # etl_logs reaproveitado do V1: coluna de tempo é created_at.
     logs = _sb_get("etl_logs", {
         "select": "*",
         "execucao_id": f"eq.{execucao_id}",
-        "order": "data_hora.asc",
+        "order": "created_at.asc",
     })
     return {"acoes": acoes, "logs": logs}
 
@@ -31353,6 +33933,12 @@ FROM   E440IPC
 """.strip()
 
 
+# Tamanho do bloco de INSERT na carga ETL. A RPC etl_carga_periodo com a tabela
+# inteira de uma vez estoura o limite do Cloudflare do Supabase (erro 520) em
+# cargas grandes (VM_LANC_CONTABIL ~27k linhas / ~73s). Blocos curtos resolvem.
+ETL_CARGA_CHUNK = int(os.getenv("ETL_CARGA_CHUNK", "5000"))
+
+
 def _acao_carga_sql(execucao_id, parametros: dict) -> dict:
     """Carga GENÉRICA ERP -> Supabase por PERÍODO (DELETE + INSERT), para
     qualquer ação SQL-based (VM_FATURAMENTO, VM_LANC_CONTABIL, VM_DRE, ...).
@@ -31426,16 +34012,30 @@ def _acao_carga_sql(execucao_id, parametros: dict) -> dict:
     # parcial/vazio. A RPC retorna {ok, inseridos, deletados}.
     # _apagar_periodo=False quando a tarefa já limpou o período (append).
     apagar = bool(parametros.get("_apagar_periodo", True))
-    resultado_rpc = _etl_normalizar_resultado_rpc_carga(_sb_rpc("etl_carga_periodo", {
-        "p_tabela": tabela,
-        "p_coluna_periodo": col_periodo,
-        "p_ini": p_ini,
-        "p_fim": p_fim,
-        "p_rows": dados,
-        "p_apagar": apagar,
-    }))
-    inseridos = int(resultado_rpc.get("inseridos") or 0)
-    deletados = int(resultado_rpc.get("deletados") or 0)
+    # Carga em BLOCOS: um único INSERT com a tabela inteira estoura o limite do
+    # Cloudflare do Supabase (520) em cargas grandes. Cada bloco é uma transação
+    # curta. Só o 1º bloco apaga o período; os demais fazem append (mantém o
+    # mesmo resultado: período substituído). Se uma reexecução acontecer, o 1º
+    # bloco apaga de novo — idempotente por período.
+    blocos = [dados[i:i + ETL_CARGA_CHUNK]
+              for i in range(0, len(dados), ETL_CARGA_CHUNK)] or [[]]
+    inseridos = 0
+    deletados = 0
+    for idx_bloco, bloco in enumerate(blocos):
+        resultado_rpc = _etl_normalizar_resultado_rpc_carga(_sb_rpc("etl_carga_periodo", {
+            "p_tabela": tabela,
+            "p_coluna_periodo": col_periodo,
+            "p_ini": p_ini,
+            "p_fim": p_fim,
+            "p_rows": bloco,
+            "p_apagar": apagar and idx_bloco == 0,
+        }))
+        inseridos += int(resultado_rpc.get("inseridos") or 0)
+        deletados += int(resultado_rpc.get("deletados") or 0)
+        if len(blocos) > 1:
+            _etl_log(execucao_id,
+                     f"Carga {tabela} bloco {idx_bloco + 1}/{len(blocos)} "
+                     f"({len(bloco)} linhas) OK; inseridos acumulados={inseridos}", "INFO")
     _etl_log(execucao_id,
              f"Carga transacional {tabela} {col_periodo} {p_ini}..{p_fim}: "
              f"inseridos={inseridos}, deletados={deletados}", "INFO")
@@ -32587,6 +35187,43 @@ def etl_testar_sql_acao(
         raise HTTPException(status_code=500, detail=f"Erro ao testar SQL: {exc}")
 
 
+class EtlComandoSqlPayload(BaseModel):
+    comando_sql: str
+
+
+@app.patch("/api/etl/acoes/{acao_ref}/comando-sql")
+def etl_salvar_comando_sql(
+    acao_ref: str,
+    body: EtlComandoSqlPayload,
+    usuario=Depends(validar_token),
+):
+    """Salva o comando_sql da ação (SQL editado no Lovable). Valida SELECT/WITH
+    (mesma regra do /testar-sql) antes de gravar. Aceita ponteiro STATIC:<TEMPLATE>.
+    O frontend pode salvar direto no Supabase; este endpoint dá a validação."""
+    acao = _etl_buscar_acao_ref(acao_ref)
+    acao_id = acao.get("id")
+    if acao_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Ação sem id no Supabase; não é possível salvar o comando_sql.",
+        )
+    novo_sql = str(body.comando_sql or "").strip()
+    if not novo_sql:
+        raise HTTPException(status_code=400, detail="comando_sql vazio.")
+    if not novo_sql.upper().startswith("STATIC:"):
+        _etl_validar_select(novo_sql)
+    _sb_patch("etl_acoes", {"id": f"eq.{acao_id}"}, {"comando_sql": novo_sql})
+    placeholders = sorted(set(ETL_PLACEHOLDER_RE.findall(novo_sql)))
+    return {
+        "id": acao_id,
+        "codigo_acao": acao.get("codigo_acao"),
+        "nome": acao.get("nome"),
+        "comando_sql": novo_sql,
+        "placeholders": placeholders,
+        "mensagem": "comando_sql atualizado com sucesso.",
+    }
+
+
 @app.get("/api/etl/acoes/{acao_ref}/comando-sql")
 def etl_obter_comando_sql(
     acao_ref: str,
@@ -33307,18 +35944,24 @@ def _bi_comercial_dim(dimensao, f: "ComercialFiltros"):
     return _bi_dim_enriquecer(dimensao, rows)
 
 
-def _bi_meta_periodo(anomes_ini, anomes_fim, unidade=None) -> float:
+def _bi_meta_periodo(anomes_ini, anomes_fim, unidade=None, anomes_emissao=None) -> float:
     """SUM(vl_meta) de bi_meta_faturamento no período (e unidade, se filtrada).
     A meta tem granularidade (anomes_emissao, unidade_negocio). Padronizado em
-    'anomes_emissao' (coluna real da tabela; 'anomes' não existe)."""
-    ai = re.sub(r"\D", "", str(anomes_ini or ""))[:6]
-    af = re.sub(r"\D", "", str(anomes_fim or ""))[:6]
-    if len(ai) != 6 or len(af) != 6:
-        return 0.0
+    'anomes_emissao' (coluna real da tabela; 'anomes' não existe).
+    Se anomes_emissao (mês único) for informado, a meta acompanha o MESMO mês
+    do realizado (ex.: clicou Maio -> meta de Maio, não do período inteiro)."""
+    mes = re.sub(r"\D", "", str(anomes_emissao or ""))[:6]
     u = str(unidade or "").strip().upper()
-    params = [("select", "vl_meta"),
-              ("anomes_emissao", f"gte.{ai}"), ("anomes_emissao", f"lte.{af}"),
-              ("ativo", "eq.true")]
+    params = [("select", "vl_meta"), ("ativo", "eq.true")]
+    if len(mes) == 6:
+        params.append(("anomes_emissao", f"eq.{mes}"))
+    else:
+        ai = re.sub(r"\D", "", str(anomes_ini or ""))[:6]
+        af = re.sub(r"\D", "", str(anomes_fim or ""))[:6]
+        if len(ai) != 6 or len(af) != 6:
+            return 0.0
+        params.append(("anomes_emissao", f"gte.{ai}"))
+        params.append(("anomes_emissao", f"lte.{af}"))
     if u and u != "CONSOLIDADO":
         params.append(("unidade_negocio", f"eq.{u}"))
     try:
@@ -33335,6 +35978,35 @@ def _bi_meta_periodo(anomes_ini, anomes_fim, unidade=None) -> float:
         return 0.0
 
 
+def _bi_meta_por_mes(anomes_ini, anomes_fim, unidade=None) -> dict:
+    """{anomes_emissao: SUM(vl_meta)} no período/unidade (bi_meta_faturamento).
+    Usado p/ casar a meta por mês com o realizado mês a mês (gráficos x meta)."""
+    ai = re.sub(r"\D", "", str(anomes_ini or ""))[:6]
+    af = re.sub(r"\D", "", str(anomes_fim or ""))[:6]
+    if len(ai) != 6 or len(af) != 6:
+        return {}
+    u = str(unidade or "").strip().upper()
+    params = [("select", "anomes_emissao,vl_meta"),
+              ("anomes_emissao", f"gte.{ai}"), ("anomes_emissao", f"lte.{af}"),
+              ("ativo", "eq.true")]
+    if u and u != "CONSOLIDADO":
+        params.append(("unidade_negocio", f"eq.{u}"))
+    out = {}
+    try:
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/bi_meta_faturamento",
+            params=params, headers=_supabase_headers("return=representation"), timeout=20)
+        if resp.status_code not in (200, 206):
+            return {}
+        for r in (resp.json() or []):
+            k = re.sub(r"\D", "", str(r.get("anomes_emissao") or ""))[:6]
+            if k:
+                out[k] = out.get(k, 0.0) + float(r.get("vl_meta") or 0)
+    except Exception as exc:  # noqa
+        print(f"[BI] meta por mês falhou: {exc}")
+    return out
+
+
 def _bi_num(v) -> float:
     try:
         return float(v or 0)
@@ -33347,10 +36019,11 @@ def _bi_kpis_aplicar_meta(data: dict, args: dict) -> dict:
     Regra: a meta vem EXCLUSIVAMENTE de bi_meta_faturamento (orçamento
     V_FATURAMENTO_META), no mesmo período/unidade. NUNCA aceita a meta da RPC
     (era o que deixava os R$ 30 mi errados passarem). Recalcula diferença e
-    percentual SEMPRE, sobre o Fat. Líquido."""
+    percentual SEMPRE sobre o Fat. BRUTO (regra "Faturamento x Meta" da
+    UpQuery); o líquido fica em campos *_liquido separados."""
     meta = _bi_meta_periodo(
         args.get("p_anomes_ini"), args.get("p_anomes_fim"),
-        args.get("p_unidade_negocio"))
+        args.get("p_unidade_negocio"), args.get("p_anomes_emissao"))
 
     fat_bruto = _bi_num(
         data.get("faturamento") or data.get("faturamento_bruto")
@@ -33359,30 +36032,51 @@ def _bi_kpis_aplicar_meta(data: dict, args: dict) -> dict:
         data.get("faturamento_liquido") or data.get("fat_liquido")
         or data.get("vl_realizado") or data.get("realizado") or fat_bruto)
 
-    # Líquido (Resumo Faturamento): diferença e % oficiais.
-    diferenca = round(fat_liquido - meta, 2)
-    percentual = round((fat_liquido / meta) * 100, 2) if meta > 0 else 0.0
-    # Bruto (gauge de atingimento): % e diferença sobre o faturamento bruto.
-    diferenca_bruto = round(fat_bruto - meta, 2)
-    percentual_bruto = round((fat_bruto / meta) * 100, 2) if meta > 0 else 0.0
+    # REGRA "Faturamento x Meta" = BRUTO (padrão UpQuery). Líquido vai separado.
+    diferenca = round(fat_bruto - meta, 2)
+    percentual = round((fat_bruto / meta) * 100, 2) if meta > 0 else 0.0
+    diferenca_liquido = round(fat_liquido - meta, 2)
+    percentual_liquido = round((fat_liquido / meta) * 100, 2) if meta > 0 else 0.0
 
     data["faturamento"] = round(fat_bruto, 2)
     data["faturamento_bruto"] = round(fat_bruto, 2)
     data["fat_bruto"] = round(fat_bruto, 2)
     data["faturamento_liquido"] = round(fat_liquido, 2)
     data["fat_liquido"] = round(fat_liquido, 2)
-    data["realizado"] = round(fat_liquido, 2)
     data["meta"] = round(meta, 2)
     data["vl_meta"] = round(meta, 2)
+
+    # Campo PRINCIPAL do card Faturamento x Meta = BRUTO.
+    data["realizado"] = round(fat_bruto, 2)
     data["diferenca"] = diferenca
     data["vl_diferenca"] = diferenca
     data["atingimento_pct"] = percentual
     data["percentual_atingimento"] = percentual
     data["percentual_meta"] = percentual
-    # Variantes BRUTO (gauge usa direto, sem recalcular no front).
-    data["diferenca_bruto"] = diferenca_bruto
-    data["atingimento_pct_bruto"] = percentual_bruto
-    data["percentual_atingimento_bruto"] = percentual_bruto
+    # Aliases _bruto (= principal) p/ quem consome o nome explícito.
+    data["diferenca_bruto"] = diferenca
+    data["atingimento_pct_bruto"] = percentual
+    data["percentual_atingimento_bruto"] = percentual
+
+    # Análise LÍQUIDA — card/aba SEPARADA, nunca o principal.
+    data["realizado_liquido"] = round(fat_liquido, 2)
+    data["diferenca_liquido"] = diferenca_liquido
+    data["atingimento_pct_liquido"] = percentual_liquido
+    data["percentual_atingimento_liquido"] = percentual_liquido
+
+    # Aliases agrupados prontos p/ os cards (front só lê, não recalcula).
+    data["card_faturamento"] = {            # PRINCIPAL = bruto x meta
+        "realizado": round(fat_bruto, 2), "meta": round(meta, 2),
+        "diferenca": diferenca, "percentual": percentual,
+    }
+    data["card_faturamento_bruto"] = {
+        "realizado": round(fat_bruto, 2), "meta": round(meta, 2),
+        "diferenca": diferenca, "percentual": percentual,
+    }
+    data["card_faturamento_liquido"] = {    # análise separada
+        "realizado": round(fat_liquido, 2), "meta": round(meta, 2),
+        "diferenca": diferenca_liquido, "percentual": percentual_liquido,
+    }
     return data
 
 
@@ -34080,6 +36774,20 @@ def _fmt_anomes(am) -> str:
         if 1 <= mes <= 12:
             return f"{_MESES_ABBR[mes]}/{s[:4]}"
     return s
+
+
+_MESES_EXTENSO = ["", "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
+                  "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]
+
+
+def _bi_rotulo_anomes(anomes) -> str:
+    """'202605' -> 'Maio' (nome do mês por extenso; devolve original se inválido)."""
+    a = re.sub(r"\D", "", str(anomes or ""))[:6]
+    if len(a) == 6:
+        mes = int(a[4:6]) if a[4:6].isdigit() else 0
+        if 1 <= mes <= 12:
+            return _MESES_EXTENSO[mes]
+    return str(anomes or "")
 
 
 def _drill_breadcrumb(unidade, ctx, drill):
@@ -34830,18 +37538,38 @@ def bi_comercial_ia_grafico(body: IaGraficoPayload, usuario=Depends(validar_toke
     args_base = _bi_comercial_args(body.anomes_ini, body.anomes_fim, uni, **extra)
 
     # Branch META x REALIZADO por mês (RPC dedicada bi_comercial_mensal).
+    # Cada série carrega o FILTRO TÉCNICO (anomes_emissao) p/ o clique drillar
+    # por código (202605), nunca pelo label visual ("Maio").
     if comparar_meta:
         rows_m = _bi_unwrap_rpc(
             _sb_rpc("bi_comercial_mensal", args_base),
             "bi_comercial_mensal") or []
-        series_m = [{"label": str(r.get("chave") or r.get("rotulo") or ""),
-                     "valor": float(r.get("vl_bruto") or 0),
-                     "meta": float(r.get("vl_meta") or 0),
-                     "percentual_meta": float(r.get("percentual_meta") or 0)}
-                    for r in rows_m]
+        series_m = []
+        for r in rows_m:
+            chave = re.sub(r"\D", "", str(
+                r.get("chave") or r.get("anomes_emissao") or r.get("anomes") or ""))[:6]
+            rotulo = (str(r.get("rotulo") or "").strip()
+                      or _bi_rotulo_anomes(chave) or chave)
+            # PRINCIPAL = BRUTO (regra Faturamento x Meta). Líquido vai separado.
+            bruto = float(r.get("vl_bruto") or r.get("faturamento") or r.get("valor") or 0)
+            liquido = float(r.get("vl_liquido") or r.get("fat_liquido") or 0)
+            meta_m = float(r.get("vl_meta") or r.get("meta") or 0)
+            series_m.append({
+                "chave": chave,
+                "label": rotulo,
+                "anomes_emissao": chave,
+                "valor": bruto,
+                "realizado": bruto,
+                "valor_liquido": liquido,
+                "realizado_liquido": liquido,
+                "meta": meta_m,
+                "diferenca": round(bruto - meta_m, 2),
+                "percentual_meta": round(bruto / meta_m * 100, 2) if meta_m > 0 else 0.0,
+                "filtros_drill": {"anomes_emissao": chave} if chave else {},
+            })
         return {
             "titulo": f"Realizado x Meta {('da ' + uni) if uni else '(Consolidado)'} por Mês",
-            "subtitulo": "Faturamento x Meta", "tipo_grafico": "line",
+            "subtitulo": "Faturamento x Meta", "tipo_grafico": "bar",
             "metrica": "faturamento", "dimensao": "mensal", "unidade_negocio": uni,
             "comparativo": "meta", "serie_temporal": True,
             "total": round(sum(s["valor"] for s in series_m), 2),
@@ -34969,7 +37697,12 @@ class TecnicoFiltros:
 @app.get("/api/bi/tecnico/kpis")
 def bi_tecnico_kpis(f: TecnicoFiltros = Depends(), usuario=Depends(validar_token)):
     data = _bi_unwrap_rpc(_sb_rpc("bi_tecnico_kpis", f.args), "bi_tecnico_kpis")
-    return data or dict(_BI_TECNICO_KPIS_ZERO)
+    data = data or dict(_BI_TECNICO_KPIS_ZERO)
+    # Mesma meta/cards do comercial (meta vem de bi_meta_faturamento, período/
+    # unidade). Obs.: o realizado técnico inclui TODAS as fontes (conciliação).
+    if isinstance(data, dict):
+        _bi_kpis_aplicar_meta(data, f.args)
+    return data
 
 
 @app.get("/api/bi/tecnico/dimensao")
@@ -35017,6 +37750,7 @@ def bi_tecnico_ia_grafico(body: IaGraficoPayload, usuario=Depends(validar_token)
             "mostrar_percentual": True if body.mostrar_percentual is None
                                   else body.mostrar_percentual,
             "limite": body.limite, "ordem": body.ordem,
+            "comparar_meta": body.comparar_meta,
             "incluir_outros": body.incluir_outros, "fonte_interpretacao": "config",
         }
 
@@ -35042,23 +37776,84 @@ def bi_tecnico_ia_grafico(body: IaGraficoPayload, usuario=Depends(validar_token)
     if limite:
         limite = max(1, min(limite, 100))
     incluir_outros = bool(intent.get("incluir_outros"))
+    comparar_meta = bool(intent.get("comparar_meta"))
 
     _drill = ("anomes_emissao", "cd_estado", "cd_cliente", "cd_prj", "cd_rev_pedido",
               "cd_origem", "cd_tp_movimento", "cd_tns", "cd_nf")
     extra = {k: (body.filtros or {}).get(k) for k in _drill
              if (body.filtros or {}).get(k) not in (None, "")}
     args_base = _bi_tecnico_args(body.anomes_ini, body.anomes_fim, uni, fonte, **extra)
+
+    # Branch META x REALIZADO por mês (conciliação = todas as fontes).
+    # PRINCIPAL = BRUTO; líquido separado; meta vem de bi_meta_faturamento.
+    if comparar_meta:
+        rows_m = _bi_unwrap_rpc(
+            _sb_rpc("bi_tecnico_dimensao", {"p_dimensao": "mensal", **args_base}),
+            "bi_tecnico_dimensao") or []
+        metas = _bi_meta_por_mes(body.anomes_ini, body.anomes_fim, uni)
+        series_m = []
+        for r in rows_m:
+            chave = re.sub(r"\D", "", str(r.get("chave") or r.get("anomes_emissao")
+                           or r.get("dimensao") or r.get("label") or ""))[:6]
+            rotulo = (str(r.get("rotulo") or "").strip()
+                      or _bi_rotulo_anomes(chave) or chave)
+            bruto = float(r.get("vl_bruto") or r.get("faturamento") or 0)
+            liquido = float(r.get("vl_liquido") or r.get("faturamento_liquido")
+                            or r.get("fat_liquido") or 0)
+            meta_m = float(metas.get(chave) or 0)
+            series_m.append({
+                "chave": chave, "label": rotulo, "anomes_emissao": chave,
+                "valor": bruto, "realizado": bruto,
+                "valor_liquido": liquido, "realizado_liquido": liquido,
+                "meta": meta_m, "diferenca": round(bruto - meta_m, 2),
+                "percentual_meta": round(bruto / meta_m * 100, 2) if meta_m > 0 else 0.0,
+                "filtros_drill": {"anomes_emissao": chave} if chave else {},
+            })
+        return {
+            "titulo": f"Realizado x Meta {('da ' + uni) if uni else '(Todas as unidades)'} "
+                      "por Mês (Conciliação)",
+            "subtitulo": "Faturamento x Meta (todas as fontes)", "tipo_grafico": "bar",
+            "metrica": "faturamento", "dimensao": "mensal", "unidade_negocio": uni,
+            "comparativo": "meta", "serie_temporal": True,
+            "total": round(sum(s["valor"] for s in series_m), 2),
+            "total_meta": round(sum(s["meta"] for s in series_m), 2),
+            "series": series_m, "interpretacao": intent,
+        }
+
     rows = _bi_unwrap_rpc(
         _sb_rpc("bi_tecnico_dimensao", {"p_dimensao": dim, **args_base}),
         "bi_tecnico_dimensao") or []
 
+    # Coluna técnica do filtro por dimensão (p/ filtros_drill do clique).
+    _ia_drill_tec = {
+        "mensal": "anomes_emissao", "estado": "cd_estado", "cliente": "cd_cliente",
+        "revenda": "cd_rev_pedido", "obras": "cd_prj", "mix": "cd_origem",
+        "origem": "cd_origem", "tns": "cd_tns", "fonte": "fonte_acao",
+        "movimento": "cd_tp_movimento", "tipo_movimento": "cd_tp_movimento",
+        "unidade": "unidade_negocio",
+    }
+    tech_col = _ia_drill_tec.get(dim, "fonte_acao")
     series = []
     for r in rows:
-        chave = str(r.get("chave") or "")
+        chave = str(r.get("chave") or r.get("dimensao") or r.get("label") or "").strip()
         if grupos and chave.upper() not in grupos:
             continue
-        series.append({"label": str(r.get("rotulo") or chave),
-                       "valor": float(r.get(met_col) or 0)})
+        valor = float(r.get(met_col) or r.get("valor") or 0)
+        if dim == "mensal":
+            cod = re.sub(r"\D", "", chave)[:6] or chave
+            label = (str(r.get("rotulo") or "").strip() or _bi_rotulo_anomes(cod) or cod)
+            series.append({
+                "chave": cod, "label": label, "display_label": label,
+                "anomes_emissao": cod, "valor": valor,
+                "filtros_drill": {tech_col: cod} if cod else {},
+            })
+        else:
+            label = str(r.get("rotulo") or chave)
+            series.append({
+                "chave": chave, "label": label, "display_label": label,
+                "valor": valor,
+                "filtros_drill": {tech_col: chave} if chave else {},
+            })
     total = round(sum(s["valor"] for s in series), 2)
     if perc:
         for s in series:
@@ -46081,6 +48876,2082 @@ def listar_bi_taux(
         "limit": limit,
         "offset": offset,
         "dados": rows,
+    }
+
+
+# ============================================================
+# BI - CONTABILIDADE / ATU_CONTABILIDADE
+# ERP Senior SQL Server -> FastAPI -> Supabase
+# Ordem:
+# 1  VM_ORC_DRE
+# 2  VM_LANC_CONTABIL
+# 3  ETL_V_BALANCO_PATRIMONIAL
+# 99 ATU_CONTABILIDADE
+# ============================================================
+
+class BiContabilidadeSyncPayload(BaseModel):
+    anomes_ini: str
+    anomes_fim: Optional[str] = None
+    acoes: Optional[List[str]] = None
+    acionado_por: Optional[str] = "MANUAL"
+
+
+BI_CONTABILIDADE_MAP = {
+    "VM_ORC_DRE": {
+        "ordem": 1,
+        "supabase": "bi_vm_orc_dre",
+        "sql_file": "01_VM_ORC_DRE.sql",
+        "period_col": "anomes_referente",
+    },
+    "VM_LANC_CONTABIL": {
+        "ordem": 2,
+        "supabase": "bi_vm_lanc_contabil",
+        "sql_file": "02_VM_LANC_CONTABIL.sql",
+        "period_col": "anomes_referente",
+    },
+    "ETL_V_BALANCO_PATRIMONIAL": {
+        "ordem": 3,
+        "supabase": "bi_etl_v_balanco_patrimonial",
+        "sql_file": "03_ETL_V_BALANCO_PATRIMONIAL.sql",
+        "period_col": "anomes_referente",
+    },
+    "ATU_CONTABILIDADE": {
+        "ordem": 99,
+        "supabase": None,
+        "sql_file": None,
+        "period_col": None,
+    },
+}
+
+
+def _bi_contab_normalizar_anomes(valor: Optional[str], fallback: Optional[str] = None) -> str:
+    v = str(valor or fallback or "").strip()
+    if not re.fullmatch(r"\d{6}", v):
+        raise HTTPException(
+            status_code=422,
+            detail="Informe ANOMES no formato YYYYMM. Exemplo: 202606.",
+        )
+    mes = int(v[4:6])
+    if mes < 1 or mes > 12:
+        raise HTTPException(
+            status_code=422,
+            detail="Mês inválido no ANOMES. Use formato YYYYMM.",
+        )
+    return v
+
+
+def _bi_contab_sql_path(nome_arquivo: str) -> str:
+    return os.path.join(_BASE_DIR, "sql", "contabilidade", nome_arquivo)
+
+
+def _bi_contab_ler_sql(nome_arquivo: str) -> str:
+    caminho = _bi_contab_sql_path(nome_arquivo)
+    if not os.path.exists(caminho):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Arquivo SQL não encontrado: {caminho}",
+        )
+    with open(caminho, "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _bi_contab_preparar_sql(sql: str, anomes_ini: str, anomes_fim: str):
+    params = []
+
+    def repl(match):
+        nome = match.group(1).upper()
+        if nome == "ANOMES_INI":
+            params.append(anomes_ini)
+        elif nome == "ANOMES_FIM":
+            params.append(anomes_fim)
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Parâmetro SQL não suportado: {nome}",
+            )
+        return "?"
+
+    sql_param = re.sub(r"\$\[(ANOMES_INI|ANOMES_FIM)\]", repl, sql)
+    return sql_param, params
+
+
+def _bi_contab_json_value(valor):
+    if valor is None:
+        return None
+    if isinstance(valor, Decimal):
+        return float(valor)
+    if isinstance(valor, (datetime, date)):
+        return valor.isoformat()
+    if isinstance(valor, str):
+        return valor.strip()
+    return valor
+
+
+def _bi_contab_sqlserver_rows(sql_raw: str, anomes_ini: str, anomes_fim: str) -> List[dict]:
+    sql, params = _bi_contab_preparar_sql(sql_raw, anomes_ini, anomes_fim)
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(sql, params)
+        cols = [c[0].lower() for c in cursor.description]
+        rows = []
+        for row in cursor.fetchall():
+            rows.append({
+                cols[i]: _bi_contab_json_value(row[i])
+                for i in range(len(cols))
+            })
+        return rows
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _bi_contab_chunks(lista: list, tamanho: int = 500):
+    for i in range(0, len(lista), tamanho):
+        yield lista[i:i + tamanho]
+
+
+def _bi_sb_headers(prefer: Optional[str] = None) -> dict:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="Supabase não configurado. Defina SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY.",
+        )
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+
+def _bi_sb_delete_periodo(table: str, period_col: str, anomes_ini: str, anomes_fim: str):
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    params = [
+        (period_col, f"gte.{anomes_ini}"),
+        (period_col, f"lte.{anomes_fim}"),
+    ]
+    resp = requests.delete(
+        url,
+        headers=_bi_sb_headers(),
+        params=params,
+        timeout=120,
+    )
+    if resp.status_code not in (200, 204):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao limpar {table}: {resp.status_code} - {resp.text}",
+        )
+
+
+def _bi_sb_insert(table: str, rows: List[dict]) -> int:
+    if not rows:
+        return 0
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    inseridas = 0
+    for bloco in _bi_contab_chunks(rows, 500):
+        resp = requests.post(
+            url,
+            headers=_bi_sb_headers("return=minimal"),
+            data=json.dumps(bloco, ensure_ascii=False),
+            timeout=180,
+        )
+        if resp.status_code not in (200, 201, 204):
+            raise HTTPException(
+                status_code=500,
+                detail=f"Erro ao inserir em {table}: {resp.status_code} - {resp.text}",
+            )
+        inseridas += len(bloco)
+    return inseridas
+
+
+def _bi_sb_post_log(payload: dict) -> Optional[str]:
+    url = f"{SUPABASE_URL}/rest/v1/bi_contab_sync_log"
+    resp = requests.post(
+        url,
+        headers=_bi_sb_headers("return=representation"),
+        data=json.dumps(payload, ensure_ascii=False),
+        timeout=60,
+    )
+    if resp.status_code not in (200, 201):
+        print(f"[BI_CONTAB_LOG] Erro ao inserir log: {resp.status_code} - {resp.text}")
+        return None
+    try:
+        data = resp.json()
+        if isinstance(data, list) and data:
+            return data[0].get("id")
+    except Exception:
+        pass
+    return None
+
+
+def _bi_sb_patch_log(log_id: Optional[str], payload: dict):
+    if not log_id:
+        return
+    url = f"{SUPABASE_URL}/rest/v1/bi_contab_sync_log"
+    params = {"id": f"eq.{log_id}"}
+    resp = requests.patch(
+        url,
+        headers=_bi_sb_headers(),
+        params=params,
+        data=json.dumps(payload, ensure_ascii=False),
+        timeout=60,
+    )
+    if resp.status_code not in (200, 204):
+        print(f"[BI_CONTAB_LOG] Erro ao atualizar log: {resp.status_code} - {resp.text}")
+
+
+def _bi_sb_get_count(table: str, anomes_ini: Optional[str] = None, anomes_fim: Optional[str] = None):
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    params = [("select", "id")]
+    if anomes_ini and anomes_fim:
+        params.append(("anomes_referente", f"gte.{anomes_ini}"))
+        params.append(("anomes_referente", f"lte.{anomes_fim}"))
+    headers = _bi_sb_headers("count=exact")
+    headers["Range"] = "0-0"
+    resp = requests.get(
+        url,
+        headers=headers,
+        params=params,
+        timeout=60,
+    )
+    if resp.status_code not in (200, 206):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao contar {table}: {resp.status_code} - {resp.text}",
+        )
+    content_range = resp.headers.get("Content-Range", "")
+    if "/" in content_range:
+        try:
+            return int(content_range.split("/")[-1])
+        except Exception:
+            return 0
+    return 0
+
+
+@app.post("/api/bi/contabilidade/sync")
+def sincronizar_bi_contabilidade(
+    payload: BiContabilidadeSyncPayload,
+    usuario=Depends(validar_token_ou_cron_secret),
+):
+    anomes_ini = _bi_contab_normalizar_anomes(payload.anomes_ini)
+    anomes_fim = _bi_contab_normalizar_anomes(payload.anomes_fim, anomes_ini)
+    if int(anomes_fim) < int(anomes_ini):
+        raise HTTPException(
+            status_code=422,
+            detail="ANOMES_FIM não pode ser menor que ANOMES_INI.",
+        )
+    acoes_req = payload.acoes or [
+        "VM_ORC_DRE",
+        "VM_LANC_CONTABIL",
+        "ETL_V_BALANCO_PATRIMONIAL",
+        "ATU_CONTABILIDADE",
+    ]
+    acoes_norm = []
+    for acao in acoes_req:
+        nome = str(acao or "").strip().upper()
+        if nome not in BI_CONTABILIDADE_MAP:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Ação não mapeada em ATU_CONTABILIDADE: {nome}",
+            )
+        acoes_norm.append(nome)
+    acoes_norm = sorted(
+        acoes_norm,
+        key=lambda x: BI_CONTABILIDADE_MAP[x]["ordem"],
+    )
+    resultado = []
+    for nome_acao in acoes_norm:
+        cfg = BI_CONTABILIDADE_MAP[nome_acao]
+        log_id = _bi_sb_post_log({
+            "nome_tarefa": "ATU_CONTABILIDADE",
+            "nome_acao": nome_acao,
+            "tabela_supabase": cfg.get("supabase"),
+            "ordem": cfg.get("ordem"),
+            "anomes_ini": anomes_ini,
+            "anomes_fim": anomes_fim,
+            "status": "INICIADO",
+            "acionado_por": str(payload.acionado_por or usuario or "MANUAL"),
+        })
+        try:
+            if nome_acao == "ATU_CONTABILIDADE":
+                qtd_orc = _bi_sb_get_count("bi_vm_orc_dre", anomes_ini, anomes_fim)
+                qtd_lanc = _bi_sb_get_count("bi_vm_lanc_contabil", anomes_ini, anomes_fim)
+                qtd_bp = _bi_sb_get_count("bi_etl_v_balanco_patrimonial", anomes_ini, anomes_fim)
+                detalhe = {
+                    "status": "CONCLUIDO",
+                    "qtd_linhas": qtd_orc + qtd_lanc + qtd_bp,
+                    "finalizado_em": datetime.utcnow().isoformat() + "Z",
+                }
+                _bi_sb_patch_log(log_id, detalhe)
+                resultado.append({
+                    "ordem": 99,
+                    "acao": nome_acao,
+                    "status": "CONCLUIDO",
+                    "qtd_vm_orc_dre": qtd_orc,
+                    "qtd_vm_lanc_contabil": qtd_lanc,
+                    "qtd_etl_v_balanco_patrimonial": qtd_bp,
+                    "observacao": "Fechamento cloud da rotina ATU_CONTABILIDADE concluído.",
+                })
+                continue
+            sql_raw = _bi_contab_ler_sql(cfg["sql_file"])
+            rows = _bi_contab_sqlserver_rows(sql_raw, anomes_ini, anomes_fim)
+            now_iso = datetime.utcnow().isoformat() + "Z"
+            for row in rows:
+                row["sincronizado_em"] = now_iso
+            _bi_sb_delete_periodo(
+                cfg["supabase"],
+                cfg["period_col"],
+                anomes_ini,
+                anomes_fim,
+            )
+            qtd = _bi_sb_insert(cfg["supabase"], rows)
+            _bi_sb_patch_log(log_id, {
+                "status": "CONCLUIDO",
+                "qtd_linhas": qtd,
+                "finalizado_em": datetime.utcnow().isoformat() + "Z",
+            })
+            resultado.append({
+                "ordem": cfg["ordem"],
+                "acao": nome_acao,
+                "tabela_supabase": cfg["supabase"],
+                "status": "CONCLUIDO",
+                "qtd_linhas": qtd,
+            })
+        except Exception as exc:
+            erro = str(exc)
+            _bi_sb_patch_log(log_id, {
+                "status": "ERRO",
+                "erro": erro[:4000],
+                "finalizado_em": datetime.utcnow().isoformat() + "Z",
+            })
+            resultado.append({
+                "ordem": cfg["ordem"],
+                "acao": nome_acao,
+                "tabela_supabase": cfg.get("supabase"),
+                "status": "ERRO",
+                "erro": erro,
+            })
+            # Como no integrador está "Continuar", não interrompe a tarefa.
+            continue
+    return {
+        "nome_tarefa": "ATU_CONTABILIDADE",
+        "anomes_ini": anomes_ini,
+        "anomes_fim": anomes_fim,
+        "acionado_por": usuario,
+        "resultado": resultado,
+    }
+
+
+@app.get("/api/bi/contabilidade/status")
+def status_bi_contabilidade(
+    anomes_ini: str = Query(...),
+    anomes_fim: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    anomes_ini = _bi_contab_normalizar_anomes(anomes_ini)
+    anomes_fim = _bi_contab_normalizar_anomes(anomes_fim, anomes_ini)
+    dados = []
+    for nome_acao, cfg in BI_CONTABILIDADE_MAP.items():
+        if nome_acao == "ATU_CONTABILIDADE":
+            continue
+        total = _bi_sb_get_count(
+            cfg["supabase"],
+            anomes_ini,
+            anomes_fim,
+        )
+        dados.append({
+            "ordem": cfg["ordem"],
+            "acao": nome_acao,
+            "tabela_supabase": cfg["supabase"],
+            "anomes_ini": anomes_ini,
+            "anomes_fim": anomes_fim,
+            "total_registros": total,
+            "status": "OK" if total > 0 else "SEM_DADOS",
+        })
+    return {
+        "nome_tarefa": "ATU_CONTABILIDADE",
+        "anomes_ini": anomes_ini,
+        "anomes_fim": anomes_fim,
+        "dados": sorted(dados, key=lambda x: x["ordem"]),
+    }
+
+
+@app.get("/api/bi/contabilidade/log")
+def log_bi_contabilidade(
+    limit: int = 100,
+    usuario=Depends(validar_token),
+):
+    limit = max(1, min(int(limit or 100), 500))
+    url = f"{SUPABASE_URL}/rest/v1/bi_contab_sync_log"
+    params = {
+        "select": "*",
+        "order": "iniciado_em.desc",
+        "limit": str(limit),
+    }
+    resp = requests.get(
+        url,
+        headers=_bi_sb_headers(),
+        params=params,
+        timeout=60,
+    )
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao consultar log contábil: {resp.status_code} - {resp.text}",
+        )
+    return {"dados": resp.json()}
+
+
+def _bi_dre_listar_estrutura() -> List[dict]:
+    """Lê bi_dre_estrutura (ativa, ordenada) via PostgREST."""
+    _supabase_required()
+    resp = requests.get(
+        f"{SUPABASE_URL}/rest/v1/bi_dre_estrutura",
+        params={
+            "select": "ordem,codigo_linha,descricao,tipo_linha,formula,ativo",
+            "ativo": "eq.true",
+            "order": "ordem.asc",
+        },
+        headers=_supabase_headers("return=representation"),
+        timeout=60,
+    )
+    if resp.status_code not in (200, 206):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase GET bi_dre_estrutura: {resp.status_code} {(resp.text or '')[:300]}",
+        )
+    return resp.json() or []
+
+
+def _bi_dre_aval_formula(formula: Optional[str], valores: dict, campo: str) -> float:
+    """Soma o `campo` (realizado/orcado) dos códigos citados na fórmula
+    ('A+B-C'). Os sinais contábeis já vêm nas views; aqui só somamos linhas."""
+    total = 0.0
+    for termo in re.findall(r"[+-]?[A-Za-z_][A-Za-z0-9_]*", str(formula or "").replace(" ", "")):
+        sinal = -1.0 if termo.startswith("-") else 1.0
+        cod = termo.lstrip("+-")
+        total += sinal * float((valores.get(cod) or {}).get(campo) or 0)
+    return total
+
+
+def _bi_dre_pct(parte, base) -> float:
+    try:
+        base = float(base or 0)
+        if base == 0:
+            return 0.0
+        return round(float(parte or 0) / base * 100.0, 2)
+    except Exception:
+        return 0.0
+
+
+_DRE_MESES = ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"]
+_DRE_MES_ABREV = {
+    "01": "jan", "02": "fev", "03": "mar", "04": "abr", "05": "mai", "06": "jun",
+    "07": "jul", "08": "ago", "09": "set", "10": "out", "11": "nov", "12": "dez",
+}
+
+
+def _dre_matriz_linhas(estrutura, anomes_ini, anomes_fim, p_uni):
+    """Classifica realizado/orçado pela base ÚNICA (RPC bi_dre_regras_periodo, que
+    lê da view bi_dre_movimento_classificado — MESMA classificação de/para do
+    drill) e monta as linhas da DRE p/ o período: CONTAS classificadas + CALCULO
+    por fórmula (bi_dre_estrutura) + A.V. (base Receita Bruta)."""
+    contas = _bi_unwrap_rpc(
+        _sb_rpc("bi_dre_regras_periodo", {
+            "p_anomes_ini": anomes_ini,
+            "p_anomes_fim": anomes_fim,
+            "p_unidade_negocio": p_uni,
+        }),
+        "bi_dre_regras_periodo",
+    ) or []
+
+    valores: dict = {}
+    for c in contas:
+        cod = str(c.get("codigo_linha") or "").strip()
+        if cod:
+            valores[cod] = {
+                "realizado": float(c.get("realizado") or 0),
+                "orcado": float(c.get("orcado") or 0),
+            }
+
+    # CALCULO (Receita Líquida, Lucro Bruto, EBITDA, EBIT, Resultado) por fórmula,
+    # em ordem — cada fórmula referencia linhas já calculadas.
+    for e in estrutura:
+        if (e.get("tipo_linha") or "").upper() in ("CALCULO", "TOTAL") and e.get("formula"):
+            cod = str(e.get("codigo_linha") or "").strip()
+            valores[cod] = {
+                "realizado": _bi_dre_aval_formula(e.get("formula"), valores, "realizado"),
+                "orcado": _bi_dre_aval_formula(e.get("formula"), valores, "orcado"),
+            }
+
+    base_real = (valores.get("RECEITA_BRUTA") or {}).get("realizado") or 0
+    base_orc = (valores.get("RECEITA_BRUTA") or {}).get("orcado") or 0
+
+    out = []
+    for e in estrutura:
+        cod = str(e.get("codigo_linha") or "").strip()
+        v = valores.get(cod) or {"realizado": 0.0, "orcado": 0.0}
+        out.append({
+            "ordem": e.get("ordem"),
+            "codigo_linha": cod,
+            "descricao": e.get("descricao"),
+            "realizado": round(float(v["realizado"]), 2),
+            "orcado": round(float(v["orcado"]), 2),
+            "av_realizado": _bi_dre_pct(v["realizado"], base_real),
+            "av_orcado": _bi_dre_pct(v["orcado"], base_orc),
+        })
+    return out
+
+
+@app.get("/api/bi/contabilidade/dre-matriz")
+def bi_contabilidade_dre_matriz(
+    ano: str = Query(...),
+    mes_ini: str = "01",
+    mes_fim: str = "12",
+    unidade: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    """Matriz anual da DRE (12 meses + total). Classifica realizado/orçado mês a
+    mês pela base única (bi_dre_regras_periodo → view bi_dre_movimento_classificado,
+    de/para conta+centro = MESMA do drill) e monta os CALCULO + A.V. na API,
+    pivotando por codigo_linha. O front consome só este endpoint."""
+    ano = re.sub(r"\D", "", str(ano or ""))[:4]
+    if len(ano) != 4:
+        raise HTTPException(status_code=422, detail="Informe o ano no formato YYYY. Ex.: 2026.")
+    mi = re.sub(r"\D", "", str(mes_ini or "01")).zfill(2)[:2] or "01"
+    mf = re.sub(r"\D", "", str(mes_fim or "12")).zfill(2)[:2] or "12"
+    if mi not in _DRE_MES_ABREV or mf not in _DRE_MES_ABREV or int(mi) > int(mf):
+        raise HTTPException(
+            status_code=422,
+            detail="mes_ini/mes_fim inválidos (use 01..12 com mes_ini <= mes_fim).",
+        )
+    uni = (unidade or "").strip()
+    p_uni = None if (uni == "" or uni.upper() == "TODOS") else uni
+
+    estrutura = _bi_dre_listar_estrutura()
+    if not estrutura:
+        raise HTTPException(
+            status_code=503,
+            detail="Estrutura da DRE não cadastrada (bi_dre_estrutura).",
+        )
+
+    meses = [m for m in _DRE_MESES if int(mi) <= int(m) <= int(mf)]
+    linhas: dict = {}
+
+    def _garante(cod, ordem, desc):
+        if cod not in linhas:
+            base = {"ordem": int(ordem or 0), "codigo_linha": cod, "descricao": desc}
+            for mm in _DRE_MESES:
+                ab = _DRE_MES_ABREV[mm]
+                base[f"{ab}_realizado"] = 0.0
+                base[f"{ab}_av"] = 0.0
+                base[f"{ab}_orcado"] = 0.0
+            base["total_realizado"] = 0.0
+            base["total_av"] = 0.0
+            base["total_orcado"] = 0.0
+            linhas[cod] = base
+        return linhas[cod]
+
+    for mm in meses:
+        ab = _DRE_MES_ABREV[mm]
+        for r in _dre_matriz_linhas(estrutura, ano + mm, ano + mm, p_uni):
+            cod = str(r.get("codigo_linha") or "").strip()
+            if not cod:
+                continue
+            linha = _garante(cod, r.get("ordem"), r.get("descricao"))
+            linha[f"{ab}_realizado"] = r.get("realizado") or 0.0
+            linha[f"{ab}_av"] = r.get("av_realizado") or 0.0
+            linha[f"{ab}_orcado"] = r.get("orcado") or 0.0
+
+    for r in _dre_matriz_linhas(estrutura, ano + mi, ano + mf, p_uni):
+        cod = str(r.get("codigo_linha") or "").strip()
+        if not cod:
+            continue
+        linha = _garante(cod, r.get("ordem"), r.get("descricao"))
+        linha["total_realizado"] = r.get("realizado") or 0.0
+        linha["total_av"] = r.get("av_realizado") or 0.0
+        linha["total_orcado"] = r.get("orcado") or 0.0
+
+    return sorted(linhas.values(), key=lambda x: x.get("ordem") or 0)
+
+
+@app.get("/api/bi/contabilidade/dre")
+def bi_contabilidade_dre(
+    anomes_ini: str = Query(...),
+    anomes_fim: Optional[str] = None,
+    unidade_negocio: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    """DRE pronta (cards + linhas + series). Realizado=bi_vm_lanc_contabil,
+    orçado=bi_vm_orc_dre, agregados pela RPC bi_dre conforme bi_dre_mascara.
+    Totalizadoras e A.V. (base Receita Bruta) calculadas aqui."""
+    anomes_ini = _bi_contab_normalizar_anomes(anomes_ini)
+    anomes_fim = _bi_contab_normalizar_anomes(anomes_fim, anomes_ini)
+    if int(anomes_fim) < int(anomes_ini):
+        raise HTTPException(
+            status_code=422,
+            detail="anomes_fim não pode ser menor que anomes_ini.",
+        )
+
+    estrutura = _bi_dre_listar_estrutura()
+    if not estrutura:
+        raise HTTPException(
+            status_code=503,
+            detail="Estrutura da DRE não cadastrada (bi_dre_estrutura). Rode migration_bi_dre.sql.",
+        )
+
+    analiticas = _bi_unwrap_rpc(
+        _sb_rpc("bi_dre", {
+            "p_anomes_ini": anomes_ini,
+            "p_anomes_fim": anomes_fim,
+            "p_unidade_negocio": (unidade_negocio or None),
+        }),
+        "bi_dre",
+    ) or []
+
+    valores: dict = {}
+    for r in analiticas:
+        cod = str(r.get("codigo_linha") or "").strip()
+        if cod:
+            valores[cod] = {
+                "realizado": float(r.get("realizado") or 0),
+                "orcado": float(r.get("orcado") or 0),
+            }
+
+    # Totalizadoras: processa em ordem (fórmula referencia linhas anteriores).
+    for e in estrutura:
+        if (e.get("tipo_linha") or "").upper() == "TOTAL":
+            cod = str(e.get("codigo_linha") or "").strip()
+            valores[cod] = {
+                "realizado": _bi_dre_aval_formula(e.get("formula"), valores, "realizado"),
+                "orcado": _bi_dre_aval_formula(e.get("formula"), valores, "orcado"),
+            }
+
+    base_real = (valores.get("RECEITA_BRUTA") or {}).get("realizado") or 0
+    base_orc = (valores.get("RECEITA_BRUTA") or {}).get("orcado") or 0
+
+    linhas = []
+    for e in estrutura:
+        cod = str(e.get("codigo_linha") or "").strip()
+        v = valores.get(cod) or {"realizado": 0.0, "orcado": 0.0}
+        real = round(float(v["realizado"]), 2)
+        orc = round(float(v["orcado"]), 2)
+        linhas.append({
+            "ordem": e.get("ordem"),
+            "codigo_linha": cod,
+            "mascara": e.get("descricao"),
+            "tipo_linha": e.get("tipo_linha"),
+            "realizado": real,
+            "av_realizado": _bi_dre_pct(real, base_real),
+            "orcado": orc,
+            "av_orcado": _bi_dre_pct(orc, base_orc),
+            "diferenca": round(real - orc, 2),
+            "diferenca_pct": _bi_dre_pct(real - orc, orc) if orc else 0.0,
+        })
+
+    def _val(cod, campo="realizado"):
+        return round(float((valores.get(cod) or {}).get(campo) or 0), 2)
+
+    cards = {
+        "receita_bruta": _val("RECEITA_BRUTA"),
+        "lucro_bruto": _val("LUCRO_BRUTO"),
+        "perc_lucro_bruto": _bi_dre_pct(_val("LUCRO_BRUTO"), base_real),
+        "ebitda": _val("EBITDA"),
+        "perc_ebitda": _bi_dre_pct(_val("EBITDA"), base_real),
+        "lucro_liquido": _val("RESULTADO_EXERCICIO"),
+        "perc_lucro_liquido": _bi_dre_pct(_val("RESULTADO_EXERCICIO"), base_real),
+    }
+
+    series = [
+        {"chave": "LUCRO_BRUTO", "label": "Lucro Bruto %", "valor": cards["perc_lucro_bruto"]},
+        {"chave": "EBITDA", "label": "EBITDA %", "valor": cards["perc_ebitda"]},
+        {"chave": "EBIT", "label": "EBIT %", "valor": _bi_dre_pct(_val("EBIT"), base_real)},
+    ]
+
+    return {
+        "filtros": {
+            "anomes_ini": anomes_ini,
+            "anomes_fim": anomes_fim,
+            "unidade_negocio": (unidade_negocio or "CONSOLIDADO"),
+        },
+        "cards": cards,
+        "linhas": linhas,
+        "composicao": [],
+        "series": series,
+    }
+
+
+_DRE_DRILL_TIPOS = {
+    "CENTRO_CUSTOS", "CONTA_CONTABIL", "ORIGEM", "TRANSACAO",
+    "HISTORICO", "LANCAMENTO", "UNIDADE",
+}
+
+_DRE_ACENTOS = str.maketrans("ÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜÇ", "AAAAAEEEEIIIIOOOOOUUUUC")
+
+# aliases: rótulos da UI / sinônimos / com ou sem acento -> tipo canônico.
+# a chave é a entrada já sem acento e só A-Z0-9 (ver _dre_norm_tipo_drill).
+_DRE_DRILL_ALIASES = {
+    "CENTROCUSTOS": "CENTRO_CUSTOS", "CENTRODECUSTOS": "CENTRO_CUSTOS",
+    "CENTRO": "CENTRO_CUSTOS", "CC": "CENTRO_CUSTOS", "CDCENTROCUSTOS": "CENTRO_CUSTOS",
+    "CONTACONTABIL": "CONTA_CONTABIL", "CONTA": "CONTA_CONTABIL",
+    "MASCARA": "CONTA_CONTABIL", "CDMASCARA": "CONTA_CONTABIL",
+    "ORIGEM": "ORIGEM", "ORIGEMLCTO": "ORIGEM", "CDORIGEMLCTO": "ORIGEM",
+    "ORIGEMDOLANCAMENTO": "ORIGEM", "ORIGEMLANCAMENTO": "ORIGEM",
+    "TRANSACAO": "TRANSACAO", "TNS": "TRANSACAO", "CDTNS": "TRANSACAO",
+    "HISTORICO": "HISTORICO", "DSOBS": "HISTORICO",
+    "LANCAMENTO": "LANCAMENTO", "LANCAMENTOS": "LANCAMENTO", "CDLANCAMENTO": "LANCAMENTO",
+    "UNIDADE": "UNIDADE", "UNIDADEDENEGOCIO": "UNIDADE", "UNIDADENEGOCIO": "UNIDADE",
+    "UN": "UNIDADE",
+    "REABRIR": "REABRIR",
+}
+
+
+def _dre_norm_tipo_drill(td):
+    """Normaliza tipo_drill aceitando rótulos da UI, sinônimos e acentos.
+    Retorna o tipo canônico (ou 'REABRIR'), ou None se não reconhecido."""
+    if td is None or str(td).strip() == "":
+        return "CONTA_CONTABIL"
+    s = str(td).strip().upper().translate(_DRE_ACENTOS)
+    s = re.sub(r"[^A-Z0-9]", "", s)
+    return _DRE_DRILL_ALIASES.get(s)
+
+
+@app.get("/api/bi/contabilidade/dre-drill")
+def bi_contabilidade_dre_drill(
+    codigo_linha: str = Query(...),
+    ano: Optional[str] = None,
+    mes_ini: str = "01",
+    mes_fim: str = "12",
+    anomes_referente: Optional[str] = None,
+    tipo_drill: str = "CONTA_CONTABIL",
+    unidade: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    """Abre uma linha da DRE (codigo_linha) no período. Para linha de CONTA:
+    lista os lançamentos realizados (bi_vm_lanc_contabil) classificados nessa
+    linha (já com exceções aplicadas), agrupados pelo nível pedido (RPC
+    bi_dre_drill_realizado) — serve p/ conferir cada valor contra a UpQuery.
+    Para linha CALCULO/TOTAL: devolve os componentes da fórmula (reabrir).
+    Período: passe anomes_referente (YYYYMM) p/ um mês exato, ou ano+mes_ini+mes_fim."""
+    am = re.sub(r"\D", "", str(anomes_referente or ""))[:6]
+    if len(am) == 6:
+        anomes_ini = anomes_fim = am
+    else:
+        ano4 = re.sub(r"\D", "", str(ano or ""))[:4]
+        if len(ano4) != 4:
+            raise HTTPException(
+                status_code=422,
+                detail="Informe ano (YYYY) ou anomes_referente (YYYYMM).",
+            )
+        mi = re.sub(r"\D", "", str(mes_ini or "01")).zfill(2)[:2] or "01"
+        mf = re.sub(r"\D", "", str(mes_fim or "12")).zfill(2)[:2] or "12"
+        if mi not in _DRE_MES_ABREV or mf not in _DRE_MES_ABREV or int(mi) > int(mf):
+            raise HTTPException(
+                status_code=422,
+                detail="mes_ini/mes_fim inválidos (use 01..12 com mes_ini <= mes_fim).",
+            )
+        anomes_ini, anomes_fim = ano4 + mi, ano4 + mf
+    cod = str(codigo_linha or "").strip().upper()
+    if not cod:
+        raise HTTPException(status_code=422, detail="Informe codigo_linha.")
+    uni = (unidade or "").strip()
+    p_uni = None if (uni == "" or uni.upper() == "TODOS") else uni
+
+    estrutura = _bi_dre_listar_estrutura()
+    est_map = {str(e.get("codigo_linha") or "").strip().upper(): e for e in estrutura}
+    e_linha = est_map.get(cod)
+    tipo_linha = (e_linha.get("tipo_linha") or "").upper() if e_linha else "CONTA"
+
+    # Guarda: exige código técnico válido. Evita o front mandar a descrição visual
+    # (ex.: "(-) Deduções s/vendas") e receber vazio silencioso. NAO_CLASSIFICADO
+    # é drillável apesar de não estar na bi_dre_estrutura.
+    if not e_linha and cod != "NAO_CLASSIFICADO":
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "codigo_linha não encontrado na estrutura da DRE.",
+                "codigo_linha_recebido": codigo_linha,
+                "hint": ("Envie o código técnico (row.codigo_linha, ex.: DEDUCOES_VENDAS), "
+                         "não a descrição/máscara visual da linha."),
+                "codigos_validos": sorted(est_map.keys()) + ["NAO_CLASSIFICADO"],
+            },
+        )
+
+    # Linha calculada -> "reabrir" os componentes da fórmula (não há lançamentos).
+    if tipo_linha in ("CALCULO", "TOTAL") and e_linha and e_linha.get("formula"):
+        comps = []
+        for termo in re.findall(r"[+-]?[A-Za-z_][A-Za-z0-9_]*",
+                                str(e_linha.get("formula")).replace(" ", "")):
+            sinal = "-" if termo.startswith("-") else "+"
+            c = termo.lstrip("+-")
+            comps.append({
+                "codigo_linha": c,
+                "sinal": sinal,
+                "descricao": (est_map.get(c.upper()) or {}).get("descricao"),
+            })
+        return {
+            "success": True,
+            "data": [],
+            "total_registros": 0,
+            "codigo_linha": cod,
+            "descricao": e_linha.get("descricao"),
+            "tipo_linha": tipo_linha,
+            "formula": e_linha.get("formula"),
+            "tipo_drill": None,
+            "periodo": {"anomes_ini": anomes_ini, "anomes_fim": anomes_fim},
+            "unidade": (p_uni or "CONSOLIDADO"),
+            "reabrir": comps,
+        }
+
+    # Linha de conta -> drill nos lançamentos classificados.
+    td = _dre_norm_tipo_drill(tipo_drill)
+    if td is None:
+        raise HTTPException(
+            status_code=422,
+            detail=("tipo_drill inválido. Use um de: "
+                    + ", ".join(sorted(_DRE_DRILL_TIPOS)) + " (ou REABRIR)."),
+        )
+    if td == "REABRIR":   # 'reabrir' só abre linha calculada; em conta, abre por conta
+        td = "CONTA_CONTABIL"
+    p_anomes_ref = am if len(am) == 6 else None
+    itens = _bi_unwrap_rpc(
+        _sb_rpc("bi_dre_drill_realizado", {
+            "p_anomes_ini": anomes_ini,
+            "p_anomes_fim": anomes_fim,
+            "p_codigo_linha": cod,
+            "p_tipo_drill": td,
+            "p_anomes_referente": p_anomes_ref,
+            "p_unidade_negocio": p_uni,
+        }),
+        "bi_dre_drill_realizado",
+    ) or []
+
+    total = round(sum(float(i.get("total") or 0) for i in itens), 2)
+    data = []
+    for i in itens:
+        v = float(i.get("total") or 0)
+        data.append({
+            "anomes_referente": i.get("anomes_referente"),
+            "grupo": i.get("grupo"),
+            "subgrupo": i.get("subgrupo"),
+            "cd_lancamento": i.get("cd_lancamento"),
+            "cd_lote": i.get("cd_lote"),
+            "cd_documento": i.get("cd_documento"),
+            "cd_mascara": i.get("cd_mascara"),
+            "cd_conta_contabil": i.get("cd_conta_contabil"),
+            "cd_centro_custos": i.get("cd_centro_custos"),
+            "cd_centro_custos_3": i.get("cd_centro_custos_3"),
+            "cd_origem_lcto": i.get("cd_origem_lcto"),
+            "cd_tns": i.get("cd_tns"),
+            "historico": i.get("historico"),
+            "qtd_lancamentos": int(i.get("qtd_lancamentos") or 0),
+            "total": round(v, 2),
+            "av": _bi_dre_pct(v, total),
+        })
+
+    return {
+        "success": True,
+        "data": data,
+        "total_registros": len(data),
+        "codigo_linha": cod,
+        "descricao": (e_linha or {}).get("descricao"),
+        "tipo_linha": tipo_linha or "CONTA",
+        "tipo_drill": td,
+        "periodo": {"anomes_ini": anomes_ini, "anomes_fim": anomes_fim},
+        "unidade": (p_uni or "CONSOLIDADO"),
+        "total": total,
+    }
+
+
+class DreExcecaoPayload(BaseModel):
+    codigo_linha_destino: str
+    codigo_linha_original: Optional[str] = None
+    anomes_referente: Optional[str] = None
+    cd_lancamento: Optional[str] = None
+    cd_lote: Optional[str] = None
+    cd_documento: Optional[str] = None
+    cd_mascara: Optional[str] = None
+    cd_conta_contabil: Optional[str] = None
+    cd_centro_custos: Optional[str] = None
+    cd_centro_custos_3: Optional[str] = None
+    cd_origem_lcto: Optional[str] = None
+    cd_tns: Optional[str] = None
+    motivo: Optional[str] = None
+    valor_referencia: Optional[float] = None
+    ativo: Optional[bool] = True
+
+
+# colunas de match (qualquer uma serve como critério da exceção)
+_DRE_EXC_MATCH_COLS = (
+    "anomes_referente", "cd_lancamento", "cd_lote", "cd_documento",
+    "cd_mascara", "cd_conta_contabil", "cd_centro_custos",
+    "cd_centro_custos_3", "cd_origem_lcto", "cd_tns",
+)
+# colunas editáveis via PATCH
+_DRE_EXC_COLS = ("codigo_linha_original", "codigo_linha_destino",
+                 "motivo", "valor_referencia", "ativo") + _DRE_EXC_MATCH_COLS
+
+
+def _dre_excecao_inserir(corpo: dict):
+    """Normaliza, valida (destino + >=1 critério de match) e insere a exceção —
+    ou reaproveita uma já ativa idêntica (idempotente). Retorna (registro, criado)."""
+    destino = str(corpo.get("codigo_linha_destino") or "").strip().upper()
+    if not destino:
+        raise HTTPException(status_code=422, detail="codigo_linha_destino é obrigatório.")
+    orig = str(corpo.get("codigo_linha_original") or "").strip().upper() or None
+    norm = {
+        "codigo_linha_destino": destino,
+        "codigo_linha_original": orig,
+        "motivo": (str(corpo["motivo"]).strip() or None) if corpo.get("motivo") is not None else None,
+        "ativo": bool(corpo.get("ativo", True)),
+    }
+    if corpo.get("valor_referencia") is not None:
+        try:
+            norm["valor_referencia"] = float(corpo["valor_referencia"])
+        except (TypeError, ValueError):
+            norm["valor_referencia"] = None
+    for col in _DRE_EXC_MATCH_COLS:
+        v = corpo.get(col)
+        v = str(v).strip() if v is not None else ""
+        if col == "anomes_referente" and v:
+            v = re.sub(r"\D", "", v)[:6]
+        norm[col] = v or None
+    if not any(norm.get(c) for c in _DRE_EXC_MATCH_COLS):
+        raise HTTPException(
+            status_code=422,
+            detail=("Informe ao menos um critério de match (cd_lancamento, cd_lote, "
+                    "cd_documento, cd_mascara, cd_tns, cd_origem_lcto, anomes_referente, "
+                    "centro). Sem critério a exceção pegaria todos os lançamentos."),
+        )
+    # dedup: já existe exceção ativa com EXATAMENTE os mesmos critérios?
+    filtros = {
+        "select": "*",
+        "ativo": "eq.true",
+        "codigo_linha_destino": f"eq.{destino}",
+        "codigo_linha_original": (f"eq.{orig}" if orig else "is.null"),
+    }
+    for col in _DRE_EXC_MATCH_COLS:
+        v = norm.get(col)
+        filtros[col] = f"eq.{v}" if v else "is.null"
+    existentes = _sb_get("bi_dre_excecoes_lancamento", filtros) or []
+    if existentes:
+        return existentes[0], False
+    criado = _sb_post("bi_dre_excecoes_lancamento", norm) or []
+    reg = criado[0] if isinstance(criado, list) and criado else norm
+    return reg, True
+
+
+@app.get("/api/bi/contabilidade/dre-excecoes")
+def bi_contabilidade_dre_excecoes_listar(
+    ativo: Optional[bool] = None,
+    codigo_linha_original: Optional[str] = None,
+    codigo_linha_destino: Optional[str] = None,
+    anomes_referente: Optional[str] = None,
+    cd_lancamento: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    """Lista as exceções de lançamento da DRE (mais recentes primeiro)."""
+    params = {"select": "*", "order": "created_at.desc"}
+    if ativo is not None:
+        params["ativo"] = f"eq.{'true' if ativo else 'false'}"
+    if codigo_linha_original:
+        params["codigo_linha_original"] = f"eq.{codigo_linha_original.strip().upper()}"
+    if codigo_linha_destino:
+        params["codigo_linha_destino"] = f"eq.{codigo_linha_destino.strip().upper()}"
+    if anomes_referente:
+        params["anomes_referente"] = "eq." + re.sub(r"\D", "", anomes_referente)[:6]
+    if cd_lancamento:
+        params["cd_lancamento"] = f"eq.{cd_lancamento.strip()}"
+    return _sb_get("bi_dre_excecoes_lancamento", params) or []
+
+
+@app.post("/api/bi/contabilidade/dre-excecoes")
+def bi_contabilidade_dre_excecoes_criar(
+    payload: DreExcecaoPayload,
+    usuario=Depends(validar_token),
+):
+    """Cria uma exceção de lançamento. Exige codigo_linha_destino e ao menos um
+    critério de match (senão a exceção pegaria todos os lançamentos)."""
+    corpo = {
+        "codigo_linha_destino": payload.codigo_linha_destino,
+        "codigo_linha_original": payload.codigo_linha_original,
+        "motivo": payload.motivo,
+        "valor_referencia": payload.valor_referencia,
+        "ativo": True if payload.ativo is None else bool(payload.ativo),
+    }
+    for col in _DRE_EXC_MATCH_COLS:
+        corpo[col] = getattr(payload, col, None)
+    reg, _criado = _dre_excecao_inserir(corpo)
+    return reg
+
+
+@app.patch("/api/bi/contabilidade/dre-excecoes/{exc_id}")
+def bi_contabilidade_dre_excecoes_atualizar(
+    exc_id: str,
+    payload: dict = Body(...),
+    usuario=Depends(validar_token),
+):
+    """Atualiza campos de uma exceção (inclui `ativo` p/ ligar/desligar)."""
+    if not str(exc_id or "").strip():
+        raise HTTPException(status_code=422, detail="Informe o id da exceção.")
+    corpo = {}
+    for col in _DRE_EXC_COLS:
+        if col not in payload:
+            continue
+        v = payload[col]
+        if col == "ativo":
+            corpo[col] = bool(v)
+        elif col == "valor_referencia":
+            try:
+                corpo[col] = float(v) if v is not None else None
+            except (TypeError, ValueError):
+                corpo[col] = None
+        elif col in ("codigo_linha_original", "codigo_linha_destino"):
+            corpo[col] = (str(v).strip().upper() or None) if v is not None else None
+        else:
+            corpo[col] = (str(v).strip() or None) if v is not None else None
+    if "codigo_linha_destino" in corpo and not corpo["codigo_linha_destino"]:
+        raise HTTPException(status_code=422, detail="codigo_linha_destino não pode ficar vazio.")
+    if not corpo:
+        raise HTTPException(status_code=422, detail="Nada para atualizar.")
+    upd = _sb_patch(
+        "bi_dre_excecoes_lancamento",
+        {"id": f"eq.{exc_id}"},
+        corpo,
+        prefer="return=representation",
+    ) or []
+    if not upd:
+        raise HTTPException(status_code=404, detail="Exceção não encontrada.")
+    return upd[0]
+
+
+@app.delete("/api/bi/contabilidade/dre-excecoes/{exc_id}")
+def bi_contabilidade_dre_excecoes_desativar(
+    exc_id: str,
+    usuario=Depends(validar_token),
+):
+    """Não apaga: marca ativo=false (soft delete)."""
+    if not str(exc_id or "").strip():
+        raise HTTPException(status_code=422, detail="Informe o id da exceção.")
+    upd = _sb_patch(
+        "bi_dre_excecoes_lancamento",
+        {"id": f"eq.{exc_id}"},
+        {"ativo": False},
+        prefer="return=representation",
+    ) or []
+    if not upd:
+        raise HTTPException(status_code=404, detail="Exceção não encontrada.")
+    return {"id": exc_id, "ativo": False, "desativada": True}
+
+
+_DRE_ESCOPOS = {"LANCAMENTO", "DOCUMENTO", "COMBINACAO", "REGRA_DEFINITIVA"}
+_DRE_SUG_STATUS = {"PENDENTE", "APROVADA", "REJEITADA"}
+
+
+class DreClassificarPayload(BaseModel):
+    codigo_linha_destino: str
+    escopo: str = "LANCAMENTO"
+    codigo_linha_original: Optional[str] = None
+    anomes_referente: Optional[str] = None
+    cd_lancamento: Optional[str] = None
+    cd_lote: Optional[str] = None
+    cd_documento: Optional[str] = None
+    cd_mascara: Optional[str] = None
+    cd_conta_contabil: Optional[str] = None
+    cd_centro_custos: Optional[str] = None
+    cd_centro_custos_3: Optional[str] = None
+    cd_origem_lcto: Optional[str] = None
+    cd_tns: Optional[str] = None
+    motivo: Optional[str] = None
+    valor: Optional[float] = None
+
+
+@app.post("/api/bi/contabilidade/dre-classificar-lancamento")
+def bi_contabilidade_dre_classificar(
+    payload: DreClassificarPayload,
+    usuario=Depends(validar_token),
+):
+    """Classifica um lançamento na DRE conforme o escopo. LANCAMENTO/DOCUMENTO/
+    COMBINACAO criam uma EXCEÇÃO (já valendo na DRE, via bi_dre_excecoes_lancamento);
+    REGRA_DEFINITIVA registra uma SUGESTÃO (bi_dre_regras_sugestoes) que NÃO é
+    aplicada — fica p/ triagem. destino='NAO_CLASSIFICADO' remove o valor da DRE."""
+    escopo = (payload.escopo or "LANCAMENTO").strip().upper()
+    if escopo not in _DRE_ESCOPOS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"escopo inválido. Use: {', '.join(sorted(_DRE_ESCOPOS))}.",
+        )
+    destino = (payload.codigo_linha_destino or "").strip().upper()
+    if not destino:
+        raise HTTPException(status_code=422, detail="codigo_linha_destino é obrigatório.")
+
+    def g(col):
+        v = getattr(payload, col, None)
+        v = str(v).strip() if v is not None else ""
+        if col == "anomes_referente" and v:
+            v = re.sub(r"\D", "", v)[:6]
+        return v or None
+
+    # REGRA_DEFINITIVA: grava sugestão e NÃO aplica
+    if escopo == "REGRA_DEFINITIVA":
+        sug = {
+            "codigo_linha_original": (payload.codigo_linha_original or "").strip().upper() or None,
+            "codigo_linha_destino": destino,
+            "escopo": escopo,
+            "motivo": g("motivo"),
+            "valor_referencia": payload.valor,
+            "status": "PENDENTE",
+            "ativo": True,
+        }
+        for col in _DRE_EXC_MATCH_COLS:
+            sug[col] = g(col)
+        criado = _sb_post("bi_dre_regras_sugestoes", sug) or []
+        reg = criado[0] if isinstance(criado, list) and criado else sug
+        return {
+            "aplicado": False,
+            "escopo": escopo,
+            "status": "PENDENTE",
+            "sugestao": reg,
+            "observacao": ("Sugestão de regra definitiva gravada (PENDENTE). NÃO aplicada à "
+                           "DRE — revise em /dre-regras-sugestoes e promova quando validar."),
+        }
+
+    # escopos que viram exceção (já valendo na DRE)
+    if escopo == "LANCAMENTO":
+        match = {"cd_lancamento": g("cd_lancamento")}
+        if not match["cd_lancamento"]:
+            raise HTTPException(status_code=422, detail="escopo LANCAMENTO exige cd_lancamento.")
+    elif escopo == "DOCUMENTO":
+        match = {
+            "anomes_referente": g("anomes_referente"),
+            "cd_documento": g("cd_documento"),
+            "cd_lote": g("cd_lote"),
+        }
+        if not match["cd_documento"]:
+            raise HTTPException(
+                status_code=422,
+                detail="escopo DOCUMENTO exige cd_documento (anomes_referente e cd_lote complementam).",
+            )
+    else:  # COMBINACAO
+        match = {
+            "cd_mascara": g("cd_mascara"),
+            "cd_tns": g("cd_tns"),
+            "cd_origem_lcto": g("cd_origem_lcto"),
+            "cd_centro_custos_3": g("cd_centro_custos_3"),
+        }
+        if not any(match.values()):
+            raise HTTPException(
+                status_code=422,
+                detail=("escopo COMBINACAO exige ao menos um de: cd_mascara, cd_tns, "
+                        "cd_origem_lcto, cd_centro_custos_3."),
+            )
+
+    corpo = {
+        "codigo_linha_original": payload.codigo_linha_original,
+        "codigo_linha_destino": destino,
+        "motivo": payload.motivo,
+        "valor_referencia": payload.valor,
+        "ativo": True,
+    }
+    corpo.update(match)
+    reg, criado = _dre_excecao_inserir(corpo)
+    return {
+        "aplicado": True,
+        "escopo": escopo,
+        "criado": criado,
+        "excecao": reg,
+        "observacao": ("Exceção criada e já valendo na DRE." if criado
+                       else "Já existia exceção ativa idêntica; reaproveitada."),
+    }
+
+
+@app.get("/api/bi/contabilidade/dre-regras-sugestoes")
+def bi_contabilidade_dre_sugestoes_listar(
+    status: Optional[str] = None,
+    ativo: Optional[bool] = True,
+    usuario=Depends(validar_token),
+):
+    """Lista as sugestões de regra definitiva (escopo REGRA_DEFINITIVA)."""
+    params = {"select": "*", "order": "created_at.desc"}
+    if ativo is not None:
+        params["ativo"] = f"eq.{'true' if ativo else 'false'}"
+    if status:
+        params["status"] = f"eq.{status.strip().upper()}"
+    return _sb_get("bi_dre_regras_sugestoes", params) or []
+
+
+@app.patch("/api/bi/contabilidade/dre-regras-sugestoes/{sug_id}")
+def bi_contabilidade_dre_sugestoes_status(
+    sug_id: str,
+    payload: dict = Body(...),
+    usuario=Depends(validar_token),
+):
+    """Triagem da sugestão: status (PENDENTE/APROVADA/REJEITADA), motivo ou ativo.
+    NÃO aplica a regra à DRE — promover é passo manual (criar exceção/regra)."""
+    if not str(sug_id or "").strip():
+        raise HTTPException(status_code=422, detail="Informe o id da sugestão.")
+    corpo = {}
+    if "status" in payload:
+        st = str(payload["status"] or "").strip().upper()
+        if st not in _DRE_SUG_STATUS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"status inválido. Use: {', '.join(sorted(_DRE_SUG_STATUS))}.",
+            )
+        corpo["status"] = st
+    if "motivo" in payload:
+        corpo["motivo"] = (str(payload["motivo"]).strip() or None)
+    if "ativo" in payload:
+        corpo["ativo"] = bool(payload["ativo"])
+    if not corpo:
+        raise HTTPException(status_code=422, detail="Nada para atualizar (status/motivo/ativo).")
+    upd = _sb_patch(
+        "bi_dre_regras_sugestoes",
+        {"id": f"eq.{sug_id}"},
+        corpo,
+        prefer="return=representation",
+    ) or []
+    if not upd:
+        raise HTTPException(status_code=404, detail="Sugestão não encontrada.")
+    return upd[0]
+
+
+@app.get("/api/bi/contabilidade/dre-depara-cobertura")
+def bi_contabilidade_dre_depara_cobertura(
+    ano: Optional[str] = None,
+    mes_ini: str = "01",
+    mes_fim: str = "12",
+    anomes_referente: Optional[str] = None,
+    limit: int = 100,
+    usuario=Depends(validar_token),
+):
+    """Contas+centro do REALIZADO sem de/para (cairiam em NAO_CLASSIFICADO), por
+    impacto — guia o cadastro da bi_dre_depara_conta_ccu. Período: anomes_referente
+    (YYYYMM) p/ mês exato, ou ano+mes_ini+mes_fim."""
+    am = re.sub(r"\D", "", str(anomes_referente or ""))[:6]
+    if len(am) == 6:
+        anomes_ini = anomes_fim = am
+    else:
+        ano4 = re.sub(r"\D", "", str(ano or ""))[:4]
+        if len(ano4) != 4:
+            raise HTTPException(
+                status_code=422,
+                detail="Informe ano (YYYY) ou anomes_referente (YYYYMM).",
+            )
+        mi = re.sub(r"\D", "", str(mes_ini or "01")).zfill(2)[:2] or "01"
+        mf = re.sub(r"\D", "", str(mes_fim or "12")).zfill(2)[:2] or "12"
+        if mi not in _DRE_MES_ABREV or mf not in _DRE_MES_ABREV or int(mi) > int(mf):
+            raise HTTPException(
+                status_code=422,
+                detail="mes_ini/mes_fim inválidos (use 01..12 com mes_ini <= mes_fim).",
+            )
+        anomes_ini, anomes_fim = ano4 + mi, ano4 + mf
+
+    faltantes = _bi_unwrap_rpc(
+        _sb_rpc("bi_dre_depara_faltantes", {
+            "p_anomes_ini": anomes_ini,
+            "p_anomes_fim": anomes_fim,
+        }),
+        "bi_dre_depara_faltantes",
+    ) or []
+    total_falt = round(sum(float(x.get("valor") or 0) for x in faltantes), 2)
+    lim = max(1, min(int(limit or 100), 1000))
+    return {
+        "periodo": {"anomes_ini": anomes_ini, "anomes_fim": anomes_fim},
+        "resumo": {
+            "combinacoes_sem_depara": len(faltantes),
+            "valor_nao_classificado": total_falt,
+        },
+        "faltantes": faltantes[:lim],
+    }
+
+
+class DreVincularContaItem(BaseModel):
+    cd_mascara: Optional[str] = None
+    cd_conta_contabil: Optional[str] = None
+
+
+class DreVincularContasPayload(BaseModel):
+    modelo_id: str
+    linha_id: str
+    tipo_regra: str = "MASCARA_CONTA"
+    operador: str = "COMECA_COM"
+    sinal: int = 1
+    prioridade: int = 100
+    contas: List[DreVincularContaItem]
+
+
+def _dre_norm_centros(centros):
+    """Normaliza os centros (vindos da v2 / qualquer formato) p/ o contrato do
+    montador: cd_centro_custos, cd_centro_custos_3 (deriva dos 3 primeiros dígitos
+    se faltar), qtd_lancamentos, valor_total E vl_realizado (ambos = mesmo valor),
+    ds_centro_custos. Tolera centros como string JSON, dict único ou None."""
+    if centros is None:
+        return []
+    if isinstance(centros, str):
+        try:
+            centros = json.loads(centros)
+        except Exception:
+            return []
+    if isinstance(centros, dict):
+        centros = [centros]
+    if not isinstance(centros, list):
+        return []
+    out = []
+    for c in centros:
+        if not isinstance(c, dict):
+            continue
+        cdc = str(c.get("cd_centro_custos") or c.get("cd_centro_custo")
+                  or c.get("centro_custo") or "").strip()
+        if not cdc:
+            continue
+        val = c.get("valor_total")
+        if val is None:
+            val = c.get("vl_realizado")
+        try:
+            val = round(float(val or 0), 2)
+        except (TypeError, ValueError):
+            val = 0.0
+        out.append({
+            "cd_centro_custos": cdc,
+            "cd_centro_custos_3": str(c.get("cd_centro_custos_3") or (cdc[:3] if cdc else "")).strip(),
+            "qtd_lancamentos": int(c.get("qtd_lancamentos") or 0),
+            "valor_total": val,
+            "vl_realizado": val,
+            "ds_centro_custos": str(c.get("ds_centro_custos") or "").strip(),
+        })
+    return out
+
+
+def _dre_resumo_conta_v2(anomes_ini=None, anomes_fim=None, modelo_id=None):
+    """Mapa {cd_conta_contabil: {qtd_lancamentos, vl_realizado, centros_custo[]}}
+    agregado de bi_vm_lanc_contabil via a RPC v2 (agregação no SQL, NÃO em Python;
+    centros normalizados). Usado p/ anexar valores+centros ao catálogo do
+    /plano-contas. Vazio se a v2 falhar."""
+    def _opt(v):
+        return (re.sub(r"\D", "", str(v))[:6] or None) if v else None
+    out = {}
+    try:
+        v2 = _bi_unwrap_rpc(
+            _sb_rpc("bi_dre_plano_contas_disponivel_v2", {
+                "p_anomes_ini": _opt(anomes_ini),
+                "p_anomes_fim": _opt(anomes_fim),
+                "p_modelo_id": (str(modelo_id).strip() or None) if modelo_id else None,
+                "p_q": None,
+                "p_limit": 10000,
+            }),
+            "bi_dre_plano_contas_disponivel_v2",
+        ) or []
+        for x in v2:
+            conta = str(x.get("cd_conta_contabil") or "")
+            if not conta:
+                continue
+            try:
+                vl = round(float(x.get("vl_realizado") or 0), 2)
+            except (TypeError, ValueError):
+                vl = 0.0
+            out[conta] = {
+                "qtd_lancamentos": int(x.get("qtd_lancamentos") or 0),
+                "vl_realizado": vl,
+                "centros_custo": _dre_norm_centros(x.get("centros_custo")),
+            }
+    except Exception:
+        out = {}
+    return out
+
+
+@app.get("/api/bi/contabilidade/plano-contas")
+def bi_contabilidade_plano_contas(
+    q: Optional[str] = None,
+    anomes_ini: Optional[str] = None,
+    anomes_fim: Optional[str] = None,
+    limit: Optional[int] = None,
+    usuario=Depends(validar_token),
+):
+    """Catálogo de contas de RESULTADO p/ o montador da DRE — lê bi_taux_plano_contas
+    (descrição) e ANEXA centros_custo[] por conta, agregados de bi_vm_lanc_contabil
+    (RPC v2) no período anomes_ini..anomes_fim. limit omitido = TODAS (cap 10000).
+    Se o catálogo estiver vazio, rode antes POST /plano-contas/sync."""
+    lim = 10000 if limit is None else max(1, min(int(limit), 10000))
+    params = {"select": "*", "order": "cd_mascara.asc", "limit": str(lim)}
+    qq = (str(q).strip() if q else "")
+    if qq:
+        params["or"] = (f"(cd_mascara.ilike.*{qq}*,ds_mascara.ilike.*{qq}*,"
+                        f"cd_conta_contabil.ilike.*{qq}*)")
+    dados = _sb_get("bi_taux_plano_contas", params) or []
+
+    # qtd_lancamentos + vl_realizado + centros_custo por conta: agregação no SQL via v2
+    # (o catálogo bi_taux não tem movimento; sem isto, o valor da conta sai zerado)
+    resumo = _dre_resumo_conta_v2(anomes_ini, anomes_fim)
+    for d in dados:
+        info = resumo.get(str(d.get("cd_conta_contabil") or ""), {})
+        d["qtd_lancamentos"] = info.get("qtd_lancamentos", 0)
+        d["vl_realizado"] = info.get("vl_realizado", 0.0)
+        cc = info.get("centros_custo", [])
+        d["centros_custo"] = cc if isinstance(cc, list) else []
+        d["qtd_centros"] = len(d["centros_custo"])
+
+    return {
+        "dados": dados,
+        "total": len(dados),
+        "catalogo_vazio": len(dados) == 0,
+    }
+
+
+@app.post("/api/bi/contabilidade/plano-contas/sync")
+def sync_plano_contas(usuario=Depends(validar_token_ou_cron_secret)):
+    """Sincroniza o plano de contas de RESULTADO do Senior (e045pla, SQL Server)
+    p/ bi_taux_plano_contas (Supabase), trazendo a DESCRIÇÃO (descta). NÃO usa
+    Oracle. Upsert por (cd_empresa, cd_conta_contabil) — exige a constraint UNIQUE."""
+    conn = get_connection("onprem")
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT codemp, clacta, descta, ctared, nivcta
+            FROM dbo.e045pla
+            WHERE sitcta = 'A'
+              AND clacta IS NOT NULL AND LTRIM(RTRIM(clacta)) <> ''
+              AND clacta NOT LIKE '1%' AND clacta NOT LIKE '2%'
+            ORDER BY clacta
+        """)
+        rows = []
+        for codemp, clacta, descta, ctared, nivcta in cur.fetchall():
+            masc = str(clacta or "").strip()
+            if not masc:
+                continue
+            rows.append({
+                "cd_empresa": str(codemp or "").strip() or None,
+                "cd_mascara": masc,
+                "ds_mascara": (str(descta).strip() if descta else None),
+                "cd_mascara_1": masc[:5] or None,
+                "cd_mascara_2": masc[:3] or None,
+                "cd_mascara_3": masc[:2] or None,
+                "cd_mascara_4": masc[:1] or None,
+                "cd_conta_contabil": (str(ctared).strip() if ctared is not None else None),
+                "ds_mascara_1": None,
+            })
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    print(f"[PLANO CONTAS SYNC] e045pla resultado: {len(rows)} contas")
+    res = _sb_upsert("bi_taux_plano_contas", rows, "cd_empresa,cd_conta_contabil")
+    return {
+        "success": True,
+        "origem": "ERP Senior e045pla (SQL Server)",
+        "destino": "bi_taux_plano_contas",
+        "total_sincronizado": res["total"],
+    }
+
+
+@app.get("/api/bi/contabilidade/plano-contas-disponivel")
+def listar_plano_contas_disponivel(
+    modelo_id: Optional[str] = None,
+    empresa_id: str = "1",
+    somente_resultado: bool = True,
+    q: Optional[str] = None,
+    limite: Optional[int] = None,
+    anomes_ini: Optional[str] = None,
+    anomes_fim: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    """Contas p/ o montador da DRE, completas: descrição + nível + qtd + valor +
+    ja_usada / codigo_linha / linha_vinculada + centros_custo[]. Chama a RPC
+    bi_dre_plano_contas_disponivel_v1 (p_modelo_id, p_empresa_id, p_somente_resultado
+    — cruza bi_taux_plano_contas + bi_vm + regras) e ANEXA os centros de custo por
+    conta vindos da agregação v2 (bi_dre_plano_contas_disponivel_v2), pois a v1
+    sozinha NÃO devolve centros_custo. Busca `q` aplicada na API (a RPC v1 não tem
+    p_q). anomes_ini/anomes_fim (opcionais) recortam os centros/valores ao período."""
+    dados = _bi_unwrap_rpc(
+        _sb_rpc("bi_dre_plano_contas_disponivel_v1", {
+            "p_modelo_id": (str(modelo_id).strip() or None) if modelo_id else None,
+            "p_empresa_id": (str(empresa_id).strip() or "1"),
+            "p_somente_resultado": bool(somente_resultado),
+        }),
+        "bi_dre_plano_contas_disponivel_v1",
+    ) or []
+
+    if q:
+        termo = str(q).strip().lower()
+        dados = [d for d in dados
+                 if termo in str(d.get("cd_mascara") or "").lower()
+                 or termo in str(d.get("ds_mascara") or "").lower()
+                 or termo in str(d.get("cd_conta_contabil") or "").lower()]
+
+    dados = dados[:(10000 if limite is None else max(1, min(int(limite), 10000)))]
+
+    # A v1 NÃO traz centros de custo — anexa centros_custo[] + qtd_centros (e
+    # completa qtd_lancamentos/vl_realizado quando vierem zerados) a partir da
+    # agregação v2 no período. Mapeia por cd_conta_contabil E por cd_mascara p/
+    # casar com qualquer das chaves que a v1 trouxer. Tolerante a falha da v2.
+    por_conta: dict = {}
+    por_mascara: dict = {}
+    try:
+        def _anomes_opt(v):
+            return (re.sub(r"\D", "", str(v))[:6] or None) if v else None
+        v2 = _bi_unwrap_rpc(
+            _sb_rpc("bi_dre_plano_contas_disponivel_v2", {
+                "p_anomes_ini": _anomes_opt(anomes_ini),
+                "p_anomes_fim": _anomes_opt(anomes_fim),
+                "p_modelo_id": (str(modelo_id).strip() or None) if modelo_id else None,
+                "p_q": None,
+                "p_limit": 10000,
+            }),
+            "bi_dre_plano_contas_disponivel_v2",
+        ) or []
+        for x in v2:
+            info = {
+                "qtd_lancamentos": int(x.get("qtd_lancamentos") or 0),
+                "vl_realizado": round(float(x.get("vl_realizado") or 0), 2),
+                "centros_custo": _dre_norm_centros(
+                    x.get("centros_custo") or x.get("centros_custos")),
+            }
+            conta = str(x.get("cd_conta_contabil") or "").strip()
+            masc = str(x.get("cd_mascara") or "").strip()
+            if conta:
+                por_conta[conta] = info
+            if masc:
+                por_mascara[masc] = info
+    except Exception:
+        por_conta, por_mascara = {}, {}
+
+    for d in dados:
+        info = (por_conta.get(str(d.get("cd_conta_contabil") or "").strip())
+                or por_mascara.get(str(d.get("cd_mascara") or "").strip())
+                or {})
+        cc = info.get("centros_custo", [])
+        d["centros_custo"] = cc if isinstance(cc, list) else []
+        d["qtd_centros"] = len(d["centros_custo"])
+        if not d.get("qtd_lancamentos"):
+            d["qtd_lancamentos"] = info.get("qtd_lancamentos", 0)
+        if not d.get("vl_realizado"):
+            d["vl_realizado"] = info.get("vl_realizado", 0.0)
+
+    return {
+        "modelo_id": modelo_id,
+        "empresa_id": empresa_id,
+        "somente_resultado": somente_resultado,
+        "total": len(dados),
+        "dados": dados,
+    }
+
+
+@app.get("/api/bi/contabilidade/dre-dinamica/plano-contas")
+def bi_dre_dinamica_plano_contas(
+    anomes_ini: Optional[str] = None,
+    anomes_fim: Optional[str] = None,
+    modelo_id: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: Optional[int] = None,
+    usuario=Depends(validar_token),
+):
+    """Lista contas/máscaras do ERP p/ o montador da DRE dinâmica. Chama a RPC
+    bi_dre_plano_contas_disponivel_v2, que já traz ds_mascara, nivel, vl_realizado,
+    ja_vinculada/linhas_vinculadas e centros_custo[] (cada centro com ds_centro_custos).
+    A API só blinda centros_custo (sempre lista) + adiciona qtd_centros e ds_conta
+    (alias de ds_mascara). Só Supabase (sem Oracle/ERP)."""
+    def _anomes_opt(v):
+        if not v:
+            return None
+        return re.sub(r"\D", "", str(v))[:6] or None
+
+    dados = _bi_unwrap_rpc(
+        _sb_rpc("bi_dre_plano_contas_disponivel_v2", {
+            "p_anomes_ini": _anomes_opt(anomes_ini),
+            "p_anomes_fim": _anomes_opt(anomes_fim),
+            "p_modelo_id": (str(modelo_id).strip() or None) if modelo_id else None,
+            "p_q": (str(q).strip() or None) if q else None,
+            "p_limit": (10000 if limit is None else max(1, min(int(limit), 10000))),
+        }),
+        "bi_dre_plano_contas_disponivel_v2",
+    ) or []
+
+    # A v2 já traz ds_mascara, nivel, vl_realizado e centros_custo (com ds_centro_custos).
+    # Aqui só blindamos centros_custo (lista, nunca null/string) + qtd_centros, e
+    # expomos ds_conta como alias de ds_mascara (compat com versões do front).
+    for item in dados:
+        centros = item.get("centros_custo") or item.get("centros_custos") or []
+        if isinstance(centros, str):
+            try:
+                centros = json.loads(centros)
+            except Exception:
+                centros = []
+        if not isinstance(centros, list):
+            centros = []
+        item["centros_custo"] = _dre_norm_centros(centros)
+        item["qtd_centros"] = len(item["centros_custo"])
+        if item.get("ds_conta") is None:
+            item["ds_conta"] = item.get("ds_mascara") or ""
+
+    return {"dados": dados}
+
+
+@app.post("/api/bi/contabilidade/dre-dinamica/vincular-contas")
+def bi_dre_dinamica_vincular_contas(
+    body: DreVincularContasPayload,
+    usuario=Depends(validar_token),
+):
+    """Vincula contas/máscaras a uma linha da DRE dinâmica (insere em
+    bi_dre_linha_regra). Não duplica vínculo já existente (mesma linha + tipo +
+    máscara/conta). Retorna criados / ignorados_por_duplicidade."""
+    tipo_regra = (body.tipo_regra or "MASCARA_CONTA").upper().strip()
+    operador = (body.operador or "COMECA_COM").upper().strip()
+    if tipo_regra not in ("MASCARA_CONTA", "CONTA_CONTABIL"):
+        raise HTTPException(status_code=422,
+                            detail="tipo_regra deve ser MASCARA_CONTA ou CONTA_CONTABIL.")
+    if body.sinal not in (-1, 1):
+        raise HTTPException(status_code=422, detail="sinal deve ser 1 ou -1.")
+    if not str(body.modelo_id or "").strip() or not str(body.linha_id or "").strip():
+        raise HTTPException(status_code=422, detail="Informe modelo_id e linha_id.")
+
+    criados, ignorados = 0, 0
+    for item in body.contas:
+        if tipo_regra == "MASCARA_CONTA":
+            chave_col, chave_val = "cd_mascara", (item.cd_mascara or "").strip()
+        else:
+            chave_col, chave_val = "cd_conta_contabil", (item.cd_conta_contabil or "").strip()
+        if not chave_val:
+            continue
+        # dedup: já existe vínculo p/ esta linha + tipo + chave?
+        existentes = _sb_get("bi_dre_linha_regra", {
+            "select": "id",
+            "linha_id": f"eq.{body.linha_id}",
+            "tipo_regra": f"eq.{tipo_regra}",
+            chave_col: f"eq.{chave_val}",
+        }) or []
+        if existentes:
+            ignorados += 1
+            continue
+        _sb_post("bi_dre_linha_regra", {
+            "modelo_id": body.modelo_id,
+            "linha_id": body.linha_id,
+            "tipo_regra": tipo_regra,
+            "operador": operador,
+            "cd_mascara": chave_val if tipo_regra == "MASCARA_CONTA" else None,
+            "cd_conta_contabil": chave_val if tipo_regra == "CONTA_CONTABIL" else None,
+            "sinal": body.sinal,
+            "prioridade": body.prioridade,
+            "ativo": True,
+        })
+        criados += 1
+
+    if criados == 0 and ignorados == 0:
+        raise HTTPException(status_code=422, detail="Nenhuma conta válida para vincular.")
+    return {
+        "mensagem": "Vínculos processados.",
+        "criados": criados,
+        "ignorados_por_duplicidade": ignorados,
+    }
+
+
+@app.get("/api/bi/contabilidade/dre-dinamica")
+def bi_contabilidade_dre_dinamica(
+    anomes_ini: str = Query(...),
+    anomes_fim: str = Query(...),
+    modelo_id: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    """DRE dinâmica gerencial: modelos/linhas/regras configuráveis no Supabase
+    (bi_dre_modelo / bi_dre_linha / bi_dre_linha_regra). Chama a RPC
+    public.bi_dre_dinamica_v1 (realizado de bi_vm_lanc_contabil) e devolve as
+    linhas montadas. NÃO consulta Oracle/UpQuery — só Supabase."""
+    ai = _bi_contab_normalizar_anomes(anomes_ini)
+    af = _bi_contab_normalizar_anomes(anomes_fim, ai)
+    if int(af) < int(ai):
+        raise HTTPException(status_code=422, detail="anomes_fim não pode ser menor que anomes_ini.")
+    mid = (str(modelo_id).strip() if modelo_id else "") or None
+
+    print(f"[DRE DINAMICA] anomes_ini={ai}")
+    print(f"[DRE DINAMICA] anomes_fim={af}")
+    print(f"[DRE DINAMICA] modelo_id={mid}")
+
+    dados = _bi_unwrap_rpc(
+        _sb_rpc("bi_dre_dinamica_v1", {
+            "p_anomes_ini": ai,
+            "p_anomes_fim": af,
+            "p_modelo_id": mid,
+        }),
+        "bi_dre_dinamica_v1",
+    ) or []
+
+    print(f"[DRE DINAMICA] linhas retornadas={len(dados)}")
+    return {
+        "anomes_ini": ai,
+        "anomes_fim": af,
+        "modelo_id": mid,
+        "dados": dados,
+    }
+
+
+@app.get("/api/admin/erp/tabelas-candidatas-dre")
+def listar_tabelas_candidatas_dre(usuario=Depends(validar_token)):
+    """Descobre, no SQL Server do ERP (NÃO no Supabase), tabelas cujo nome sugere
+    de/para da DRE (DRE/DEPARA/PLANO/MASCARA/GERENC). Read-only — só sys.tables.
+    Serve p/ achar a tabela real antes de criar o /sync-depara-dre."""
+    conn = get_connection("onprem")
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT s.name AS schema_name, t.name AS table_name
+            FROM sys.tables t
+            INNER JOIN sys.schemas s ON s.schema_id = t.schema_id
+            WHERE t.name LIKE '%DRE%' OR t.name LIKE '%DEPARA%'
+               OR t.name LIKE '%PLANO%' OR t.name LIKE '%MASCARA%'
+               OR t.name LIKE '%GERENC%'
+            ORDER BY s.name, t.name
+        """)
+        dados = [{"schema_name": r[0], "table_name": r[1]} for r in cursor.fetchall()]
+        return {"success": True, "total": len(dados), "dados": dados}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/admin/erp/colunas-candidatas-dre")
+def listar_colunas_candidatas_dre(
+    tabela: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    """Colunas (no SQL Server do ERP) que sugerem de/para da DRE
+    (CTA/CONTA/CCU/CENTRO/MASC/DRE/GERENC). Informe `tabela` p/ ver só uma. Read-only."""
+    conn = get_connection("onprem")
+    try:
+        cursor = conn.cursor()
+        sql = """
+            SELECT s.name, t.name, c.name
+            FROM sys.tables t
+            INNER JOIN sys.schemas s ON s.schema_id = t.schema_id
+            INNER JOIN sys.columns c ON c.object_id = t.object_id
+            WHERE (c.name LIKE '%CTA%' OR c.name LIKE '%CONTA%'
+                OR c.name LIKE '%CCU%' OR c.name LIKE '%CENTRO%'
+                OR c.name LIKE '%MASC%' OR c.name LIKE '%DRE%'
+                OR c.name LIKE '%GERENC%')
+        """
+        params = []
+        if tabela:
+            sql += " AND t.name = ?"
+            params.append(tabela)
+        sql += " ORDER BY s.name, t.name, c.column_id"
+        cursor.execute(sql, params)
+        dados = [{"schema_name": r[0], "table_name": r[1], "column_name": r[2]}
+                 for r in cursor.fetchall()]
+        return {"success": True, "total": len(dados), "dados": dados}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ===================== DRE REALIZADO (família /api/dre/*) =====================
+# Tela "DRE" do Lovable (plano de outra IA). O resumo é derivado do realizado já
+# carregado em bi_vm_lanc_contabil (vem de E640RAT, COM o filtro de encerramento
+# aplicado na carga — ver ação VM_LANC_CONTABIL). Agrega via a RPC
+# bi_dre_plano_contas_disponivel_v2 (que já soma bi_vm por conta no banco) e
+# classifica por PREFIXO da máscara. Grupos validados ao centavo vs dez/2025:
+#   receita_bruta_e_deducoes = 411,412 | receita_operacional = 41x
+#   custos = 31x | despesas = 321 | receitas_nao_operacionais = 42x
+#   resultado_dre = soma de TODAS as contas de resultado (inclui IRPJ/CSLL 51x).
+# Sem RPC nova/migration — só restart.
+
+def _dre_real_to_anomes(*valores):
+    """1º valor não-vazio → anomes int (YYYYMM). Aceita 202506 ou '2026-06-01'."""
+    for v in valores:
+        if v is None:
+            continue
+        s = str(v).strip().replace("-", "")
+        if len(s) >= 6 and s[:6].isdigit():
+            return int(s[:6])
+    return None
+
+
+def _dre_real_meses(anomes_ini, anomes_fim):
+    """anomes (YYYYMM) inclusivo, mês a mês."""
+    if not anomes_ini or not anomes_fim:
+        return []
+    y, m = divmod(anomes_ini, 100)
+    yf, mf = divmod(anomes_fim, 100)
+    out = []
+    while (y, m) <= (yf, mf):
+        out.append(y * 100 + m)
+        m = m + 1 if m < 12 else 1
+        if m == 1:
+            y += 1
+    return out
+
+
+def _dre_real_grupos(rows):
+    """Soma as contas (saída da v2) nos grupos do resumo, por prefixo de máscara."""
+    g = {"receita_operacional": 0.0, "receita_bruta_e_deducoes": 0.0,
+         "custos": 0.0, "despesas": 0.0, "receitas_nao_operacionais": 0.0,
+         "resultado_dre": 0.0}
+    for r in rows or []:
+        m = str(r.get("cd_mascara") or "")
+        v = float(r.get("vl_realizado") or 0)
+        g["resultado_dre"] += v
+        if m[:3] in ("411", "412"):
+            g["receita_bruta_e_deducoes"] += v
+        if m[:2] == "41":
+            g["receita_operacional"] += v
+        if m[:2] == "31":
+            g["custos"] += v
+        if m[:3] == "321":
+            g["despesas"] += v
+        if m[:2] == "42":
+            g["receitas_nao_operacionais"] += v
+    return {k: round(v, 2) for k, v in g.items()}
+
+
+def _dre_real_v2(anomes_ini, anomes_fim):
+    """Contas agregadas (bi_vm) no período via a RPC v2.
+    IMPORTANTE: a RPC devolve o jsonb embrulhado ([{nome_funcao: [...]}]) — é
+    obrigatório desembrulhar com _bi_unwrap_rpc (igual aos demais consumidores
+    desta mesma RPC: _dre_resumo_conta_v2 e bi_dre_dinamica_plano_contas). Sem
+    isso, _dre_real_grupos itera o invólucro, não acha cd_mascara/vl_realizado e
+    TODOS os grupos saem zerados. anomes vai como string de dígitos (consistente
+    com os outros chamadores)."""
+    return _bi_unwrap_rpc(
+        _sb_rpc("bi_dre_plano_contas_disponivel_v2", {
+            "p_anomes_ini": str(anomes_ini),
+            "p_anomes_fim": str(anomes_fim),
+            "p_modelo_id": None, "p_q": None, "p_limit": 10000,
+        }),
+        "bi_dre_plano_contas_disponivel_v2",
+    ) or []
+
+
+@app.get("/api/dre/modelos")
+def dre_modelos(usuario=Depends(validar_token)):
+    """Lista os modelos de DRE configuráveis (bi_dre_modelo), padrão primeiro."""
+    return _sb_get("bi_dre_modelo",
+                   {"select": "*", "order": "padrao.desc,nome.asc"}) or []
+
+
+# ----- MONTADOR DA DRE GERENCIAL: criar/editar modelo e linhas -----
+# Endpoints que faltavam: o Montador não conseguia CRIAR nada porque só existia
+# o GET acima e o POST de vincular-contas (que grava em bi_dre_linha_regra, não
+# em bi_dre_modelo/bi_dre_linha). CONFIRA os nomes das colunas no Supabase antes
+# de usar em produção (chame GET /api/dre/modelos e veja as chaves retornadas).
+
+class DreModeloPayload(BaseModel):
+    nome: str
+    descricao: Optional[str] = None
+    padrao: bool = False
+    ativo: bool = True
+
+
+@app.post("/api/dre/modelos")
+def dre_modelo_criar(body: DreModeloPayload, usuario=Depends(validar_token)):
+    """Cria um modelo de DRE gerencial (bi_dre_modelo)."""
+    nome = (body.nome or "").strip()
+    if not nome:
+        raise HTTPException(status_code=422, detail="Informe o nome do modelo.")
+    criado = _sb_post("bi_dre_modelo", {
+        "nome": nome,
+        "descricao": body.descricao,
+        "padrao": bool(body.padrao),
+        "ativo": bool(body.ativo),
+    })
+    return criado[0] if isinstance(criado, list) and criado else criado
+
+
+@app.patch("/api/dre/modelos/{modelo_id}")
+def dre_modelo_atualizar(modelo_id: str, body: DreModeloPayload,
+                         usuario=Depends(validar_token)):
+    """Atualiza um modelo de DRE (nome/descrição/padrão/ativo)."""
+    if not str(modelo_id).strip():
+        raise HTTPException(status_code=422, detail="Informe o modelo_id.")
+    payload = {
+        "nome": (body.nome or "").strip(),
+        "descricao": body.descricao,
+        "padrao": bool(body.padrao),
+        "ativo": bool(body.ativo),
+    }
+    return _sb_patch("bi_dre_modelo", {"id": f"eq.{modelo_id}"}, payload,
+                     prefer="return=representation")
+
+
+class DreLinhaPayload(BaseModel):
+    modelo_id: str
+    codigo_linha: str
+    descricao: str
+    tipo_linha: str = "CONTA"          # CONTA | CALCULO | TOTAL
+    ordem: int = 0
+    formula: Optional[str] = None
+    ativo: bool = True
+
+
+@app.get("/api/dre/linhas")
+def dre_linhas_listar(modelo_id: Optional[str] = None,
+                      incluir_inativas: bool = False,
+                      usuario=Depends(validar_token)):
+    """Lista as linhas de um modelo de DRE (bi_dre_linha), ordenadas por `ordem`.
+    Filtra por modelo_id quando informado; por padrão só linhas ativas."""
+    params = {"select": "*", "order": "ordem.asc"}
+    if modelo_id and str(modelo_id).strip():
+        params["modelo_id"] = f"eq.{str(modelo_id).strip()}"
+    if not incluir_inativas:
+        params["ativo"] = "eq.true"
+    return _sb_get("bi_dre_linha", params) or []
+
+
+@app.post("/api/dre/linhas")
+def dre_linha_criar(body: DreLinhaPayload, usuario=Depends(validar_token)):
+    """Cria uma linha de um modelo de DRE (bi_dre_linha)."""
+    if not str(body.modelo_id).strip() or not str(body.codigo_linha).strip():
+        raise HTTPException(status_code=422,
+                            detail="Informe modelo_id e codigo_linha.")
+    criado = _sb_post("bi_dre_linha", {
+        "modelo_id": body.modelo_id,
+        "codigo_linha": body.codigo_linha.strip().upper(),
+        "descricao": (body.descricao or "").strip(),
+        "tipo_linha": (body.tipo_linha or "CONTA").upper(),
+        "ordem": body.ordem,
+        "formula": body.formula,
+        "ativo": bool(body.ativo),
+    })
+    return criado[0] if isinstance(criado, list) and criado else criado
+
+
+@app.patch("/api/dre/linhas/{linha_id}")
+def dre_linha_atualizar(linha_id: str, body: DreLinhaPayload,
+                        usuario=Depends(validar_token)):
+    """Atualiza uma linha de DRE (bi_dre_linha)."""
+    if not str(linha_id).strip():
+        raise HTTPException(status_code=422, detail="Informe o linha_id.")
+    payload = {
+        "modelo_id": body.modelo_id,
+        "codigo_linha": body.codigo_linha.strip().upper(),
+        "descricao": (body.descricao or "").strip(),
+        "tipo_linha": (body.tipo_linha or "CONTA").upper(),
+        "ordem": body.ordem,
+        "formula": body.formula,
+        "ativo": bool(body.ativo),
+    }
+    return _sb_patch("bi_dre_linha", {"id": f"eq.{linha_id}"}, payload,
+                     prefer="return=representation")
+
+
+@app.delete("/api/dre/linhas/{linha_id}")
+def dre_linha_remover(linha_id: str, usuario=Depends(validar_token)):
+    """Desativa (soft-delete) uma linha de DRE."""
+    if not str(linha_id).strip():
+        raise HTTPException(status_code=422, detail="Informe o linha_id.")
+    _sb_patch("bi_dre_linha", {"id": f"eq.{linha_id}"}, {"ativo": False})
+    return {"mensagem": "Linha desativada.", "linha_id": linha_id}
+
+
+@app.get("/api/dre/realizado/resumo")
+def dre_realizado_resumo(
+    data_ini: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    anomes_ini: Optional[str] = None,
+    anomes_fim: Optional[str] = None,
+    tipo: str = "MENSAL",
+    comparar_orcamento: bool = False,
+    codemp: Optional[int] = 1,
+    usuario=Depends(validar_token),
+):
+    """Resumo da DRE realizada por grupo contábil. Período aceita data ISO
+    (data_ini/data_fim) OU anomes (YYYYMM). tipo=MENSAL → 1 linha por mês;
+    ANUAL → 1 linha consolidada do período."""
+    ai = _dre_real_to_anomes(anomes_ini, data_ini)
+    af = _dre_real_to_anomes(anomes_fim, data_fim)
+    if not ai or not af:
+        raise HTTPException(
+            status_code=422,
+            detail="Informe data_ini/data_fim (YYYY-MM-DD) ou anomes_ini/anomes_fim (YYYYMM).",
+        )
+    if af < ai:
+        ai, af = af, ai
+
+    print(f"[DRE RESUMO] periodo={ai}..{af} tipo={tipo} orc={comparar_orcamento}")
+    dados = []
+    if str(tipo or "").upper() == "ANUAL":
+        grupos = _dre_real_grupos(_dre_real_v2(ai, af))
+        dados.append({"anomes": None, "anomes_ini": ai, "anomes_fim": af, **grupos})
+    else:
+        for ym in _dre_real_meses(ai, af):
+            dados.append({"anomes": ym, **_dre_real_grupos(_dre_real_v2(ym, ym))})
+    return dados
+
+
+@app.get("/api/bi/contabilidade/{nome_base}")
+def listar_bi_contabilidade(
+    nome_base: str,
+    anomes_ini: str = Query(...),
+    anomes_fim: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    usuario=Depends(validar_token),
+):
+    anomes_ini = _bi_contab_normalizar_anomes(anomes_ini)
+    anomes_fim = _bi_contab_normalizar_anomes(anomes_fim, anomes_ini)
+    nome = str(nome_base or "").strip().upper()
+    aliases = {
+        "ORC_DRE": "VM_ORC_DRE",
+        "VM_ORC_DRE": "VM_ORC_DRE",
+        "LANC_CONTABIL": "VM_LANC_CONTABIL",
+        "VM_LANC_CONTABIL": "VM_LANC_CONTABIL",
+        "BALANCO": "ETL_V_BALANCO_PATRIMONIAL",
+        "BALANCO_PATRIMONIAL": "ETL_V_BALANCO_PATRIMONIAL",
+        "ETL_V_BALANCO_PATRIMONIAL": "ETL_V_BALANCO_PATRIMONIAL",
+    }
+    nome_acao = aliases.get(nome)
+    if not nome_acao:
+        raise HTTPException(
+            status_code=404,
+            detail="Base contábil não mapeada.",
+        )
+    cfg = BI_CONTABILIDADE_MAP[nome_acao]
+    table = cfg["supabase"]
+    limit = max(1, min(int(limit or 100), 500))
+    offset = max(0, int(offset or 0))
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    params = [
+        ("select", "*"),
+        ("anomes_referente", f"gte.{anomes_ini}"),
+        ("anomes_referente", f"lte.{anomes_fim}"),
+        ("order", "anomes_referente.asc"),
+        ("limit", str(limit)),
+        ("offset", str(offset)),
+    ]
+    resp = requests.get(
+        url,
+        headers=_bi_sb_headers("count=exact"),
+        params=params,
+        timeout=120,
+    )
+    if resp.status_code not in (200, 206):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao consultar {table}: {resp.status_code} - {resp.text}",
+        )
+    total = 0
+    content_range = resp.headers.get("Content-Range", "")
+    if "/" in content_range:
+        try:
+            total = int(content_range.split("/")[-1])
+        except Exception:
+            total = 0
+    return {
+        "base": nome_acao,
+        "tabela_supabase": table,
+        "anomes_ini": anomes_ini,
+        "anomes_fim": anomes_fim,
+        "limit": limit,
+        "offset": offset,
+        "total_registros": total,
+        "dados": resp.json(),
     }
 
 
