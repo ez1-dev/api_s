@@ -3257,9 +3257,24 @@ def _fetch_children_bom(cursor, codemp: int, codmod: str, codder: Optional[str],
             COALESCE(P.DESPRO, '') AS descricao_componente,
             COALESCE(P.UNIMED, '') AS unidade_medida,
             COALESCE(P.TIPPRO, '') AS tipo_produto,
+            P.CODFAM AS familia_componente,
+            P.CODORI AS origem_componente,
             CAST(CT.QTDUTI AS FLOAT) AS quantidade_utilizada,
             CAST(COALESCE(CT.PERPRD, 0) AS FLOAT) AS perda_percentual,
-            CAST(COALESCE(CT.PRDQTD, 0) AS FLOAT) AS quantidade_perda
+            CAST(COALESCE(CT.PRDQTD, 0) AS FLOAT) AS quantidade_perda,
+            CAST(COALESCE(D.PREMED, 0) AS FLOAT) AS preco_medio,
+            D.DATMED AS data_preco_medio,
+            CAST(COALESCE(D.PREUEN, 0) AS FLOAT) AS preco_ultima_entrada_cadastro,
+            D.DATUEN AS data_ultima_entrada_cadastro,
+            CAST(COALESCE(D.PRECUS, 0) AS FLOAT) AS custo_calculado,
+            D.DATCUS AS data_custo_calculado,
+            CAST(COALESCE(D.CUSSAL, 0) AS FLOAT) AS custo_salarial,
+            CAST(COALESCE(D.CUSENC, 0) AS FLOAT) AS custo_encargos,
+            ULTNF.NUMERO_NF_ULTIMA_COMPRA AS numero_nf_ultima_compra,
+            COALESCE(ULTNF.SERIE_NF_ULTIMA_COMPRA, '') AS serie_nf_ultima_compra,
+            ULTNF.DATA_ENTRADA_NF_ULTIMA_COMPRA AS data_entrada_nf_ultima_compra,
+            COALESCE(ULTNF.FORNECEDOR_ULTIMA_COMPRA, '') AS fornecedor_ultima_compra,
+            CAST(COALESCE(ULTNF.PRECO_NF_ULTIMA_COMPRA, 0) AS FLOAT) AS preco_nf_ultima_compra
         FROM E700CTM CT
         LEFT JOIN E700MOD M
             ON M.CODEMP = CT.CODEMP
@@ -3267,6 +3282,31 @@ def _fetch_children_bom(cursor, codemp: int, codmod: str, codder: Optional[str],
         LEFT JOIN E075PRO P
             ON P.CODEMP = CT.CODEMP
            AND P.CODPRO = CT.CODCMP
+        LEFT JOIN E075DER D
+            ON D.CODEMP = CT.CODEMP
+           AND D.CODPRO = CT.CODCMP
+           AND COALESCE(D.CODDER, '') = COALESCE(CT.DERCMP, '')
+        OUTER APPLY (
+            SELECT TOP 1
+                H.NUMNFC AS NUMERO_NF_ULTIMA_COMPRA,
+                H.CODSNF AS SERIE_NF_ULTIMA_COMPRA,
+                H.DATENT AS DATA_ENTRADA_NF_ULTIMA_COMPRA,
+                COALESCE(F.APEFOR, F.NOMFOR, '') AS FORNECEDOR_ULTIMA_COMPRA,
+                CAST(I.PREUNI AS FLOAT) AS PRECO_NF_ULTIMA_COMPRA
+            FROM E440IPC I
+            INNER JOIN E440NFC H
+                ON H.CODEMP = I.CODEMP
+               AND H.CODFIL = I.CODFIL
+               AND H.CODFOR = I.CODFOR
+               AND H.NUMNFC = I.NUMNFC
+               AND H.CODSNF = I.CODSNF
+            LEFT JOIN E095FOR F
+                ON F.CODFOR = H.CODFOR
+            WHERE I.CODEMP = CT.CODEMP
+              AND I.CODPRO = CT.CODCMP
+              AND COALESCE(I.CODDER, '') = COALESCE(CT.DERCMP, '')
+            ORDER BY COALESCE(H.DATENT, H.DATEMI) DESC, H.NUMNFC DESC, I.SEQIPC DESC
+        ) ULTNF
         WHERE CT.CODEMP = ?
           AND CT.CODMOD = ?
     """
@@ -3320,7 +3360,11 @@ def _build_bom_rows(cursor, codemp: int, codmod: str, codder: Optional[str], max
     desc_cache = {}
     max_rows = 5000
 
-    def walk(modelo_atual: str, derivacao_atual: Optional[str], nivel: int, caminho: list):
+    familias_mp = {'MP', 'MPM', 'MAT-PRI', 'MATPRIMA', 'BR-CHA', 'BR-QUA', 'BR-RED', 'PER-U', 'PER-T', 'TUBO'}
+    origens_mp = {'MP', 'MPM', '200'}
+
+    def walk(modelo_atual: str, derivacao_atual: Optional[str], nivel: int, caminho: list,
+             qtd_acumulada_pai: float = 1.0):
         if nivel > max_nivel:
             return
         if len(rows) >= max_rows:
@@ -3340,19 +3384,68 @@ def _build_bom_rows(cursor, codemp: int, codmod: str, codder: Optional[str], max
                 else:
                     possui_filhos = _model_exists(cursor, codemp, comp, exists_cache)
 
+            # Quantidade acumulada na árvore (multiplica pelo caminho do pai)
+            qtd_utilizada = float(item.get('quantidade_utilizada') or 0)
+            qtd_perda = float(item.get('quantidade_perda') or 0)
+            qtd_acumulada = qtd_acumulada_pai * qtd_utilizada
+            qtd_acumulada_com_perda = qtd_acumulada_pai * (qtd_utilizada + qtd_perda)
+
+            # Custo unitário de referência (ordem de prioridade)
+            preco_medio = float(item.get('preco_medio') or 0)
+            preco_ultima_nf = float(item.get('preco_nf_ultima_compra') or 0)
+            preco_ultima_entrada = float(item.get('preco_ultima_entrada_cadastro') or 0)
+            custo_calculado = float(item.get('custo_calculado') or 0)
+            custo_unitario_ref = (
+                preco_medio
+                or preco_ultima_nf
+                or preco_ultima_entrada
+                or custo_calculado
+            )
+
             item['nivel'] = nivel
             item['caminho'] = ' > '.join([x.split('|')[0] for x in caminho] + [comp]) if comp else ' > '.join([x.split('|')[0] for x in caminho])
             item['possui_filhos'] = possui_filhos
             item['ciclo_detectado'] = ciclo
             item['descricao_modelo_pai'] = item.get('descricao_modelo_pai') or _model_description(cursor, codemp, modelo_atual, desc_cache)
+
+            item['quantidade_acumulada'] = round(qtd_acumulada, 6)
+            item['quantidade_acumulada_com_perda'] = round(qtd_acumulada_com_perda, 6)
+            item['custo_unitario_referencia'] = round(custo_unitario_ref, 6)
+            item['custo_total_referencia'] = round(qtd_acumulada * custo_unitario_ref, 6)
+            item['criterio_custo_referencia'] = (
+                'PRECO_MEDIO' if preco_medio else
+                'ULTIMA_NF' if preco_ultima_nf else
+                'ULTIMA_ENTRADA_CADASTRO' if preco_ultima_entrada else
+                'CUSTO_CALCULADO' if custo_calculado else
+                'SEM_CUSTO'
+            )
+
+            # Matéria-prima: folha da árvore com família/origem/tipo de MP
+            familia = (item.get('familia_componente') or '').strip().upper()
+            origem = (item.get('origem_componente') or '').strip().upper()
+            tipo = (item.get('tipo_produto') or '').strip().upper()
+            eh_materia_prima = (
+                not possui_filhos
+                and (
+                    tipo == 'C'
+                    or familia in familias_mp
+                    or origem in origens_mp
+                )
+            )
+            item['eh_materia_prima'] = eh_materia_prima
+            item['tipo_linha_estrutura'] = (
+                'MATERIA_PRIMA' if eh_materia_prima
+                else ('SUBCONJUNTO' if possui_filhos else 'COMPONENTE')
+            )
+
             rows.append(item)
 
             if possui_filhos and not ciclo and nivel < max_nivel and len(rows) < max_rows:
                 novo_caminho = list(caminho)
                 novo_caminho.append(path_key)
-                walk(comp, der_comp or None, nivel + 1, novo_caminho)
+                walk(comp, der_comp or None, nivel + 1, novo_caminho, qtd_acumulada)
 
-    walk(codmod, codder or None, 1, [f"{codmod}|{codder or ''}"])
+    walk(codmod, codder or None, 1, [f"{codmod}|{codder or ''}"], 1.0)
     return rows
 
 
@@ -3753,6 +3846,7 @@ def consultar_bom(
     codder: Optional[str] = None,
     situacao_cadastro: str = 'TODOS',
     max_nivel: int = 10,
+    somente_materias_primas: bool = False,
     usuario=Depends(validar_token)
 ):
     codmod = (codmod or '').strip()
@@ -3782,6 +3876,9 @@ def consultar_bom(
     unidade_raiz = row_um[0].strip() if row_um and isinstance(row_um[0], str) else (row_um[0] or '') if row_um else ''
     dados = _build_bom_rows(cursor, EMPRESA_PADRAO, codmod, codder, max_nivel, situacao_cadastro)
     conn.close()
+
+    if somente_materias_primas:
+        dados = [x for x in dados if x.get('eh_materia_prima')]
 
     total_itens = len(dados)
     total_niveis = max([item.get('nivel', 0) for item in dados], default=0)
@@ -9715,9 +9812,10 @@ def exportar_bom_excel(
     codder: Optional[str] = None,
     situacao_cadastro: str = 'TODOS',
     max_nivel: int = 10,
+    somente_materias_primas: bool = False,
     usuario=Depends(validar_token)
 ):
-    resposta = consultar_bom(codmod=codmod, codder=codder, situacao_cadastro=situacao_cadastro, max_nivel=max_nivel, usuario=usuario)
+    resposta = consultar_bom(codmod=codmod, codder=codder, situacao_cadastro=situacao_cadastro, max_nivel=max_nivel, somente_materias_primas=somente_materias_primas, usuario=usuario)
     resumo = [{'campo': _excel_label(chave), 'valor': valor} for chave, valor in resposta.get('cabecalho', {}).items()]
     resumo.extend([
         {'campo': 'Total Itens', 'valor': resposta.get('total_itens', 0)},
@@ -9725,6 +9823,69 @@ def exportar_bom_excel(
         {'campo': 'Total Modelos Filhos', 'valor': resposta.get('total_modelos_filhos', 0)},
     ])
     return _xlsx_response('estrutura_bom.xlsx', [('Resumo BOM', resumo, {'campo': 'Campo', 'valor': 'Valor'}), ('Estrutura BOM', resposta.get('dados', []), None)])
+
+
+@app.get('/api/export/bom-lote')
+def exportar_bom_lote_excel(
+    codmods: str,
+    situacao_cadastro: str = 'TODOS',
+    max_nivel: int = 10,
+    somente_materias_primas: bool = True,
+    usuario=Depends(validar_token)
+):
+    """Exporta a estrutura (BOM) de vários modelos num único Excel.
+
+    codmods = códigos separados por vírgula. Gera uma aba 'Consolidado' (todos
+    os itens, marcados pelo modelo raiz) + uma aba por código. Código inválido
+    entra na aba 'Falhas' em vez de derrubar a exportação inteira."""
+    codigos = [x.strip() for x in (codmods or '').split(',') if x.strip()]
+    # Dedup preservando a ordem (evita aba duplicada e trabalho repetido).
+    codigos = list(dict.fromkeys(codigos))
+    if not codigos:
+        raise HTTPException(status_code=400, detail='Informe ao menos um código em codmods (separados por vírgula).')
+
+    abas = []
+    consolidado = []
+    falhas = []
+
+    for codmod in codigos:
+        try:
+            resposta = consultar_bom(
+                codmod=codmod,
+                codder=None,
+                situacao_cadastro=situacao_cadastro,
+                max_nivel=max_nivel,
+                somente_materias_primas=somente_materias_primas,
+                usuario=usuario,
+            )
+        except HTTPException as exc:
+            falhas.append({'codigo_modelo': codmod, 'erro': str(exc.detail)})
+            continue
+        except Exception as exc:
+            falhas.append({'codigo_modelo': codmod, 'erro': str(exc)})
+            continue
+
+        descricao_raiz = resposta.get('cabecalho', {}).get('descricao_modelo', '')
+        for item in resposta.get('dados', []):
+            item['codigo_modelo_raiz'] = codmod
+            item['descricao_modelo_raiz'] = descricao_raiz
+            consolidado.append(item)
+
+        abas.append((codmod[:31], resposta.get('dados', []), None))
+
+    if not abas and falhas:
+        raise HTTPException(
+            status_code=404,
+            detail='Nenhum código válido para exportar: ' + '; '.join(
+                f"{f['codigo_modelo']} ({f['erro']})" for f in falhas
+            ),
+        )
+
+    abas.insert(0, ('Consolidado', consolidado, None))
+    if falhas:
+        abas.append(('Falhas', falhas, {'codigo_modelo': 'Código', 'erro': 'Erro'}))
+
+    return _xlsx_response('estrutura_bom_lote.xlsx', abas)
 
 
 @app.get('/api/export/compras-produto')
@@ -18244,10 +18405,21 @@ class _ImpressaoOPPdfJobPayload(BaseModel):
     cod_cre: Optional[str] = None
     # Qualidade dos desenhos no PDF: "rapida"=120 DPI, "normal"=150 DPI
     # (PADRÃO da impressão em massa), "alta"=200 DPI (mesma da tela).
-    qualidade: Any = None
+    # Aceita "qualidade" ou "qualidade_desenhos" (nome usado pelo front).
+    qualidade: Any = Field(
+        default=None,
+        validation_alias=AliasChoices("qualidade", "qualidade_desenhos"),
+    )
     # DPI direto (120/150/200) — alternativa ao `qualidade`; se ambos
     # vierem, `dpi` vence. Ausente/inválido cai no padrão 150.
     dpi: Any = None
+    # Como o PDF técnico entra no PDF final: "vetor" preserva vetor/texto
+    # (recomendado); "raster" mantém o fluxo antigo (PDF -> JPEG A4).
+    # No modo vetorial o DPI só vale para imagem/fallback raster.
+    modo_pdf_desenho: Any = Field(
+        default="vetor",
+        validation_alias=AliasChoices("modo_pdf_desenho", "modoPdfDesenho"),
+    )
 
 
 def _pdf_job_flag(valor, padrao: bool = True) -> bool:
@@ -18285,6 +18457,19 @@ def _pdf_job_dpi(qualidade=None, dpi=None) -> int:
     if texto in ("alta", "200"):
         return DESENHO_A4_DPI
     return DESENHO_A4_DPI_PADRAO_JOB
+
+
+def _pdf_job_modo_pdf_desenho(valor=None) -> str:
+    """Resolve como PDFs técnicos entram no PDF final.
+
+    vetor  = preserva o PDF original como vetor/texto (sem rasterizar).
+    raster = mantém o comportamento antigo: PDF -> JPEG A4 cacheado.
+    Ausente/inválido cai no padrão "vetor" — nunca levanta exceção.
+    """
+    texto = str(valor or "vetor").strip().lower()
+    if texto in ("raster", "imagem", "image", "jpg", "jpeg", "cache"):
+        return "raster"
+    return "vetor"
 
 
 def _pdf_job_fmt_data(valor) -> str:
@@ -18617,15 +18802,124 @@ def _pdf_job_render_op(escritor: "_PdfJobEscritor", dados_op: dict, *,
     escritor.paragrafo(dados_op.get("mensagem_responsabilidade") or "", tamanho=7)
 
 
-def _pdf_job_resolver_desenhos(desenhos, avisos: list, contexto: str):
+def _pdf_job_novo_diag_desenhos() -> dict:
+    """Acumulador para consolidar avisos repetidos de desenho num lote.
+
+    Em vez de 1 aviso por OP (que polui o status de um lote grande), guarda
+    a contagem/lista das OPs afetadas; o flush no fim do lote emite avisos
+    consolidados:
+      - pasta inacessível: 1 aviso para o lote inteiro;
+      - produto sem desenho: 1 aviso por produto distinto.
+    Os demais casos (arquivo sumido do share, erro ao abrir/contar páginas,
+    fallback vetor->raster) seguem detalhados por ocorrência.
+    """
+    return {
+        "pasta_inacessivel": {"caminho": None, "ops": []},
+        "produto_sem_desenho": {},  # cod_pro -> [contexto, ...]
+    }
+
+
+def _pdf_job_flush_diag_desenhos(diag, avisos: list, job=None) -> None:
+    """Emite os avisos consolidados do acumulador (uma vez por lote).
+
+    Guarda também o detalhe estruturado em job['desenhos_diagnostico']
+    (contagem/listas das OPs afetadas) sem inflar o avisos[].
+    """
+    if not diag:
+        return
+
+    pasta_str = str(Path(PASTA_DESENHOS_OP_PADRAO))
+
+    pasta_inac = diag.get("pasta_inacessivel") or {}
+    ops_pasta = pasta_inac.get("ops") or []
+    if ops_pasta:
+        caminho = pasta_inac.get("caminho") or pasta_str
+        avisos.append(
+            f"Pasta de desenhos inacessível: {caminho}. "
+            f"Afetou {len(ops_pasta)} OP(s)."
+        )
+
+    prod = diag.get("produto_sem_desenho") or {}
+    for cod_pro, ops_prod in prod.items():
+        qtd = len(ops_prod or [])
+        if cod_pro and cod_pro != "(sem produto)":
+            avisos.append(
+                f"Nenhum desenho encontrado para o produto {cod_pro} na pasta "
+                f"{pasta_str}. Afetou {qtd} OP(s)."
+            )
+        else:
+            avisos.append(
+                f"Nenhum desenho encontrado para {qtd} OP(s) sem produto "
+                f"resolvido na pasta {pasta_str}."
+            )
+
+    if job is not None:
+        job["desenhos_diagnostico"] = {
+            "pasta_inacessivel": {
+                "caminho": pasta_inac.get("caminho"),
+                "total_ops": len(ops_pasta),
+                "ops": list(ops_pasta),
+            },
+            "produto_sem_desenho": {
+                cod: {"total_ops": len(o or []), "ops": list(o or [])}
+                for cod, o in prod.items()
+            },
+        }
+
+
+def _pdf_job_resolver_desenhos(desenhos, avisos: list, contexto: str,
+                               cod_pro=None, diag=None):
     """Resolve a lista de desenhos da OP em [(nome, caminho, total_paginas)].
 
     Valida existência no share e conta páginas UMA vez (PDF multipágina) —
     a normalização paralela e a montagem reutilizam o resultado. Desenho
     com problema vira aviso e fica fora da lista.
+
+    A ausência de desenho NUNCA é silenciosa: o job continua gerando o PDF
+    da OP, mas registra em `avisos` o motivo exato pelo qual o desenho não
+    entrou — para o usuário distinguir no status:
+      1) pasta de desenhos inacessível (share fora do ar / UNC não montado
+         no contêiner / env PASTA_DESENHOS_OP errada);
+      2) produto da OP sem nenhum arquivo casando o padrão CODPRO/CODPRO-N;
+      3) arquivo listado mas sumido do share entre a busca e a montagem;
+      4) erro ao abrir/contar páginas do desenho (PDF corrompido, etc.).
     """
     resolvidos = []
     pasta = Path(PASTA_DESENHOS_OP_PADRAO)
+
+    # (1) Pasta de desenhos inacessível. Com acumulador de lote, registra a OP
+    # afetada e consolida 1 aviso no flush; sem acumulador, aviso por OP.
+    try:
+        pasta_ok = pasta.exists() and pasta.is_dir()
+    except Exception:
+        pasta_ok = False
+    if not pasta_ok:
+        if diag is not None:
+            pi = diag.setdefault("pasta_inacessivel", {"caminho": None, "ops": []})
+            pi["caminho"] = str(pasta)
+            pi["ops"].append(contexto)
+        else:
+            avisos.append(f"{contexto}: pasta de desenhos inacessível: {pasta}")
+        return []
+
+    # (2) Pasta acessível, mas nenhum arquivo casou o produto da OP (divergência
+    # de nome CODPRO/CODPRO-N ou produto sem desenho). Com acumulador, dedup
+    # por produto (1 aviso por produto distinto no flush); sem ele, por OP.
+    if not desenhos:
+        if diag is not None:
+            chave = (str(cod_pro).strip() if cod_pro else "") or "(sem produto)"
+            psd = diag.setdefault("produto_sem_desenho", {})
+            psd.setdefault(chave, []).append(contexto)
+        elif cod_pro:
+            avisos.append(
+                f"{contexto}: nenhum desenho encontrado para o produto "
+                f"{cod_pro} na pasta {pasta}"
+            )
+        else:
+            avisos.append(
+                f"{contexto}: nenhum desenho encontrado na pasta {pasta}"
+            )
+        return []
 
     for desenho in desenhos or []:
         nome = os.path.basename(str(desenho.get("nome_arquivo") or "").strip())
@@ -18648,48 +18942,145 @@ def _pdf_job_resolver_desenhos(desenhos, avisos: list, contexto: str):
     return resolvidos
 
 
+def _pdf_job_rect_area_util_a4():
+    """Retângulo da área útil de uma folha A4 retrato (descontadas margens)."""
+    return fitz.Rect(
+        A4_MARGIN_PT,
+        A4_MARGIN_PT,
+        A4_WIDTH_PT - A4_MARGIN_PT,
+        A4_HEIGHT_PT - A4_MARGIN_PT,
+    )
+
+
+def _pdf_job_inserir_pagina_pdf_vetorial(doc_destino, src_doc, pagina_zero_based: int):
+    """Insere uma página de PDF dentro de uma folha A4 retrato, preservando vetor.
+
+    Usa show_pdf_page (copia o conteúdo do PDF de origem como vetor/texto) —
+    NÃO usa get_pixmap, NÃO gera PNG/JPEG, NÃO rasteriza. Páginas em paisagem
+    (mais largas que altas) são giradas 90° para aproveitar a folha retrato.
+    """
+    src_page = src_doc[pagina_zero_based]
+    src_rect = src_page.rect
+    pagina_destino = doc_destino.new_page(
+        width=A4_WIDTH_PT,
+        height=A4_HEIGHT_PT,
+    )
+    rect_a4 = _pdf_job_rect_area_util_a4()
+    rotacao = 90 if src_rect.width > src_rect.height else 0
+    pagina_destino.show_pdf_page(
+        rect_a4,
+        src_doc,
+        pagina_zero_based,
+        keep_proportion=True,
+        rotate=rotacao,
+    )
+
+
+def _pdf_job_inserir_pagina_desenho_raster(doc, caminho: Path, num_pag: int, dpi: int):
+    """Comportamento antigo: pega/gera o JPEG A4 cacheado e insere como imagem.
+
+    Usado para JPG/PNG, para PDF em modo raster e como fallback de PDF que
+    não pôde entrar como vetor. Usa o CAMINHO do cache (insert_image por
+    filename) e cai para stream só quando a pasta de cache está indisponível.
+    """
+    rect_a4 = fitz.Rect(0, 0, A4_WIDTH_PT, A4_HEIGHT_PT)
+    arquivo_cache, jpeg_bytes, _ = obter_arquivo_pagina_desenho_a4_cacheada(
+        caminho,
+        pagina=num_pag,
+        dpi=dpi,
+    )
+    pagina_pdf = doc.new_page(width=A4_WIDTH_PT, height=A4_HEIGHT_PT)
+    if arquivo_cache is not None:
+        pagina_pdf.insert_image(rect_a4, filename=str(arquivo_cache))
+    else:
+        pagina_pdf.insert_image(rect_a4, stream=jpeg_bytes)
+
+
 def _pdf_job_inserir_desenhos(doc, desenhos_resolvidos, avisos: list,
                               contexto: str, dpi: Optional[int] = None,
-                              falhas_normalizacao=None) -> int:
-    """Insere os desenhos (já resolvidos) como páginas-imagem A4 no PDF.
+                              falhas_normalizacao=None,
+                              modo_pdf_desenho: str = "vetor") -> int:
+    """Insere os desenhos (já resolvidos) no PDF final. Retorna as páginas inseridas.
 
-    Usa o CAMINHO do JPEG cacheado (insert_image por filename): a leitura
-    fica na camada C do MuPDF, sem materializar os bytes de cada página no
-    heap do Python — relevante em jobs de centenas de OPs. Fallback para
-    stream só quando a pasta de cache está indisponível. Página que já
-    falhou na normalização (em `falhas_normalizacao`) é pulada sem aviso
-    duplicado; falha nova vira aviso. Retorna as páginas inseridas.
+    - PDF + modo vetorial: usa show_pdf_page, preservando vetor/texto (sem
+      serrilha em cotas e tolerâncias). Página problemática cai para raster.
+    - JPG/PNG (qualquer modo) e PDF em modo raster: mantêm o fluxo antigo,
+      com JPEG A4 cacheado (insert_image por filename, fallback stream).
+
+    Página que já falhou na normalização (em `falhas_normalizacao`) é pulada
+    sem aviso duplicado; falha nova vira aviso — nada derruba o job inteiro.
     """
     dpi = _pdf_job_dpi(dpi=dpi)
+    modo_pdf_desenho = _pdf_job_modo_pdf_desenho(modo_pdf_desenho)
     paginas = 0
     falhas = falhas_normalizacao or set()
-    rect_a4 = fitz.Rect(0, 0, A4_WIDTH_PT, A4_HEIGHT_PT)
 
     for nome, caminho, total_paginas in desenhos_resolvidos or []:
+        eh_pdf = caminho.suffix.lower() == ".pdf"
+        if eh_pdf and modo_pdf_desenho == "vetor":
+            try:
+                src_doc = fitz.open(str(caminho))
+            except Exception as exc:
+                avisos.append(
+                    f"{contexto}: não foi possível abrir {nome} como PDF vetorial; "
+                    f"usando raster. Detalhe: {exc}"
+                )
+            else:
+                try:
+                    for idx in range(total_paginas):
+                        num_pag = idx + 1
+                        if (str(caminho), num_pag) in falhas:
+                            continue
+                        try:
+                            _pdf_job_inserir_pagina_pdf_vetorial(doc, src_doc, idx)
+                            paginas += 1
+                        except Exception as exc:
+                            avisos.append(
+                                f"{contexto}: falha ao inserir {nome} pág. {num_pag} "
+                                f"como vetor; usando raster. Detalhe: {exc}"
+                            )
+                            try:
+                                _pdf_job_inserir_pagina_desenho_raster(
+                                    doc,
+                                    caminho,
+                                    num_pag,
+                                    dpi,
+                                )
+                                paginas += 1
+                            except HTTPException as exc2:
+                                avisos.append(
+                                    f"{contexto}: erro no fallback raster de {nome} "
+                                    f"pág. {num_pag}: {exc2.detail}"
+                                )
+                            except Exception as exc2:
+                                avisos.append(
+                                    f"{contexto}: erro no fallback raster de {nome} "
+                                    f"pág. {num_pag}: {exc2}"
+                                )
+                finally:
+                    src_doc.close()
+                continue
+
+        # JPG/PNG ou PDF em modo raster.
         for num_pag in range(1, total_paginas + 1):
             if (str(caminho), num_pag) in falhas:
                 continue
             try:
-                arquivo_cache, jpeg_bytes, _ = obter_arquivo_pagina_desenho_a4_cacheada(
-                    caminho, pagina=num_pag, dpi=dpi,
+                _pdf_job_inserir_pagina_desenho_raster(
+                    doc,
+                    caminho,
+                    num_pag,
+                    dpi,
                 )
+                paginas += 1
             except HTTPException as exc:
                 avisos.append(
                     f"{contexto}: erro no desenho {nome} pág. {num_pag}: {exc.detail}"
                 )
-                continue
             except Exception as exc:
                 avisos.append(
                     f"{contexto}: erro no desenho {nome} pág. {num_pag}: {exc}"
                 )
-                continue
-
-            pagina_pdf = doc.new_page(width=A4_WIDTH_PT, height=A4_HEIGHT_PT)
-            if arquivo_cache is not None:
-                pagina_pdf.insert_image(rect_a4, filename=str(arquivo_cache))
-            else:
-                pagina_pdf.insert_image(rect_a4, stream=jpeg_bytes)
-            paginas += 1
 
     return paginas
 
@@ -18697,7 +19088,8 @@ def _pdf_job_inserir_desenhos(doc, desenhos_resolvidos, avisos: list,
 def gerar_pdf_ops_com_desenhos(*, ops, arquivo_saida: str, incluir_desenhos: bool,
                                incluir_componentes: bool, incluir_operacoes: bool,
                                imprimir_observacoes: bool, cod_etg, cod_cre,
-                               job_id: str, dpi: Optional[int] = None):
+                               job_id: str, dpi: Optional[int] = None,
+                               modo_pdf_desenho: str = "vetor"):
     """Gera o PDF único do job em etapas, com progresso real no status.
 
     1) BUSCANDO_OPS          — consultas SQL sequenciais (1 conexão pyodbc).
@@ -18722,7 +19114,9 @@ def gerar_pdf_ops_com_desenhos(*, ops, arquivo_saida: str, incluir_desenhos: boo
         )
 
     dpi = _pdf_job_dpi(dpi=dpi)
+    modo_pdf_desenho = _pdf_job_modo_pdf_desenho(modo_pdf_desenho)
     job = IMPRESSAO_OP_JOBS.get(job_id) or {}
+    job["modo_pdf_desenho"] = modo_pdf_desenho
     descartadas: list = []
     avisos: list = []
     total = len(ops)
@@ -18763,6 +19157,7 @@ def gerar_pdf_ops_com_desenhos(*, ops, arquivo_saida: str, incluir_desenhos: boo
         # ============================================================
         _etapa("BUSCANDO_OPS", f"Buscando dados de {total} OPs...")
         ops_dados: list = []
+        diag_desenhos = _pdf_job_novo_diag_desenhos()
 
         for idx, op in enumerate(ops, start=1):
             cod_ori = str(op.get("cod_ori") or "").strip()
@@ -18812,8 +19207,10 @@ def gerar_pdf_ops_com_desenhos(*, ops, arquivo_saida: str, incluir_desenhos: boo
                 if dados_op:
                     desenhos_resolvidos = []
                     if incluir_desenhos:
+                        cod_pro_op = (dados_op.get("cabecalho") or {}).get("produto")
                         desenhos_resolvidos = _pdf_job_resolver_desenhos(
                             dados_op.get("desenhos") or [], avisos, contexto,
+                            cod_pro=cod_pro_op, diag=diag_desenhos,
                         )
                     ops_dados.append({
                         "contexto": contexto,
@@ -18825,6 +19222,11 @@ def gerar_pdf_ops_com_desenhos(*, ops, arquivo_saida: str, incluir_desenhos: boo
             job["percentual"] = int(idx * pct_consulta_fim / total) if total else pct_consulta_fim
             job["mensagem"] = f"Buscando dados da OP {idx} de {total}"
 
+        # Avisos consolidados de desenho (pasta inacessível / produto sem
+        # desenho) — 1 vez por lote, em vez de 1 por OP.
+        if incluir_desenhos:
+            _pdf_job_flush_diag_desenhos(diag_desenhos, avisos, job)
+
         # ============================================================
         # Etapa 2 — normalização paralela dos desenhos (popula o cache)
         # ============================================================
@@ -18834,13 +19236,22 @@ def gerar_pdf_ops_com_desenhos(*, ops, arquivo_saida: str, incluir_desenhos: boo
             tarefas: dict = {}
             for item in ops_dados:
                 for nome, caminho, total_paginas in item["desenhos_resolvidos"]:
+                    eh_pdf = caminho.suffix.lower() == ".pdf"
+                    # PDF vetorial não precisa ser normalizado/cacheado como JPEG.
+                    if modo_pdf_desenho == "vetor" and eh_pdf:
+                        continue
                     for num_pag in range(1, total_paginas + 1):
                         tarefas[(str(caminho), num_pag)] = (nome, caminho, num_pag)
 
             total_tarefas = len(tarefas)
             _etapa(
                 "NORMALIZANDO_DESENHOS",
-                f"Normalizando {total_tarefas} páginas de desenho ({dpi} DPI)...",
+                (
+                    f"Normalizando {total_tarefas} páginas de imagem/fallback "
+                    f"raster ({dpi} DPI)..."
+                    if modo_pdf_desenho == "vetor"
+                    else f"Normalizando {total_tarefas} páginas de desenho ({dpi} DPI)..."
+                ),
             )
 
             if total_tarefas:
@@ -18893,8 +19304,13 @@ def gerar_pdf_ops_com_desenhos(*, ops, arquivo_saida: str, incluir_desenhos: boo
             )
             if incluir_desenhos:
                 _pdf_job_inserir_desenhos(
-                    doc, item["desenhos_resolvidos"], avisos,
-                    item["contexto"], dpi, falhas_normalizacao,
+                    doc,
+                    item["desenhos_resolvidos"],
+                    avisos,
+                    item["contexto"],
+                    dpi,
+                    falhas_normalizacao,
+                    modo_pdf_desenho=modo_pdf_desenho,
                 )
             job["percentual"] = pct_montagem_ini + int(
                 i * (pct_montagem_fim - pct_montagem_ini) / total_validas
@@ -18954,7 +19370,9 @@ def processar_job_impressao_op_pdf(job_id: str, payload: dict,
         job["iniciado_em"] = datetime.now().isoformat()
 
         dpi = _pdf_job_dpi(payload.get("qualidade"), payload.get("dpi"))
+        modo_pdf_desenho = _pdf_job_modo_pdf_desenho(payload.get("modo_pdf_desenho"))
         job["dpi"] = dpi
+        job["modo_pdf_desenho"] = modo_pdf_desenho
 
         gerar_pdf_ops_com_desenhos(
             ops=payload.get("ops") or [],
@@ -18967,6 +19385,7 @@ def processar_job_impressao_op_pdf(job_id: str, payload: dict,
             cod_cre=payload.get("cod_cre"),
             job_id=job_id,
             dpi=dpi,
+            modo_pdf_desenho=modo_pdf_desenho,
         )
 
         try:
@@ -19021,7 +19440,8 @@ def _consultar_cod_pro_op(conn, cod_emp: int, cod_ori: str, num_orp: int):
     return str(row[0]).strip() or None
 
 
-def gerar_aquecimento_cache_desenhos(*, ops, job_id: str, dpi: Optional[int] = None):
+def gerar_aquecimento_cache_desenhos(*, ops, job_id: str, dpi: Optional[int] = None,
+                                     modo_pdf_desenho: str = "vetor"):
     """Job de AQUECIMENTO: normaliza os desenhos das OPs direto no cache,
     SEM montar PDF. Depois disso, o "Gerar PDF" das mesmas OPs encontra
     tudo como HIT na etapa de desenhos e fica muito mais rápido.
@@ -19036,7 +19456,9 @@ def gerar_aquecimento_cache_desenhos(*, ops, job_id: str, dpi: Optional[int] = N
         )
 
     dpi = _pdf_job_dpi(dpi=dpi)
+    modo_pdf_desenho = _pdf_job_modo_pdf_desenho(modo_pdf_desenho)
     job = IMPRESSAO_OP_JOBS.get(job_id) or {}
+    job["modo_pdf_desenho"] = modo_pdf_desenho
     descartadas: list = []
     avisos: list = []
     total = len(ops)
@@ -19065,6 +19487,7 @@ def gerar_aquecimento_cache_desenhos(*, ops, job_id: str, dpi: Optional[int] = N
     try:
         _etapa("BUSCANDO_OPS", f"Localizando desenhos de {total} OPs...")
         tarefas: dict = {}
+        diag_desenhos = _pdf_job_novo_diag_desenhos()
 
         for idx, op in enumerate(ops, start=1):
             cod_ori = str(op.get("cod_ori") or "").strip()
@@ -19096,14 +19519,25 @@ def gerar_aquecimento_cache_desenhos(*, ops, job_id: str, dpi: Optional[int] = N
 
             if cod_pro:
                 desenhos = localizar_desenhos_produto(cod_pro)
-                resolvidos = _pdf_job_resolver_desenhos(desenhos, avisos, contexto)
+                resolvidos = _pdf_job_resolver_desenhos(
+                    desenhos, avisos, contexto, cod_pro=cod_pro,
+                    diag=diag_desenhos,
+                )
                 for nome, caminho, total_paginas in resolvidos:
+                    eh_pdf = caminho.suffix.lower() == ".pdf"
+                    # PDF vetorial não precisa de cache raster — só JPG/PNG.
+                    if modo_pdf_desenho == "vetor" and eh_pdf:
+                        continue
                     for num_pag in range(1, total_paginas + 1):
                         tarefas[(str(caminho), num_pag)] = (nome, caminho, num_pag)
 
             job["processadas"] = idx
             job["percentual"] = int(idx * 40 / total) if total else 40
             job["mensagem"] = f"Localizando desenhos da OP {idx} de {total}"
+
+        # Avisos consolidados de desenho (pasta inacessível / produto sem
+        # desenho) — 1 vez por lote, em vez de 1 por OP.
+        _pdf_job_flush_diag_desenhos(diag_desenhos, avisos, job)
 
         total_tarefas = len(tarefas)
         job["total_desenhos"] = total_tarefas
@@ -19172,12 +19606,15 @@ def processar_job_aquecimento_cache(job_id: str, payload: dict, usuario: str):
         job["iniciado_em"] = datetime.now().isoformat()
 
         dpi = _pdf_job_dpi(payload.get("qualidade"), payload.get("dpi"))
+        modo_pdf_desenho = _pdf_job_modo_pdf_desenho(payload.get("modo_pdf_desenho"))
         job["dpi"] = dpi
+        job["modo_pdf_desenho"] = modo_pdf_desenho
 
         gerar_aquecimento_cache_desenhos(
             ops=payload.get("ops") or [],
             job_id=job_id,
             dpi=dpi,
+            modo_pdf_desenho=modo_pdf_desenho,
         )
 
         job["percentual"] = 100
@@ -19311,6 +19748,7 @@ def criar_job_impressao_op_pdf(
     arquivo_saida = PASTA_JOBS_IMPRESSAO_OP / f"{job_id}.pdf"
 
     dpi_job = _pdf_job_dpi(payload.qualidade, payload.dpi)
+    modo_pdf_desenho = _pdf_job_modo_pdf_desenho(payload.modo_pdf_desenho)
 
     with _IMPRESSAO_OP_JOBS_LOCK:
         IMPRESSAO_OP_JOBS[job_id] = {
@@ -19325,6 +19763,7 @@ def criar_job_impressao_op_pdf(
             "op_atual": None,
             "qualidade": "normal" if dpi_job == DESENHO_A4_DPI_NORMAL else "alta",
             "dpi": dpi_job,
+            "modo_pdf_desenho": modo_pdf_desenho,
             "paginas_pdf": None,
             "tamanho_bytes": None,
             "descartadas": [],
@@ -19351,6 +19790,7 @@ def criar_job_impressao_op_pdf(
         "status": "PENDENTE",
         "total_ops": len(payload.ops),
         "dpi": dpi_job,
+        "modo_pdf_desenho": modo_pdf_desenho,
         "mensagem": "Geração do PDF iniciada. Acompanhe pelo endpoint de status.",
         "url_status": (
             f"/api/producao/ordem-producao/impressao/pdf-job/{job_id}/status"
@@ -19399,6 +19839,7 @@ def criar_job_aquecimento_cache_desenhos(
         + uuid.uuid4().hex[:8]
     )
     dpi_job = _pdf_job_dpi(payload.qualidade, payload.dpi)
+    modo_pdf_desenho = _pdf_job_modo_pdf_desenho(payload.modo_pdf_desenho)
 
     with _IMPRESSAO_OP_JOBS_LOCK:
         IMPRESSAO_OP_JOBS[job_id] = {
@@ -19417,6 +19858,7 @@ def criar_job_aquecimento_cache_desenhos(
                 else "alta"
             ),
             "dpi": dpi_job,
+            "modo_pdf_desenho": modo_pdf_desenho,
             "total_desenhos": None,
             "cache_hits": None,
             "cache_miss": None,
@@ -19443,6 +19885,7 @@ def criar_job_aquecimento_cache_desenhos(
         "status": "PENDENTE",
         "total_ops": len(payload.ops),
         "dpi": dpi_job,
+        "modo_pdf_desenho": modo_pdf_desenho,
         "mensagem": "Aquecimento do cache iniciado. Acompanhe pelo endpoint de status.",
         "url_status": (
             f"/api/producao/ordem-producao/impressao/pdf-job/{job_id}/status"
@@ -33927,7 +34370,8 @@ FROM   E440IPC
                                        '2410', '2209', '2204', '2203',
                                        '2202', '2201', '1411', '1410',
                                        '1204', '1203', '1202', '1201' )
-                                       OR E440IPC.TNSPRO = '1201E')
+                                       OR E440IPC.TNSPRO IN ('1201E', '2949E')
+                                       )
          AND SUBSTRING(E044CCU.CLACCU, 1, 3) IN ('503','502')
          AND CAST(YEAR(E440NFC.DATENT) *100 + MONTH(E440NFC.DATENT) AS NVARCHAR)  BETWEEN $[ANOMES_INI] AND $[ANOMES_FIM]
 """.strip()
@@ -50953,6 +51397,3084 @@ def listar_bi_contabilidade(
         "total_registros": total,
         "dados": resp.json(),
     }
+
+
+# ============================================================
+# RH - Senior/Vetorh -> Supabase -> Front
+# ============================================================
+
+# As tabelas RH (R0xx...) ficam no banco VETORH (mesmo servidor/credenciais
+# do Sapiens, só muda o DATABASE). A conexão padrão get_connection() aponta
+# para 'sapiens' — por isso os SELECTs RH davam "Nome de objeto inválido".
+# Conexão dedicada abaixo, SEM tocar em get_connection()/_ONPREM_DB_DEFAULTS.
+_RH_DB_DEFAULTS = {
+    "driver":   "ODBC Driver 17 for SQL Server",
+    "host":     "172.16.137.100",
+    "port":     "1433",
+    "database": "VETORH",
+    "user":     "sapiens",
+    "trust":    "yes",
+}
+
+
+def get_rh_connection():
+    """Conexão pyodbc dedicada ao banco RH/Vetorh (VETORH.dbo.*).
+
+    Lê config do .env via prefixo RH_DB_* (RH_DB_HOST, RH_DB_DATABASE, ...)
+    com fallback em _RH_DB_DEFAULTS — que já aponta para VETORH. A SENHA é a
+    mesma do Sapiens: se RH_DB_PASSWORD não estiver no .env, reaproveita
+    ONPREM_DB_PASSWORD, para o sync não cair com "Senha do banco RH ausente".
+    Não altera get_connection() nem o banco dos demais módulos.
+    """
+    if not os.getenv("RH_DB_PASSWORD") and os.getenv("ONPREM_DB_PASSWORD"):
+        os.environ["RH_DB_PASSWORD"] = os.environ["ONPREM_DB_PASSWORD"]
+    try:
+        conn_str = _build_db_conn_str("RH", _RH_DB_DEFAULTS)
+        return pyodbc.connect(conn_str, timeout=10)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro conexão SQL RH/Vetorh: {e}",
+        )
+
+
+RH_BATCH_UPSERT = 500
+
+RH_TABELAS_VALIDAS = {
+    "resumo_folha": "rh_resumo_folha",
+    "quadro_colaboradores": "rh_quadro_colaboradores",
+    "contrato_experiencia": "rh_contrato_experiencia",
+    "programacao_ferias": "rh_programacao_ferias",
+    "formularios": "rh_formularios",
+}
+
+
+class RhFormularioPayload(BaseModel):
+    cd_tp_formulario: str
+    ds_titulo: str
+    ds_descricao: Optional[str] = None
+    cd_matricula: Optional[str] = None
+    ds_colaborador: Optional[str] = None
+    cd_status: Optional[str] = "ABERTO"
+
+
+def _rh_supabase_headers(prefer: str = "return=minimal"):
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="Supabase não configurado. Defina SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY no .env.",
+        )
+
+    return {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": prefer,
+    }
+
+
+def _rh_json_safe(valor):
+    if isinstance(valor, Decimal):
+        return float(valor)
+    if isinstance(valor, datetime):
+        return valor.isoformat()
+    if isinstance(valor, date):
+        return valor.isoformat()
+    if isinstance(valor, str):
+        return valor.strip()
+    return valor
+
+
+def _rh_rows_to_dicts(cursor):
+    cols = [c[0].lower() for c in cursor.description]
+    dados = []
+
+    for row in cursor.fetchall():
+        item = {}
+        for i, col in enumerate(cols):
+            item[col] = _rh_json_safe(row[i])
+        dados.append(item)
+
+    return dados
+
+
+def _rh_executar_sql_senior(sql: str, params: list):
+    conn = get_rh_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(sql, params)
+        return _rh_rows_to_dicts(cursor)
+    finally:
+        conn.close()
+
+
+def _rh_executar_sql_principal(sql: str, params: list):
+    """Executa no banco PRINCIPAL (sapiens/onprem) — usado para localizar as
+    views de BI (ex.: VM_FOLHA), que podem não estar no VETORH."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(sql, params)
+        return _rh_rows_to_dicts(cursor)
+    finally:
+        conn.close()
+
+
+# NOTA: as funções _rh_localizar_vm_folha / _rh_sincronizar_vm_folha foram
+# removidas. VETORH.dbo.VM_FOLHA NÃO existe fisicamente (é objeto lógico do
+# UpQuery/BI-JET), então qualquer tentativa de localizá-la ou consultá-la
+# retornava erro. A materialização oficial passou a ser a CAMADA COMPATÍVEL
+# (public.rh_vm_folha), construída por _rh_vm_folha_compat_construir e carregada
+# via POST /api/rh/vm-folha-compat/sincronizar.
+
+
+def _rh_buscar_nomes_filiais(codemp) -> dict:
+    """Mapa {cod_filial: nome} das filiais no Vetorh.
+
+    Tabela validada: VETORH.dbo.r030fil — exibe NOMFIL, com RAZSOC de fallback
+    (nome_filial = nomfil or razsoc). O map carrega chave int E str, porque
+    cd_filial pode vir como número ou texto. Best-effort: qualquer falha
+    devolve {} e o sync segue normal (o dashboard cai para o código)."""
+    sql = """
+        SELECT codfil, nomfil, razsoc
+        FROM VETORH.dbo.r030fil
+        WHERE numemp = ?
+    """
+    try:
+        rows = _rh_executar_sql_senior(sql, [codemp])
+    except Exception as exc:
+        print(f"[RH] Falha ao buscar nomes das filiais em r030fil: {exc}")
+        return {}
+
+    mapa: dict = {}
+    for r in rows or []:
+        codfil = r.get("codfil")
+        nome = r.get("nomfil") or r.get("razsoc") or ""
+        nome = nome.strip() if isinstance(nome, str) else str(nome).strip()
+        if codfil is None or not nome:
+            continue
+        try:
+            mapa[int(codfil)] = nome
+        except (TypeError, ValueError):
+            pass
+        mapa[str(codfil).strip()] = nome
+    return mapa
+
+
+def _rh_supabase_delete(table: str, filtro: str):
+    url = f"{SUPABASE_URL}/rest/v1/{table}?{filtro}"
+    resp = requests.delete(
+        url,
+        headers=_rh_supabase_headers(),
+        timeout=30,
+    )
+
+    if resp.status_code not in (200, 202, 204):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao limpar {table} no Supabase: HTTP {resp.status_code} - {(resp.text or '')[:500]}",
+        )
+
+
+def _rh_supabase_upsert(table: str, rows: list, conflict: str):
+    if not rows:
+        return 0
+
+    # Dedup por chave de conflito (último vence) — evita o erro do PostgREST
+    # "ON CONFLICT DO UPDATE command cannot affect row a second time" quando o
+    # SQL traz a mesma chave 2x no mesmo lote (ex.: LEFT JOIN multiplicando
+    # linhas). Só dedup quando a chave é simples (1 coluna). Linhas com chave
+    # nula não conflitam entre si no Postgres, então passam adiante intactas.
+    if conflict and "," not in conflict:
+        unicos: dict = {}
+        sem_chave: list = []
+        for r in rows:
+            chave = r.get(conflict)
+            if chave is None:
+                sem_chave.append(r)
+            else:
+                unicos[chave] = r
+        rows = list(unicos.values()) + sem_chave
+
+    total = 0
+
+    for i in range(0, len(rows), RH_BATCH_UPSERT):
+        lote = rows[i:i + RH_BATCH_UPSERT]
+
+        url = f"{SUPABASE_URL}/rest/v1/{table}?on_conflict={conflict}"
+
+        resp = requests.post(
+            url,
+            json=lote,
+            headers=_rh_supabase_headers("resolution=merge-duplicates,return=minimal"),
+            timeout=60,
+        )
+
+        if resp.status_code not in (200, 201, 204):
+            raise HTTPException(
+                status_code=500,
+                detail=f"Erro ao enviar {table} para Supabase: HTTP {resp.status_code} - {(resp.text or '')[:500]}",
+            )
+
+        total += len(lote)
+
+    return total
+
+
+def _rh_registrar_log(tarefa: str, status: str, qtd: int = 0, mensagem: str = "", anomes_ini: str = None, anomes_fim: str = None):
+    try:
+        payload = {
+            "tarefa": tarefa,
+            "anomes_ini": anomes_ini,
+            "anomes_fim": anomes_fim,
+            "status": status,
+            "qtd_registros": qtd,
+            "mensagem": mensagem,
+            "finalizado_em": datetime.now().isoformat(),
+        }
+
+        url = f"{SUPABASE_URL}/rest/v1/rh_sync_log"
+
+        requests.post(
+            url,
+            json=payload,
+            headers=_rh_supabase_headers(),
+            timeout=10,
+        )
+    except Exception as exc:
+        print(f"[RH_SYNC_LOG] falha: {exc}")
+
+
+def _rh_get_supabase(table: str, query: str = ""):
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+
+    if query:
+        url += f"?{query}"
+
+    resp = requests.get(
+        url,
+        headers=_rh_supabase_headers("return=representation"),
+        timeout=30,
+    )
+
+    if resp.status_code not in (200, 206):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao consultar {table} no Supabase: HTTP {resp.status_code} - {(resp.text or '')[:500]}",
+        )
+
+    return resp.json()
+
+
+SQL_RH_RESUMO_FOLHA = """
+SELECT
+    CONVERT(
+        VARCHAR(64),
+        HASHBYTES(
+            'SHA2_256',
+            CONCAT(
+                VER.NUMEMP, '|',
+                VER.TIPCOL, '|',
+                VER.NUMCAD, '|',
+                VER.CODCAL, '|',
+                VER.TABEVE, '|',
+                VER.CODEVE, '|',
+                VER.CODRAT, '|',
+                CONVERT(VARCHAR(8), CAL.PERREF, 112)
+            )
+        ),
+        2
+    ) AS ID,
+    VER.NUMEMP AS CD_EMPRESA,
+    VER.TIPCOL AS CD_TP_COLABORADOR,
+    CAST(VER.NUMEMP AS VARCHAR(20)) + '-' +
+    CAST(VER.TIPCOL AS VARCHAR(20)) + '-' +
+    CAST(VER.NUMCAD AS VARCHAR(20)) AS CD_MATRICULA,
+    FUN.NOMFUN AS DS_COLABORADOR,
+    FUN.CODFIL AS CD_FILIAL,
+    FUN.CODCCU AS CD_CENTRO_CUSTO,
+    FUN.CODCAR AS CD_CARGO,
+    FUN.SITAFA AS CD_SITUACAO_COLABORADOR,
+    CAL.CODCAL AS CD_CALCULO,
+    CAL.TIPCAL AS CD_TP_CALCULO,
+    CAST(CAL.PERREF AS DATE) AS DT_COMPETENCIA,
+    CONVERT(VARCHAR(6), CAL.PERREF, 112) AS ANOMES_COMPETENCIA,
+    CAST(CAL.DATPAG AS DATE) AS DT_PAGAMENTO,
+    VER.CODEVE AS CD_EVENTO,
+    EVC.DESEVE AS DS_EVENTO,
+    EVC.TIPEVE AS CD_TP_EVENTO,
+    VER.REFEVE AS QTD_REFERENCIA,
+    VER.VALEVE AS VL_EVENTO,
+    CASE
+        WHEN EVC.TIPEVE = 1 THEN VER.VALEVE
+        ELSE 0
+    END AS VL_PROVENTO,
+    CASE
+        WHEN EVC.TIPEVE = 2 THEN VER.VALEVE
+        ELSE 0
+    END AS VL_DESCONTO,
+    CASE
+        WHEN EVC.TIPEVE = 1 THEN VER.VALEVE
+        WHEN EVC.TIPEVE = 2 THEN VER.VALEVE * -1
+        ELSE 0
+    END AS VL_LIQUIDO_CALCULADO,
+    BAS.APOESP AS CD_APOSENTADORIA_ESPECIAL,
+    VER.CODRAT AS CD_RATEIO
+FROM VETORH.dbo.R046FFR VER
+INNER JOIN VETORH.dbo.R034FUN FUN
+    ON FUN.NUMEMP = VER.NUMEMP
+   AND FUN.TIPCOL = VER.TIPCOL
+   AND FUN.NUMCAD = VER.NUMCAD
+INNER JOIN VETORH.dbo.R044CAL CAL
+    ON CAL.NUMEMP = VER.NUMEMP
+   AND CAL.CODCAL = VER.CODCAL
+LEFT JOIN VETORH.dbo.R008EVC EVC
+    ON EVC.CODTAB = VER.TABEVE
+   AND EVC.CODEVE = VER.CODEVE
+LEFT JOIN VETORH.dbo.R046INF BAS
+    ON BAS.NUMEMP = VER.NUMEMP
+   AND BAS.TIPCOL = VER.TIPCOL
+   AND BAS.NUMCAD = VER.NUMCAD
+   AND BAS.CODCAL = VER.CODCAL
+   AND BAS.PERREF = CAL.PERREF
+   AND BAS.TIPCAL = CAL.TIPCAL
+WHERE VER.NUMEMP = ?
+  AND CONVERT(VARCHAR(6), CAL.PERREF, 112) BETWEEN ? AND ?
+"""
+
+
+SQL_RH_QUADRO_COLABORADORES = """
+SELECT
+    FUN.NUMEMP AS CD_EMPRESA,
+    FUN.CODFIL AS CD_FILIAL,
+    CAST(FUN.NUMEMP AS VARCHAR(20)) + '-' +
+    CAST(FUN.CODFIL AS VARCHAR(20)) AS CD_FILIAL_SN,
+    FUN.TIPCOL AS CD_TP_COLABORADOR,
+    FUN.NUMCAD AS CD_CADASTRO,
+    CAST(FUN.NUMEMP AS VARCHAR(20)) + '-' +
+    CAST(FUN.TIPCOL AS VARCHAR(20)) + '-' +
+    CAST(FUN.NUMCAD AS VARCHAR(20)) AS CD_MATRICULA,
+    FUN.NOMFUN AS DS_COLABORADOR,
+    FUN.CODCCU AS CD_CENTRO_CUSTO,
+    CAST(FUN.NUMEMP AS VARCHAR(20)) + '-' +
+    CAST(FUN.CODCCU AS VARCHAR(20)) AS CD_CENTRO_CUSTO_SN,
+    FUN.ESTCAR AS CD_ESTRUTURA_CARGO,
+    FUN.CODCAR AS CD_CARGO,
+    CAST(FUN.ESTCAR AS VARCHAR(20)) + '-' +
+    CAST(FUN.CODCAR AS VARCHAR(20)) AS CD_CARGO_SN,
+    FUN.NUMLOC AS CD_LOCAL,
+    FUN.CODVIN AS CD_VINCULO,
+    FUN.CODDEF AS CD_DEFICIENCIA,
+    FUN.GRAINS AS CD_ESCOLARIDADE,
+    FUN.TIPSEX AS CD_SEXO,
+    CAST(FUN.DATNAS AS DATE) AS DT_NASCIMENTO,
+    CAST(FUN.DATADM AS DATE) AS DT_ADMISSAO,
+    CAST(FUN.DATAFA AS DATE) AS DT_AFASTAMENTO,
+    FUN.SITAFA AS CD_SITUACAO,
+    FUN.CAUDEM AS CD_CAUSA_DEMISSAO,
+    AVI.TIPAVI AS CD_TP_AVISO,
+    CASE
+        WHEN FUN.CAUDEM = 7 THEN CAST(FUN.DATAFA AS DATE)
+        ELSE NULL
+    END AS DT_DEMISSAO,
+    FUN.RACCOR AS CD_RACA,
+    FUN.TIPCON AS CD_TP_CONTRATO,
+    FUN.CODESC AS CD_ESCALA,
+    FUN.NUMCPF AS CD_CPF,
+    FUN.CATESO AS CD_ESOCIAL,
+    FUN.TIPSAL AS CD_TIPO_SAL
+FROM VETORH.dbo.R034FUN FUN
+LEFT JOIN VETORH.dbo.R042AVI AVI
+    ON AVI.NUMEMP = FUN.NUMEMP
+   AND AVI.TIPCOL = FUN.TIPCOL
+   AND AVI.NUMCAD = FUN.NUMCAD
+   AND AVI.CAUDEM = FUN.CAUDEM
+WHERE FUN.NUMEMP = ?
+"""
+
+
+SQL_RH_CONTRATO_EXPERIENCIA = """
+SELECT
+    FUN.NUMEMP AS CD_EMPRESA,
+    FUN.CODFIL AS CD_FILIAL,
+    FUN.TIPCOL AS CD_TP_COLABORADOR,
+    FUN.NUMCAD AS CD_CADASTRO,
+    CAST(FUN.NUMEMP AS VARCHAR(20)) + '-' +
+    CAST(FUN.TIPCOL AS VARCHAR(20)) + '-' +
+    CAST(FUN.NUMCAD AS VARCHAR(20)) AS CD_MATRICULA,
+    FUN.NOMFUN AS DS_COLABORADOR,
+    FUN.CODCCU AS CD_CENTRO_CUSTO,
+    FUN.CODCAR AS CD_CARGO,
+    FUN.SITAFA AS CD_SITUACAO,
+    CAST(FUN.DATADM AS DATE) AS DT_ADMISSAO,
+    FUN.TIPCON AS CD_TP_CONTRATO,
+    CPL.DURCON AS QTD_DIAS_CONTRATO,
+    CPL.PROCON AS QTD_DIAS_PRORROGACAO,
+    CAST(DATEADD(DAY, ISNULL(CPL.DURCON, 0) - 1, FUN.DATADM) AS DATE) AS DT_FIM_CONTRATO_1,
+    CAST(DATEADD(
+        DAY,
+        ISNULL(CPL.DURCON, 0) + ISNULL(CPL.PROCON, 0) - 1,
+        FUN.DATADM
+    ) AS DATE) AS DT_FIM_CONTRATO_FINAL,
+    DATEDIFF(
+        DAY,
+        CAST(GETDATE() AS DATE),
+        DATEADD(
+            DAY,
+            ISNULL(CPL.DURCON, 0) + ISNULL(CPL.PROCON, 0) - 1,
+            FUN.DATADM
+        )
+    ) AS QTD_DIAS_RESTANTES,
+    CASE
+        WHEN FUN.SITAFA = 7 THEN 'DEMITIDO'
+        WHEN DATEADD(DAY, ISNULL(CPL.DURCON, 0) + ISNULL(CPL.PROCON, 0) - 1, FUN.DATADM) < CAST(GETDATE() AS DATE)
+            THEN 'VENCIDO'
+        WHEN DATEDIFF(DAY, CAST(GETDATE() AS DATE), DATEADD(DAY, ISNULL(CPL.DURCON, 0) + ISNULL(CPL.PROCON, 0) - 1, FUN.DATADM)) <= 10
+            THEN 'VENCE EM ATE 10 DIAS'
+        WHEN DATEDIFF(DAY, CAST(GETDATE() AS DATE), DATEADD(DAY, ISNULL(CPL.DURCON, 0) + ISNULL(CPL.PROCON, 0) - 1, FUN.DATADM)) <= 30
+            THEN 'VENCE EM ATE 30 DIAS'
+        ELSE 'NO PRAZO'
+    END AS DS_STATUS_CONTRATO
+FROM VETORH.dbo.R034FUN FUN
+LEFT JOIN VETORH.dbo.R034CPL CPL
+    ON CPL.NUMEMP = FUN.NUMEMP
+   AND CPL.TIPCOL = FUN.TIPCOL
+   AND CPL.NUMCAD = FUN.NUMCAD
+WHERE FUN.NUMEMP = ?
+  AND FUN.SITAFA <> 7
+  AND ISNULL(CPL.DURCON, 0) > 0
+"""
+
+
+SQL_RH_PROGRAMACAO_FERIAS = """
+SELECT
+    CONVERT(
+        VARCHAR(64),
+        HASHBYTES(
+            'SHA2_256',
+            CONCAT(
+                FUN.NUMEMP, '|',
+                FUN.TIPCOL, '|',
+                FUN.NUMCAD, '|',
+                CONVERT(VARCHAR(8), FER.INIPER, 112), '|',
+                COALESCE(CONVERT(VARCHAR(8), PRG.PRGDAT, 112), '')
+            )
+        ),
+        2
+    ) AS ID,
+    FUN.NUMEMP AS CD_EMPRESA,
+    FUN.CODFIL AS CD_FILIAL,
+    CAST(FUN.NUMEMP AS VARCHAR(20)) + '-' +
+    CAST(FUN.CODFIL AS VARCHAR(20)) AS CD_FILIAL_SN,
+    FUN.TIPCOL AS CD_TP_COLABORADOR,
+    FUN.NUMCAD AS CD_CADASTRO,
+    CAST(FUN.NUMEMP AS VARCHAR(20)) + '-' +
+    CAST(FUN.TIPCOL AS VARCHAR(20)) + '-' +
+    CAST(FUN.NUMCAD AS VARCHAR(20)) AS CD_MATRICULA,
+    FUN.NOMFUN AS DS_COLABORADOR,
+    FUN.CODCCU AS CD_CENTRO_CUSTO,
+    CAST(FUN.NUMEMP AS VARCHAR(20)) + '-' +
+    CAST(FUN.CODCCU AS VARCHAR(20)) AS CD_CENTRO_CUSTO_SN,
+    FUN.ESTCAR AS CD_ESTRUTURA_CARGO,
+    FUN.CODCAR AS CD_CARGO,
+    FUN.NUMLOC AS CD_LOCAL,
+    FUN.CODVIN AS CD_VINCULO,
+    FUN.SITAFA AS CD_SITUACAO_COLABORADOR,
+    FER.SITPER AS CD_SITUACAO_FERIAS,
+    CAST(FER.INIPER AS DATE) AS DT_INICIO_PERIODO,
+    CAST(FER.FIMPER AS DATE) AS DT_FIM_PERIODO,
+    CAST(FER.LIMCON AS DATE) AS DT_LIMITE_SAIDA,
+    FER.QTDDIR AS QTD_DIAS_DIREITO,
+    FER.QTDSLD AS QTD_DIAS_SALDO,
+    CAST(PRG.PRGDAT AS DATE) AS DT_PROGRAMACAO,
+    PRG.PRGDFE AS QTD_DIAS_PROGRAMACAO,
+    PRG.PRGDAB AS QTD_DIAS_ABONO_PROGRAMACAO,
+    CAST(DATEADD(DAY, ISNULL(PRG.PRGDFE, 0) - 1, PRG.PRGDAT) AS DATE) AS DT_FIM_PROGRAMACAO,
+    CASE
+        WHEN FUN.SITAFA = 7 THEN 'COLABORADOR DEMITIDO'
+        WHEN FER.QTDSLD <= 0 THEN 'SEM SALDO'
+        WHEN PRG.PRGDAT IS NULL THEN 'SEM PROGRAMACAO'
+        WHEN FER.LIMCON < CAST(GETDATE() AS DATE) THEN 'LIMITE VENCIDO'
+        WHEN DATEDIFF(DAY, CAST(GETDATE() AS DATE), FER.LIMCON) <= 30 THEN 'LIMITE ATE 30 DIAS'
+        ELSE 'OK'
+    END AS DS_STATUS_FERIAS
+FROM VETORH.dbo.R040PER FER
+INNER JOIN VETORH.dbo.R034FUN FUN
+    ON FUN.NUMEMP = FER.NUMEMP
+   AND FUN.TIPCOL = FER.TIPCOL
+   AND FUN.NUMCAD = FER.NUMCAD
+LEFT JOIN VETORH.dbo.R040PRG PRG
+    ON PRG.NUMEMP = FER.NUMEMP
+   AND PRG.TIPCOL = FER.TIPCOL
+   AND PRG.NUMCAD = FER.NUMCAD
+   AND PRG.INIPER = FER.INIPER
+WHERE FUN.NUMEMP = ?
+"""
+
+
+# Provisões (férias/13) por matrícula/competência — origem R146PRV (validada).
+# tipprv=1 férias, tipprv=2 13º; valor = prvmes + ajuprv + saltrf.
+SQL_RH_AUX_PROVISOES = """
+SELECT
+    P.NUMEMP AS cd_empresa,
+    F.CODFIL AS cd_filial,
+    P.TIPCOL AS cd_tp_colaborador,
+    CAST(P.NUMEMP AS VARCHAR(20)) + '-' +
+    CAST(P.TIPCOL AS VARCHAR(20)) + '-' +
+    CAST(P.NUMCAD AS VARCHAR(20)) AS cd_matricula,
+    CONVERT(VARCHAR(6), P.MESANO, 112) AS anomes_competencia,
+    CAST(SUM(CASE WHEN P.TIPPRV = 1
+        THEN ISNULL(P.PRVMES, 0) + ISNULL(P.AJUPRV, 0) + ISNULL(P.SALTRF, 0)
+        ELSE 0 END) AS FLOAT) AS vl_provisao_ferias,
+    CAST(SUM(CASE WHEN P.TIPPRV = 2
+        THEN ISNULL(P.PRVMES, 0) + ISNULL(P.AJUPRV, 0) + ISNULL(P.SALTRF, 0)
+        ELSE 0 END) AS FLOAT) AS vl_provisao_13
+FROM VETORH.dbo.R146PRV P
+INNER JOIN VETORH.dbo.R034FUN F
+    ON F.NUMEMP = P.NUMEMP
+   AND F.TIPCOL = P.TIPCOL
+   AND F.NUMCAD = P.NUMCAD
+WHERE P.NUMEMP = ?
+  AND CONVERT(VARCHAR(6), P.MESANO, 112) BETWEEN ? AND ?
+GROUP BY
+    P.NUMEMP, F.CODFIL, P.TIPCOL, P.NUMCAD,
+    CONVERT(VARCHAR(6), P.MESANO, 112)
+"""
+
+
+# FGTS oficial por matrícula/competência — origem R056SFP (validada).
+# fgts = valfgt + valf13. NÃO soma R056RCS (rescisório) no card principal.
+SQL_RH_AUX_FGTS = """
+SELECT
+    S.NUMEMP AS cd_empresa,
+    F.CODFIL AS cd_filial,
+    S.TIPCOL AS cd_tp_colaborador,
+    CAST(S.NUMEMP AS VARCHAR(20)) + '-' +
+    CAST(S.TIPCOL AS VARCHAR(20)) + '-' +
+    CAST(S.NUMCAD AS VARCHAR(20)) AS cd_matricula,
+    CONVERT(VARCHAR(6), S.CMPREF, 112) AS anomes_competencia,
+    CAST(SUM(ISNULL(S.VALFGT, 0)) AS FLOAT) AS vl_fgts,
+    CAST(SUM(ISNULL(S.VALF13, 0)) AS FLOAT) AS vl_fgts_13
+FROM VETORH.dbo.R056SFP S
+INNER JOIN VETORH.dbo.R034FUN F
+    ON F.NUMEMP = S.NUMEMP
+   AND F.TIPCOL = S.TIPCOL
+   AND F.NUMCAD = S.NUMCAD
+WHERE S.NUMEMP = ?
+  AND CONVERT(VARCHAR(6), S.CMPREF, 112) BETWEEN ? AND ?
+GROUP BY
+    S.NUMEMP, F.CODFIL, S.TIPCOL, S.NUMCAD,
+    CONVERT(VARCHAR(6), S.CMPREF, 112)
+"""
+
+
+# INSS oficial por filial/competência — origem R056SFP (fórmula validada).
+# NÃO usa eventos 301/302/303/307 (esses seguem só no detalhe de descontos).
+# inss_total = inss_empregado + inss_patronal_20 - sal_maternidade - sal_familia
+SQL_RH_AUX_INSS = """
+SELECT
+    S.NUMEMP AS cd_empresa,
+    F.CODFIL AS cd_filial,
+    CONVERT(VARCHAR(6), S.CMPREF, 112) AS anomes_competencia,
+    CAST(SUM(ISNULL(S.BASINS, 0) + ISNULL(S.BASI13, 0)) AS FLOAT) AS base_inss_original,
+    CAST(SUM(ISNULL(S.BASA13, 0)) AS FLOAT) AS base_13_aviso_excluida,
+    CAST(SUM(ISNULL(S.BASINS, 0) + ISNULL(S.BASI13, 0) - ISNULL(S.BASA13, 0)) AS FLOAT) AS base_inss_patronal,
+    CAST(SUM(ISNULL(S.VALINS, 0) + ISNULL(S.VALI13, 0)) AS FLOAT) AS inss_empregado,
+    CAST(SUM((ISNULL(S.BASINS, 0) + ISNULL(S.BASI13, 0) - ISNULL(S.BASA13, 0)) * 0.20) AS FLOAT) AS inss_patronal_20,
+    CAST(SUM(ISNULL(S.VALMAT, 0) + ISNULL(S.VALM13, 0)) AS FLOAT) AS salario_maternidade,
+    CAST(SUM(ISNULL(S.VALFAM, 0)) AS FLOAT) AS salario_familia,
+    CAST(SUM(
+        ISNULL(S.VALINS, 0) + ISNULL(S.VALI13, 0)
+        + ((ISNULL(S.BASINS, 0) + ISNULL(S.BASI13, 0) - ISNULL(S.BASA13, 0)) * 0.20)
+        - ISNULL(S.VALMAT, 0) - ISNULL(S.VALM13, 0) - ISNULL(S.VALFAM, 0)
+    ) AS FLOAT) AS inss_total
+FROM VETORH.dbo.R056SFP S
+INNER JOIN VETORH.dbo.R034FUN F
+    ON F.NUMEMP = S.NUMEMP
+   AND F.TIPCOL = S.TIPCOL
+   AND F.NUMCAD = S.NUMCAD
+WHERE S.NUMEMP = ?
+  AND CONVERT(VARCHAR(6), S.CMPREF, 112) BETWEEN ? AND ?
+GROUP BY
+    S.NUMEMP, F.CODFIL,
+    CONVERT(VARCHAR(6), S.CMPREF, 112)
+"""
+
+
+# Diagnóstico de vale/benefícios (R162GER) por codval/staval/orival — só para
+# validar o filtro antes de eventualmente trocar o card de benefícios.
+SQL_RH_VALE_DIAG = """
+SELECT
+    V.CODVAL AS codval,
+    V.STAVAL AS staval,
+    V.ORIVAL AS orival,
+    COUNT(*) AS qtd,
+    CAST(SUM(ISNULL(V.QTDVAL, 0)) AS FLOAT) AS qtd_vale,
+    CAST(SUM(ISNULL(V.VLRVAL, 0)) AS FLOAT) AS valor_vale
+FROM VETORH.dbo.R162GER V
+WHERE V.NUMEMP = ?
+  AND CONVERT(VARCHAR(6), V.DATVAL, 112) BETWEEN ? AND ?
+GROUP BY V.CODVAL, V.STAVAL, V.ORIVAL
+ORDER BY V.CODVAL, V.STAVAL, V.ORIVAL
+"""
+
+
+# Vale-alimentação OFICIAL (R162GER) — regra do RH: qtdval = 1 e competência pelo
+# dia 15 (>= 15 => mês seguinte). Retorna por MATRÍCULA (não pré-agrega por filial):
+# a filial e o "quem tem folha" vêm da POPULAÇÃO DA FOLHA (rh_resumo_folha). Assim
+# o V.A. casa por matrícula/competência e é alocado na filial da folha — evita
+# inflar com quem não tem folha e evita usar a filial atual do cadastro.
+SQL_RH_VALE_ALIMENTACAO = """
+SELECT
+    G.NUMEMP AS cd_empresa,
+    CAST(G.NUMEMP AS VARCHAR(20)) + '-' +
+    CAST(G.TIPCOL AS VARCHAR(20)) + '-' +
+    CAST(G.NUMCAD AS VARCHAR(20)) AS cd_matricula,
+    FORMAT(
+        CASE WHEN DAY(G.DATVAL) >= 15 THEN DATEADD(MONTH, 1, G.DATVAL) ELSE G.DATVAL END,
+        'yyyyMM'
+    ) AS anomes_competencia,
+    CAST(ROUND(SUM(COALESCE(G.VLRVAL, 0)), 0) AS FLOAT) AS vl_vale_alimentacao
+FROM VETORH.dbo.R162GER G
+WHERE G.NUMEMP = ?
+  AND G.QTDVAL = 1
+  AND FORMAT(
+        CASE WHEN DAY(G.DATVAL) >= 15 THEN DATEADD(MONTH, 1, G.DATVAL) ELSE G.DATVAL END,
+        'yyyyMM'
+      ) BETWEEN ? AND ?
+GROUP BY
+    G.NUMEMP, G.TIPCOL, G.NUMCAD,
+    FORMAT(
+        CASE WHEN DAY(G.DATVAL) >= 15 THEN DATEADD(MONTH, 1, G.DATVAL) ELSE G.DATVAL END,
+        'yyyyMM'
+    )
+"""
+
+
+# Diagnóstico do V.A. por dimensões classificadoras do R162GER (para achar o filtro
+# que fecha o BI sem chutar): por CODVAL/STAVAL/ORIVAL/TIPCOL/QTDVAL e competência.
+# QTDVAL entra como DIMENSÃO (não filtro) para dar visão do universo inteiro; o
+# recorte QTDVAL=1 (o da fórmula atual) é feito no Python.
+SQL_RH_VALE_BREAKDOWN = """
+SELECT
+    G.CODVAL AS codval,
+    G.STAVAL AS staval,
+    G.ORIVAL AS orival,
+    G.TIPCOL AS tipcol,
+    G.TABEVE AS tabeve,
+    G.QTDVAL AS qtdval,
+    FORMAT(
+        CASE WHEN DAY(G.DATVAL) >= 15 THEN DATEADD(MONTH, 1, G.DATVAL) ELSE G.DATVAL END,
+        'yyyyMM'
+    ) AS anomes_competencia,
+    COUNT(*) AS qtd_registros,
+    CAST(SUM(COALESCE(G.VLRVAL, 0)) AS FLOAT) AS valor
+FROM VETORH.dbo.R162GER G
+WHERE G.NUMEMP = ?
+  AND FORMAT(
+        CASE WHEN DAY(G.DATVAL) >= 15 THEN DATEADD(MONTH, 1, G.DATVAL) ELSE G.DATVAL END,
+        'yyyyMM'
+      ) BETWEEN ? AND ?
+GROUP BY G.CODVAL, G.STAVAL, G.ORIVAL, G.TIPCOL, G.TABEVE, G.QTDVAL,
+    FORMAT(
+        CASE WHEN DAY(G.DATVAL) >= 15 THEN DATEADD(MONTH, 1, G.DATVAL) ELSE G.DATVAL END,
+        'yyyyMM'
+    )
+ORDER BY valor DESC
+"""
+
+
+# Colunas reais da R162GER (INFORMATION_SCHEMA) — pré-requisito para fechar a
+# fórmula do V.A.: mostra o que existe para filtrar/classificar além de
+# CODVAL/STAVAL/ORIVAL/TIPCOL/QTDVAL.
+SQL_RH_R162GER_COLUNAS = """
+SELECT
+    COLUMN_NAME AS coluna,
+    DATA_TYPE AS tipo
+FROM VETORH.INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_NAME = 'R162GER'
+ORDER BY ORDINAL_POSITION
+"""
+
+
+@app.post("/api/rh/sync")
+def rh_sync(
+    anomes_ini: str = Query(..., description="Exemplo: 202601"),
+    anomes_fim: str = Query(..., description="Exemplo: 202606"),
+    codemp: int = EMPRESA_PADRAO,
+    usuario=Depends(validar_token),
+):
+    resultado = {}
+
+    try:
+        # 01 - Resumo Folha
+        dados = _rh_executar_sql_senior(SQL_RH_RESUMO_FOLHA, [codemp, anomes_ini, anomes_fim])
+        # Nome da filial (r030fil/Vetorh) — para os cards por filial do dashboard.
+        nomes_filiais = _rh_buscar_nomes_filiais(codemp)
+        for d in dados:
+            cf = d.get("cd_filial")
+            d["ds_filial"] = (
+                (nomes_filiais.get(cf) or nomes_filiais.get(str(cf).strip()))
+                if cf is not None else None
+            )
+        _rh_supabase_delete(
+            "rh_resumo_folha",
+            f"cd_empresa=eq.{codemp}&anomes_competencia=gte.{anomes_ini}&anomes_competencia=lte.{anomes_fim}",
+        )
+        qtd = _rh_supabase_upsert("rh_resumo_folha", dados, "id")
+        resultado["resumo_folha"] = qtd
+        _rh_drills_cache_invalidar()   # rh_resumo_folha mudou => drills mudam
+        _rh_registrar_log("RH_RESUMO_FOLHA", "OK", qtd, "", anomes_ini, anomes_fim)
+
+        # 02 - Quadro Colaboradores
+        dados = _rh_executar_sql_senior(SQL_RH_QUADRO_COLABORADORES, [codemp])
+        _rh_supabase_delete("rh_quadro_colaboradores", f"cd_empresa=eq.{codemp}")
+        qtd = _rh_supabase_upsert("rh_quadro_colaboradores", dados, "cd_matricula")
+        resultado["quadro_colaboradores"] = qtd
+        _rh_registrar_log("RH_QUADRO_COLABORADORES", "OK", qtd, "", anomes_ini, anomes_fim)
+
+        # 03 - Contrato Experiência
+        dados = _rh_executar_sql_senior(SQL_RH_CONTRATO_EXPERIENCIA, [codemp])
+        _rh_supabase_delete("rh_contrato_experiencia", f"cd_empresa=eq.{codemp}")
+        qtd = _rh_supabase_upsert("rh_contrato_experiencia", dados, "cd_matricula")
+        resultado["contrato_experiencia"] = qtd
+        _rh_registrar_log("RH_CONTRATO_EXPERIENCIA", "OK", qtd, "", anomes_ini, anomes_fim)
+
+        # 04 - Programação de Férias
+        dados = _rh_executar_sql_senior(SQL_RH_PROGRAMACAO_FERIAS, [codemp])
+        _rh_supabase_delete("rh_programacao_ferias", f"cd_empresa=eq.{codemp}")
+        qtd = _rh_supabase_upsert("rh_programacao_ferias", dados, "id")
+        resultado["programacao_ferias"] = qtd
+        _rh_registrar_log("RH_PROGRAMACAO_FERIAS", "OK", qtd, "", anomes_ini, anomes_fim)
+
+        # 05 - Provisões (R146PRV) -> rh_aux_provisoes. Defensivo: falha aqui
+        # não derruba o sync principal (o dashboard cai no event-based).
+        try:
+            dados_prov = _rh_executar_sql_senior(
+                SQL_RH_AUX_PROVISOES, [codemp, anomes_ini, anomes_fim])
+            _rh_supabase_delete(
+                "rh_aux_provisoes",
+                f"cd_empresa=eq.{codemp}&anomes_competencia=gte.{anomes_ini}&anomes_competencia=lte.{anomes_fim}",
+            )
+            qtd_prov = _rh_supabase_upsert(
+                "rh_aux_provisoes", dados_prov, "cd_empresa,cd_matricula,anomes_competencia")
+            resultado["aux_provisoes"] = qtd_prov
+            _rh_registrar_log("RH_AUX_PROVISOES", "OK", qtd_prov, "", anomes_ini, anomes_fim)
+        except Exception as exc:
+            resultado["aux_provisoes"] = f"ERRO: {exc}"
+            _rh_registrar_log("RH_AUX_PROVISOES", "ERRO", 0, str(exc), anomes_ini, anomes_fim)
+
+        # 06 - FGTS (R056SFP) -> rh_aux_fgts. Idem defensivo.
+        try:
+            dados_fgts = _rh_executar_sql_senior(
+                SQL_RH_AUX_FGTS, [codemp, anomes_ini, anomes_fim])
+            _rh_supabase_delete(
+                "rh_aux_fgts",
+                f"cd_empresa=eq.{codemp}&anomes_competencia=gte.{anomes_ini}&anomes_competencia=lte.{anomes_fim}",
+            )
+            qtd_fgts = _rh_supabase_upsert(
+                "rh_aux_fgts", dados_fgts, "cd_empresa,cd_matricula,anomes_competencia")
+            resultado["aux_fgts"] = qtd_fgts
+            _rh_registrar_log("RH_AUX_FGTS", "OK", qtd_fgts, "", anomes_ini, anomes_fim)
+        except Exception as exc:
+            resultado["aux_fgts"] = f"ERRO: {exc}"
+            _rh_registrar_log("RH_AUX_FGTS", "ERRO", 0, str(exc), anomes_ini, anomes_fim)
+
+        # 07 - INSS oficial (R056SFP) -> rh_aux_inss. Idem defensivo.
+        try:
+            dados_inss = _rh_executar_sql_senior(
+                SQL_RH_AUX_INSS, [codemp, anomes_ini, anomes_fim])
+            _rh_supabase_delete(
+                "rh_aux_inss",
+                f"cd_empresa=eq.{codemp}&anomes_competencia=gte.{anomes_ini}&anomes_competencia=lte.{anomes_fim}",
+            )
+            qtd_inss = _rh_supabase_upsert(
+                "rh_aux_inss", dados_inss, "cd_empresa,cd_filial,anomes_competencia")
+            resultado["aux_inss"] = qtd_inss
+            _rh_registrar_log("RH_AUX_INSS", "OK", qtd_inss, "", anomes_ini, anomes_fim)
+        except Exception as exc:
+            resultado["aux_inss"] = f"ERRO: {exc}"
+            _rh_registrar_log("RH_AUX_INSS", "ERRO", 0, str(exc), anomes_ini, anomes_fim)
+
+        # 08 - VM_FOLHA (camada COMPAT) -> rh_vm_folha. Fonte oficial dos KPIs.
+        #      VETORH.dbo.VM_FOLHA não existe fisicamente (é objeto lógico do
+        #      UpQuery/BI-JET); materializamos a partir das fontes já validadas
+        #      (eventos p/ líquido/hora extra/férias; R056SFP p/ FGTS/INSS;
+        #      R146PRV p/ provisões). Depende das etapas 01-07 desta mesma sync.
+        try:
+            linhas_vm, diag_vm = _rh_vm_folha_compat_construir(codemp, anomes_ini, anomes_fim)
+            if linhas_vm:
+                _rh_supabase_delete(
+                    "rh_vm_folha",
+                    f"cd_empresa=eq.{codemp}&anomes_competencia=gte.{anomes_ini}&anomes_competencia=lte.{anomes_fim}",
+                )
+                qtd_vm = _rh_supabase_upsert(
+                    "rh_vm_folha", linhas_vm, "cd_empresa,cd_filial,anomes_competencia")
+                resultado["vm_folha"] = {
+                    "linhas": qtd_vm, "camada": "COMPAT", "fontes": diag_vm}
+                _rh_registrar_log("RH_VM_FOLHA_COMPAT", "OK", qtd_vm, "compat", anomes_ini, anomes_fim)
+            else:
+                resultado["vm_folha"] = "VAZIO: sem dados nas fontes (rode as etapas anteriores)"
+                _rh_registrar_log("RH_VM_FOLHA_COMPAT", "VAZIO", 0, "sem dados nas fontes", anomes_ini, anomes_fim)
+        except Exception as exc:
+            resultado["vm_folha"] = f"ERRO: {exc}"
+            _rh_registrar_log("RH_VM_FOLHA_COMPAT", "ERRO", 0, str(exc), anomes_ini, anomes_fim)
+
+        return {
+            "mensagem": "RH sincronizado com sucesso.",
+            "codemp": codemp,
+            "anomes_ini": anomes_ini,
+            "anomes_fim": anomes_fim,
+            "resultado": resultado,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _rh_registrar_log("RH_SYNC", "ERRO", 0, str(exc), anomes_ini, anomes_fim)
+        raise HTTPException(status_code=500, detail=f"Erro ao sincronizar RH: {exc}")
+
+
+@app.get("/api/rh/menu")
+def rh_menu(usuario=Depends(validar_token)):
+    return {
+        "dados": _rh_get_supabase(
+            "rh_menu",
+            "select=*&ativo=eq.true&order=nr_ordem.asc",
+        )
+    }
+
+
+@app.get("/api/rh/resumo-folha")
+def rh_resumo_folha(
+    anomes_ini: Optional[str] = None,
+    anomes_fim: Optional[str] = None,
+    cd_filial: Optional[int] = None,
+    cd_matricula: Optional[str] = None,
+    limite: int = 1000,
+    usuario=Depends(validar_token),
+):
+    filtros = ["select=*", "order=anomes_competencia.desc,ds_colaborador.asc"]
+
+    if anomes_ini:
+        filtros.append(f"anomes_competencia=gte.{anomes_ini}")
+
+    if anomes_fim:
+        filtros.append(f"anomes_competencia=lte.{anomes_fim}")
+
+    if cd_filial:
+        filtros.append(f"cd_filial=eq.{cd_filial}")
+
+    if cd_matricula:
+        filtros.append(f"cd_matricula=eq.{cd_matricula}")
+
+    filtros.append(f"limit={min(limite, 5000)}")
+
+    dados = _rh_get_supabase("rh_resumo_folha", "&".join(filtros))
+
+    return {
+        "dados": dados,
+        "kpis": {
+            "qtd_registros": len(dados),
+            "vl_proventos": round(sum(float(x.get("vl_provento") or 0) for x in dados), 2),
+            "vl_descontos": round(sum(float(x.get("vl_desconto") or 0) for x in dados), 2),
+            "vl_liquido": round(sum(float(x.get("vl_liquido_calculado") or 0) for x in dados), 2),
+            "qtd_colaboradores": len(set(x.get("cd_matricula") for x in dados)),
+        },
+    }
+
+
+@app.get("/api/rh/quadro-colaboradores")
+def rh_quadro_colaboradores(
+    cd_filial: Optional[int] = None,
+    cd_situacao: Optional[int] = None,
+    usuario=Depends(validar_token),
+):
+    filtros = ["select=*", "order=ds_colaborador.asc"]
+
+    if cd_filial:
+        filtros.append(f"cd_filial=eq.{cd_filial}")
+
+    if cd_situacao:
+        filtros.append(f"cd_situacao=eq.{cd_situacao}")
+
+    dados = _rh_get_supabase("rh_quadro_colaboradores", "&".join(filtros))
+
+    return {
+        "dados": dados,
+        "kpis": {
+            "qtd_colaboradores": len(dados),
+            "qtd_ativos": len([x for x in dados if int(x.get("cd_situacao") or 0) != 7]),
+            "qtd_demitidos": len([x for x in dados if int(x.get("cd_situacao") or 0) == 7]),
+        },
+    }
+
+
+@app.get("/api/rh/contrato-experiencia")
+def rh_contrato_experiencia(
+    status: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    filtros = ["select=*", "order=dt_fim_contrato_final.asc"]
+
+    if status:
+        filtros.append(f"ds_status_contrato=eq.{status}")
+
+    dados = _rh_get_supabase("rh_contrato_experiencia", "&".join(filtros))
+
+    return {
+        "dados": dados,
+        "kpis": {
+            "qtd_contratos": len(dados),
+            "qtd_vencidos": len([x for x in dados if x.get("ds_status_contrato") == "VENCIDO"]),
+            "qtd_ate_10_dias": len([x for x in dados if x.get("ds_status_contrato") == "VENCE EM ATE 10 DIAS"]),
+            "qtd_ate_30_dias": len([x for x in dados if x.get("ds_status_contrato") == "VENCE EM ATE 30 DIAS"]),
+        },
+    }
+
+
+@app.get("/api/rh/programacao-ferias")
+def rh_programacao_ferias(
+    status: Optional[str] = None,
+    cd_filial: Optional[int] = None,
+    usuario=Depends(validar_token),
+):
+    filtros = ["select=*", "order=dt_limite_saida.asc,ds_colaborador.asc"]
+
+    if status:
+        filtros.append(f"ds_status_ferias=eq.{status}")
+
+    if cd_filial:
+        filtros.append(f"cd_filial=eq.{cd_filial}")
+
+    dados = _rh_get_supabase("rh_programacao_ferias", "&".join(filtros))
+
+    return {
+        "dados": dados,
+        "kpis": {
+            "qtd_registros": len(dados),
+            "qtd_sem_programacao": len([x for x in dados if x.get("ds_status_ferias") == "SEM PROGRAMACAO"]),
+            "qtd_limite_vencido": len([x for x in dados if x.get("ds_status_ferias") == "LIMITE VENCIDO"]),
+            "qtd_limite_ate_30_dias": len([x for x in dados if x.get("ds_status_ferias") == "LIMITE ATE 30 DIAS"]),
+            "qtd_dias_saldo": round(sum(float(x.get("qtd_dias_saldo") or 0) for x in dados), 2),
+        },
+    }
+
+
+@app.get("/api/rh/formularios")
+def rh_formularios(
+    status: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    filtros = ["select=*", "order=dt_criacao.desc"]
+
+    if status:
+        filtros.append(f"cd_status=eq.{status}")
+
+    return {
+        "dados": _rh_get_supabase("rh_formularios", "&".join(filtros))
+    }
+
+
+@app.post("/api/rh/formularios")
+def rh_criar_formulario(
+    body: RhFormularioPayload,
+    usuario=Depends(validar_token),
+):
+    payload = {
+        "cd_tp_formulario": body.cd_tp_formulario,
+        "ds_titulo": body.ds_titulo,
+        "ds_descricao": body.ds_descricao,
+        "cd_matricula": body.cd_matricula,
+        "ds_colaborador": body.ds_colaborador,
+        "cd_status": body.cd_status or "ABERTO",
+        "cd_usuario_criacao": usuario,
+    }
+
+    url = f"{SUPABASE_URL}/rest/v1/rh_formularios"
+
+    resp = requests.post(
+        url,
+        json=payload,
+        headers=_rh_supabase_headers("return=representation"),
+        timeout=30,
+    )
+
+    if resp.status_code not in (200, 201):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao criar formulário: HTTP {resp.status_code} - {(resp.text or '')[:500]}",
+        )
+
+    return {
+        "mensagem": "Formulário criado com sucesso.",
+        "dados": resp.json(),
+    }
+
+
+# ------------------------------------------------------------
+# RH - Dashboard agregado do Resumo de Folha (cards da tela 01)
+# Agrega no SERVIDOR para o front não somar milhares de linhas. Os KPIs
+# cobrem TODO o período: paginação sem o teto de 1000 linhas do PostgREST.
+# As regras de classificação por descrição ficam aqui (fáceis de ajustar).
+# ------------------------------------------------------------
+
+def _rh_num(valor) -> float:
+    """Converte para float seguro (None/'' -> 0.0)."""
+    if valor is None:
+        return 0.0
+    try:
+        return float(valor)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _rh_desc_norm(texto) -> str:
+    """UPPER + sem acento — casa FERIAS/FÉRIAS, SAUDE/SAÚDE, RESCISAO/RESCISÃO."""
+    s = str(texto or "").upper()
+    s = unicodedata.normalize("NFKD", s)
+    return "".join(c for c in s if not unicodedata.combining(c))
+
+
+# Eventos de desconto que às vezes NÃO vêm com cd_tp_evento=2 nem
+# vl_desconto>0 (a folha lança como informativo). Classificação interina por
+# palavra-chave (sem acento) na descrição — AJUSTE à sua tabela de eventos.
+_RH_DESC_KEYWORDS = (
+    "INSS", "IRRF", "IMPOSTO DE RENDA", "CONSIGNAD", "ADTO", "ADIANT",
+    "PLANO", "SAUDE", "UNIMED", "FARMACIA", "PENSAO", "FALTA",
+    "DESC.", "DESCONTO", "VALE", "EMPRESTIMO", "CONTRIBUI", "SINDICAL",
+)
+
+
+def _rh_evento_eh_desconto(row) -> bool:
+    """True se o evento é desconto: tipo 2, OU vl_desconto>0, OU (quando não é
+    um provento explícito) a descrição casa palavra-chave de desconto. Cobre o
+    caso citado: INSS/Consignado/Adto/Plano Saúde com tipo!=2 e vl_desconto=0."""
+    if _rh_num(row.get("cd_tp_evento")) == 2:
+        return True
+    if _rh_num(row.get("vl_desconto")) > 0:
+        return True
+    if _rh_num(row.get("vl_provento")) > 0:
+        return False
+    desc = _rh_desc_norm(row.get("ds_evento"))
+    return any(k in desc for k in _RH_DESC_KEYWORDS)
+
+
+def _rh_valor_desconto(row) -> float:
+    """Magnitude do desconto: vl_desconto quando > 0; senão |vl_evento|
+    (descontos informativos vêm com vl_desconto=0)."""
+    vd = _rh_num(row.get("vl_desconto"))
+    if vd > 0:
+        return vd
+    return abs(_rh_num(row.get("vl_evento")))
+
+
+def _rh_supabase_paginar(table: str, filtros: list, page: int = 5000,
+                         order: str = "id.asc") -> list:
+    """GET paginado no PostgREST — devolve TODAS as linhas do filtro, sem o
+    teto de linhas do Supabase, para os KPIs cobrirem o período inteiro.
+
+    Pagina por offset com ordenação estável (`order`; padrão id) e usa o total
+    do header Content-Range (Prefer: count=exact) para parar com segurança —
+    mesmo que o servidor limite cada página abaixo de `page`, o avanço é pelo
+    nº REAL de linhas recebidas e a parada é por offset >= total. Views sem
+    coluna id devem passar `order` com uma chave única do agrupamento."""
+    base = "&".join(list(filtros) + [f"order={order}"])
+    todos: list = []
+    offset = 0
+    total = None
+    while True:
+        url = f"{SUPABASE_URL}/rest/v1/{table}?{base}&limit={page}&offset={offset}"
+        resp = requests.get(
+            url,
+            headers=_rh_supabase_headers("count=exact"),
+            timeout=60,
+        )
+        if resp.status_code not in (200, 206):
+            raise HTTPException(
+                status_code=500,
+                detail=f"Erro ao paginar {table} no Supabase: HTTP {resp.status_code} - {(resp.text or '')[:500]}",
+            )
+        lote = resp.json()
+        if not isinstance(lote, list):
+            break
+        todos.extend(lote)
+
+        if total is None:
+            cr = resp.headers.get("Content-Range") or ""
+            if "/" in cr:
+                cauda = cr.rsplit("/", 1)[-1].strip()
+                if cauda.isdigit():
+                    total = int(cauda)
+
+        if not lote:
+            break
+        offset += len(lote)
+        if total is not None:
+            if offset >= total:
+                break
+        elif len(lote) < page:
+            break
+    return todos
+
+
+# Palavras-chave (sem acento) por grupo de CARD — fallback enquanto a
+# rh_evento_classificacao não está completa. AJUSTE à sua tabela de eventos.
+_RH_BENEFICIO_KEYWORDS = ("VALE", "V.A.", "ALIMENT", "FARMACIA", "PLANO",
+                          "SAUDE", "UNIMED", "SEGURO", "CONVENIO")
+_RH_VA_KEYWORDS = ("VALE", "V.A.", "ALIMENT")
+_RH_RESCISAO_KEYWORDS = ("RESCISAO", "AVISO", "INDENIZ", "MULTA")
+
+
+def _rh_grupo_por_descricao(desc_norm: str):
+    """Grupo de CARD pela descrição (já normalizada) — ou None se não casar.
+    Ordem importa: provisões antes de férias/13 genéricos."""
+    if "INSS" in desc_norm:
+        return "INSS"
+    if "FGTS" in desc_norm:
+        return "FGTS"
+    if "EXTRA" in desc_norm:
+        return "HORA_EXTRA"
+    if any(b in desc_norm for b in _RH_BENEFICIO_KEYWORDS):
+        return "BENEFICIO"
+    if "PROV" in desc_norm and ("13" in desc_norm or "DECIMO" in desc_norm):
+        return "PROVISAO_13"
+    # Rescisão vence férias: "Férias Rescisão" entra em RESCISAO, não CUSTO_FERIAS.
+    if "RESCIS" in desc_norm:
+        return "RESCISAO"
+    if "FERIAS" in desc_norm:
+        return "PROVISAO_FERIAS" if "PROV" in desc_norm else "CUSTO_FERIAS"
+    if any(r in desc_norm for r in _RH_RESCISAO_KEYWORDS):
+        return "RESCISAO"
+    return None
+
+
+def _rh_classificar_linha(r, classif, desc_norm=None):
+    """Resolve (grupo_dashboard, entra_liquido, sinal_liquido) da linha.
+
+    Classificação OFICIAL (rh_evento_classificacao por cd_evento) vence; senão
+    cai no fallback: grupo por descrição + sinal por coluna
+    (vl_provento>0 => +1; vl_desconto>0 / tipo 2 / INSS => -1; senão não entra)."""
+    if desc_norm is None:
+        desc_norm = _rh_desc_norm(r.get("ds_evento"))
+
+    cev = r.get("cd_evento")
+    try:
+        chave = int(cev) if cev is not None else None
+    except (TypeError, ValueError):
+        chave = None
+    c = classif.get(chave) if (classif and chave is not None) else None
+    if c and c.get("grupo"):
+        return c["grupo"], bool(c.get("entra")), int(c.get("sinal") or 0)
+
+    grupo = _rh_grupo_por_descricao(desc_norm)
+    vp = _rh_num(r.get("vl_provento"))
+    vd = _rh_num(r.get("vl_desconto"))
+    tp = _rh_num(r.get("cd_tp_evento"))
+    if vp > 0:
+        return (grupo or "PROVENTO_LIQUIDO"), True, 1
+    if vd > 0 or tp == 2 or grupo == "INSS":
+        return (grupo or "DESCONTO_LIQUIDO"), True, -1
+    return (grupo or "OUTROS"), False, 0
+
+
+def _rh_carregar_classificacao_eventos(codemp=None) -> dict:
+    """Carrega rh_evento_classificacao (ativos) num map {cd_evento: {...}}.
+
+    Graceful: se a tabela ainda não existe (ou erro), devolve {} — o dashboard
+    continua funcionando 100% por palavra-chave. Passe codemp para não misturar
+    classificação de empresas diferentes."""
+    filtros = ["select=cd_evento,grupo_dashboard,entra_liquido,sinal_liquido", "ativo=eq.true"]
+    if codemp is not None:
+        filtros.append(f"cd_empresa=eq.{codemp}")
+    try:
+        # PAGINADO: a classificação pode ter mais de 1000 eventos. Com o GET
+        # simples (teto de 1000 do PostgREST) o mapa vinha truncado, jogando
+        # eventos p/ o fallback (que só conta vl_provento>0) e derrubando o
+        # provento do líquido (ex.: hora-extra/férias/rescisão com vl_provento=0).
+        linhas = _rh_supabase_paginar("rh_evento_classificacao", filtros)
+    except Exception:
+        return {}
+    mapa: dict = {}
+    for c in linhas or []:
+        cev = c.get("cd_evento")
+        try:
+            chave = int(cev) if cev is not None else None
+        except (TypeError, ValueError):
+            chave = None
+        if chave is None:
+            continue
+        mapa[chave] = {
+            "grupo": (c.get("grupo_dashboard") or "").strip().upper(),
+            "entra": bool(c.get("entra_liquido")),
+            "sinal": int(c.get("sinal_liquido") or 0),
+        }
+    return mapa
+
+
+def _rh_fmt_horas(horas_decimais) -> str:
+    """Horas decimais -> 'H:MM' (ex.: 198244.58 -> '198244:35').
+
+    Assume qtd_referencia em horas decimais para eventos de hora. Se a sua
+    folha gravar minutos/centésimos diferente, ajustar aqui."""
+    total_min = int(round(_rh_num(horas_decimais) * 60))
+    h, m = divmod(total_min, 60)
+    return f"{h}:{m:02d}"
+
+
+# Evento de hora extra que entra no líquido mas fica FORA da base de encargo do
+# card Hora Extra (reflexo/DSR que não gera o encargo de 20%).
+_RH_HE_EVENTO_SEM_ENCARGO = 134
+
+
+def _rh_cd_evento_int(valor):
+    """cd_evento como int (None se não parsear). Robusto a str/float/'515.0'."""
+    if valor is None:
+        return None
+    try:
+        return int(valor)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return int(float(str(valor).strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+# ============================================================
+# Eventos de FÉRIAS — listas validadas pelo RH (Jan-Mai/2026).
+# O Custo de Férias soma APENAS os eventos de "férias normais" (proventos de
+# férias gozadas/pagas). Férias de RESCISÃO vão para o custo de rescisão;
+# descontos/impostos sobre férias NÃO são custo da empresa. A base do custo é
+# por LISTA DE EVENTOS (não pelo grupo_dashboard), porque o grupo estava
+# misturando rescisão e impostos.
+# ============================================================
+# Base do Custo Férias (proventos de férias normais):
+_RH_FERIAS_NORMAIS_EVENTOS = frozenset({
+    12,   # Horas Férias Diurnas
+    14,   # Horas Férias Noturnas
+    68,   # Periculosidade Férias
+    70,   # Adic.Noturno Férias
+    91,   # Grat. Função s/ Ferias
+    134,  # Média Horas Extras Férias
+    140,  # 1/3 Férias
+    148,  # Abono Pecuniário Férias
+    150,  # Média H.Extras Abono Pec.
+    154,  # Insalubridade Abono Pec.
+    158,  # Adic.Noturno Abono Pec.
+    160,  # 1/3 Abono Pecuniário Fér
+    162,  # Diferença de Abono
+})
+# Férias de RESCISÃO (=> custo de rescisão, NÃO custo de férias):
+_RH_FERIAS_RESCISAO_EVENTOS = frozenset({
+    90,   # Gratif Ferias Vencid Resc
+    170,  # Férias Vencidas Rescisão
+    172,  # Férias Proporc.Rescisão
+    174,  # Média H.Extra Férias Resc
+    180,  # Peric.Férias Rescisão
+    182,  # Adic.Noturno Férias Resc
+    184,  # 1/3 Férias Rescisão
+})
+# Descontos/impostos sobre férias (NÃO são custo de férias da empresa):
+_RH_FERIAS_DESCONTO_EVENTOS = frozenset({
+    281,  # Desconto Adto Férias
+    301,  # INSS s/ Férias
+    308,  # IRRF Férias
+    311,  # Diferença IRRF s/Férias
+})
+# Abono pecuniário de férias (venda de dias) — verba INDENIZATÓRIA: em geral NÃO
+# sofre encargo patronal (FGTS/INSS). Subconjunto da whitelist, separado para
+# calcular o encargo de férias só sobre a base de férias GOZADAS.
+_RH_FERIAS_ABONO_EVENTOS = frozenset({
+    148,  # Abono Pecuniário Férias
+    150,  # Média H.Extras Abono Pec.
+    154,  # Insalubridade Abono Pec.
+    158,  # Adic.Noturno Abono Pec.
+    160,  # 1/3 Abono Pecuniário Fér
+    162,  # Diferença de Abono
+})
+# Encargo patronal sobre FÉRIAS GOZADAS (não incide sobre abono pecuniário, que é
+# indenizatório). Hipótese derivada de Jan-Mai/2026: FGTS 8% + INSS patronal 20%
+# = 28%, aplicada só sobre a base de férias gozadas. Se o alvo BI não fechar,
+# AJUSTAR AQUI (uma linha) — ex.: 0.288 se entrar RAT/FAP. custo_ferias =
+# base_normais + base_gozada * _RH_FERIAS_ENCARGO_TAXA.
+_RH_FERIAS_ENCARGO_TAXA = 0.28
+
+
+# ============================================================
+# Rescisão (eventos validados Jan-Mai/2026). O custo usa o LÍQUIDO de rescisão
+# (evento 264) + FGTS rescisório. NÃO somar os eventos que COMPÕEM o líquido
+# (aviso, 13, férias de rescisão...) — isso duplicaria. Os encargos patronais de
+# rescisão (fonte dos ~87k restantes) ainda a mapear => encargo fica pendente e
+# custo_total_rescisao = líquido + fgts (aproxima o BI; fecha quando achar o resto).
+# ============================================================
+_RH_RESCISAO_LIQUIDO_EVENTOS = frozenset({264})              # Líquido Rescisão
+# FGTS rescisório: 498 (40%), 497 (resc. depositado), 335 (13º dep. na rescisão).
+# O 393 (FGTS 13o Salário) NÃO entra: é depósito mensal — sem ele o card fecha
+# EXATO com o oficial (1.408.899,46; com ele sobrava +732,11).
+_RH_RESCISAO_FGTS_EVENTOS = frozenset({498, 497, 335})
+
+# ============================================================
+# Benefícios por componente (evento de folha -> coluna da rh_vm_folha). São os
+# CANDIDATOS enviados pelo RH; cada componente é exposto separado para validação.
+# Vale-alimentação NÃO está aqui: a fonte oficial é o R162GER (benefício, não
+# evento) — segue pendente (o evento 97 é DESCONTO de VA, não o custo).
+# ============================================================
+_RH_BENEFICIO_COMPONENTES = {
+    "calc_vl_plano_saude": frozenset({515, 521, 526}),  # Part.Empresa (não o desconto)
+    "calc_vl_ajuda_custo": frozenset({82}),             # Ajuda Custo Art 458 CLT
+    "calc_vl_vale_trans": frozenset({269}),             # Vale Transporte
+    "calc_vl_estagio": frozenset({213}),                # Bolsa Estágio
+    "calc_vl_premio": frozenset({254}),                 # Prêmio Assiduidade
+    "calc_vl_seg_vida": frozenset({309}),               # Seguro Vida
+    "calc_vl_aux_moradia": frozenset({223}),            # Auxílio Moradia
+    "calc_vl_bolsa_estud": frozenset({578}),            # Bolsa de Estudo
+    "calc_vl_aux_edu": frozenset({577}),                # Auxílio Educação
+    # Gratificações (CANDIDATO — conjunto a confirmar com a fórmula CALC_VL_GRATI
+    # do UpQuery). 90 e 91 ficam FORA: já pertencem aos grupos de férias (a cadeia
+    # de classificação os consome antes). Não entra no card Benefícios; é insumo
+    # do Custo Total oficial.
+    "calc_vl_grati": frozenset({85, 92, 93, 94, 95, 199, 268}),
+}
+_RH_BENEFICIO_COLUNAS = tuple(_RH_BENEFICIO_COMPONENTES.keys())
+_RH_BENEF_EVENTO_TO_COMP = {
+    ev: comp for comp, evs in _RH_BENEFICIO_COMPONENTES.items() for ev in evs
+}
+
+# Card oficial de Benefícios (PROVADO contra o UpQuery/BI JET, 02/07/2026): a soma
+# dos eventos oficiais fecha 1.060.678,68 NO CENTAVO somente SEM Ajuda Custo (82)
+# e SEM Bolsa Estágio (213). Gratificação também fica fora do card (não aparece na
+# composição provada); é insumo do Custo Total. As colunas continuam na VM.
+_RH_BENEF_CARD_EXCLUIR = frozenset({"calc_vl_ajuda_custo", "calc_vl_estagio",
+                                    "calc_vl_grati"})
+_RH_BENEF_CARD_COLUNAS = tuple(c for c in _RH_BENEFICIO_COLUNAS
+                               if c not in _RH_BENEF_CARD_EXCLUIR)
+
+# Os cards do BI usam SOMENTE TIPCAL = 11 (mensal). PROVADO no centavo:
+#   provento oficial 12.537.132,60 = TIPCAL 11 + TIPEVE (1,2)
+#   desconto oficial  6.795.671,53 = TIPCAL 11 + TIPEVE 3
+#   e evento a evento (82/213/223/254/269/309/515/521/526/577/578).
+# TIPCAL 91 (adiantamento, 2,76M), 13 e 15 ficam FORA dos cards — mas continuam
+# na rh_resumo_folha (espelho cru da R046FFR).
+_RH_CARD_TIPCAL = 11
+
+
+def _rh_hora_extra_componentes(linhas, classif) -> dict:
+    """Componentes do card Hora Extra (grupo_dashboard = HORA_EXTRA):
+      liquido      = SUM(sinal +1) - SUM(sinal -1)
+      base_encargo = SUM(sinal +1, exceto evento 134)
+      hora_extra   = liquido + base_encargo * 0.20
+    NÃO altera o líquido geral — o evento 134 segue no líquido, só não entra na
+    base de encargo do card."""
+    classif = classif or {}
+    prov = desc = base = 0.0
+    for r in linhas or []:
+        grupo, _entra, sinal = _rh_classificar_linha(r, classif)
+        if grupo != "HORA_EXTRA":
+            continue
+        ve = _rh_num(r.get("vl_evento"))
+        if sinal == 1:
+            prov += ve
+            cev = r.get("cd_evento")
+            try:
+                cev_int = int(cev) if cev is not None else None
+            except (TypeError, ValueError):
+                cev_int = None
+            if cev_int != _RH_HE_EVENTO_SEM_ENCARGO:
+                base += ve
+        elif sinal == -1:
+            desc += ve
+    liquido = prov - desc
+    encargo = base * 0.20
+    return {
+        "proventos": round(prov, 2),
+        "descontos": round(desc, 2),
+        "liquido": round(liquido, 2),
+        "base_encargo": round(base, 2),
+        "encargo_20": round(encargo, 2),
+        "hora_extra_calculada": round(liquido + encargo, 2),
+    }
+
+
+def _rh_custo_ferias_componentes(linhas, classif=None) -> dict:
+    """Componentes do card Custo Férias — por LISTA DE EVENTOS (não por grupo).
+
+    Regra validada (Jan-Mai/2026):
+      custo_ferias = SUM(vl_evento dos eventos de FÉRIAS NORMAIS)
+    Férias de RESCISÃO (=> custo de rescisão) e descontos/impostos sobre férias
+    NÃO entram. Os totais excluídos ficam expostos só para conferência. `classif`
+    é ignorado de propósito — a base é por CÓDIGO de evento, não por classificação
+    (o grupo estava misturando rescisão/impostos)."""
+    base = resc = desc_ferias = gozada = abono = 0.0
+    n_base = n_resc = n_desc = 0
+    por_evento: dict = {}
+    for r in linhas or []:
+        cev = _rh_cd_evento_int(r.get("cd_evento"))
+        ve = _rh_num(r.get("vl_evento"))
+        if cev in _RH_FERIAS_NORMAIS_EVENTOS:
+            base += ve
+            n_base += 1
+            if cev in _RH_FERIAS_ABONO_EVENTOS:
+                abono += ve
+            else:
+                gozada += ve
+            pe = por_evento.get(cev)
+            if pe is None:
+                pe = {"cd_evento": cev, "ds_evento": r.get("ds_evento"),
+                      "abono": cev in _RH_FERIAS_ABONO_EVENTOS, "total": 0.0}
+                por_evento[cev] = pe
+            pe["total"] += ve
+        elif cev in _RH_FERIAS_RESCISAO_EVENTOS:
+            resc += ve
+            n_resc += 1
+        elif cev in _RH_FERIAS_DESCONTO_EVENTOS:
+            desc_ferias += ve
+            n_desc += 1
+    base = round(base, 2)
+    # Encargo patronal sobre férias GOZADAS (abono pecuniário fora). Alíquota em
+    # _RH_FERIAS_ENCARGO_TAXA (28% = FGTS 8% + INSS 20%). custo = base + encargo.
+    enc_fgts = round(gozada * 0.08, 2)
+    enc_inss = round(gozada * 0.20, 2)
+    enc_total = round(gozada * _RH_FERIAS_ENCARGO_TAXA, 2)
+    enc_outros = round(enc_total - enc_fgts - enc_inss, 2)
+    final = round(base + enc_total, 2)
+    for pe in por_evento.values():
+        pe["total"] = round(pe["total"], 2)
+    return {
+        # Item A — composição do custo de férias:
+        "ferias_eventos_base": base,
+        "ferias_base_gozada": round(gozada, 2),  # sujeita a encargo patronal
+        "ferias_base_abono": round(abono, 2),    # abono pecuniário (indenizatório)
+        "ferias_encargo_taxa": _RH_FERIAS_ENCARGO_TAXA,
+        "ferias_fgts": enc_fgts,          # 8% sobre a base gozada
+        "ferias_inss": enc_inss,          # 20% sobre a base gozada
+        "ferias_outros_encargos": enc_outros,  # resto da alíquota (RAT/FAP, se houver)
+        "ferias_encargo_total": enc_total,
+        "ferias_provisao_usada": 0.0,     # provisão NÃO entra (card Provisões)
+        # Final = base de férias normais + encargo patronal sobre as gozadas.
+        "calc_vl_custo_ferias_final": final,
+        # Excluídos (conferência — NÃO entram no final):
+        "ferias_rescisao_excluida": round(resc, 2),
+        "ferias_descontos_excluidos": round(desc_ferias, 2),
+        "qtd_linhas": {"base": n_base, "rescisao": n_resc, "desconto": n_desc},
+        # Detalhe por evento da base (para conferir a base do encargo sem chutar):
+        "por_evento_base": sorted(por_evento.values(), key=lambda x: -abs(x["total"])),
+        # Compat com chamadas existentes:
+        "custo_ferias_calculada": final,
+    }
+
+
+def _rh_resumo_folha_agregar(linhas: list, classif=None) -> dict:
+    """Agrega rh_resumo_folha nos cards da tela 01. Modelo classificação-primeiro:
+
+    - Líquido (sinal): provento = SUM(vl_evento, sinal +1);
+      desconto = SUM(vl_evento, sinal -1); total_liquido = provento - desconto
+      (NÃO usa vl_liquido_calculado, que vem inconsistente).
+    - Cards (INSS/FGTS/Hora Extra/Benefícios/Custo Férias/Provisões/Rescisões/
+      Custo Total) somam vl_evento por grupo_dashboard.
+    custo_total/salario_base sem grupo classificado ficam INTERINOS (= proventos)."""
+    classif = classif or {}
+    k = {
+        "provento": 0.0,
+        "desconto": 0.0,
+        "total_liquido": 0.0,
+        "custo_total": 0.0,
+        "beneficios": 0.0,
+        "inss_total": 0.0,
+        "hora_extra": 0.0,
+        "provisoes": 0.0,
+        "custo_ferias": 0.0,
+        "rescisoes": 0.0,
+        "fgts": 0.0,
+    }
+    custo_total_classif = 0.0
+    prov_grp: dict = {}
+    desc_grp: dict = {}
+    fil_grp: dict = {}
+    tp_grp: dict = {}
+
+    for r in linhas or []:
+        ve = _rh_num(r.get("vl_evento"))
+        qr = _rh_num(r.get("qtd_referencia"))
+        desc = _rh_desc_norm(r.get("ds_evento"))
+        cev = r.get("cd_evento")
+        dev = r.get("ds_evento")
+        tp = r.get("cd_tp_evento")
+        fil = r.get("cd_filial")
+
+        grupo, entra, sinal = _rh_classificar_linha(r, classif, desc)
+        prov_inc = ve if (entra and sinal == 1) else 0.0
+        desc_inc = ve if (entra and sinal == -1) else 0.0
+        k["provento"] += prov_inc
+        k["desconto"] += desc_inc
+
+        # Cards por grupo
+        if grupo == "INSS":
+            k["inss_total"] += ve
+        elif grupo == "FGTS":
+            k["fgts"] += ve
+        elif grupo == "HORA_EXTRA":
+            k["hora_extra"] += ve
+        elif grupo == "BENEFICIO":
+            k["beneficios"] += ve
+        elif grupo == "CUSTO_FERIAS":
+            k["custo_ferias"] += ve
+        elif grupo == "RESCISAO":
+            k["rescisoes"] += ve
+        elif grupo in ("PROVISAO_FERIAS", "PROVISAO_13"):
+            k["provisoes"] += ve
+        elif grupo == "CUSTO_TOTAL":
+            custo_total_classif += ve
+
+        # proventos_vantagens / descontos (por evento, valor que entra no líquido)
+        if prov_inc > 0:
+            g = prov_grp.setdefault((cev, dev), {"cd_evento": cev, "ds_evento": dev, "valor": 0.0})
+            g["valor"] += prov_inc
+        if desc_inc > 0:
+            g = desc_grp.setdefault((cev, dev), {"cd_evento": cev, "ds_evento": dev, "valor": 0.0})
+            g["valor"] += desc_inc
+
+        # tipos_evento
+        t = tp_grp.setdefault(tp, {"cd_tp_evento": tp, "valor": 0.0})
+        t["valor"] += ve
+
+        # filiais
+        f = fil_grp.setdefault(fil, {
+            "cd_filial": fil,
+            "filial": "",
+            "salario_base": 0.0,
+            "custo_total": 0.0,
+            "_qtd_horas": 0.0,
+            "custo_hora_extra": 0.0,
+            "_qtd_hora_extra": 0.0,
+            "liquido": 0.0,
+            "fgts": 0.0,
+            "va": 0.0,
+            "inss": 0.0,
+            "custo_ferias": 0.0,
+            "prov_ferias": 0.0,
+            "prov_13": 0.0,
+            "proventos": 0.0,
+            "descontos": 0.0,
+        })
+        if not f["filial"]:
+            dsf = r.get("ds_filial")
+            f["filial"] = (str(dsf).strip() if dsf else "") or (str(fil) if fil is not None else "")
+        f["proventos"] += prov_inc
+        f["descontos"] += desc_inc
+        if grupo == "INSS":
+            f["inss"] += ve
+        elif grupo == "FGTS":
+            f["fgts"] += ve
+        elif grupo == "HORA_EXTRA":
+            f["custo_hora_extra"] += ve
+            f["_qtd_hora_extra"] += qr
+        elif grupo == "CUSTO_FERIAS":
+            f["custo_ferias"] += ve
+        elif grupo == "PROVISAO_FERIAS":
+            f["prov_ferias"] += ve
+        elif grupo == "PROVISAO_13":
+            f["prov_13"] += ve
+        elif grupo == "SALARIO_BASE":
+            f["salario_base"] += ve
+        elif grupo == "CUSTO_TOTAL":
+            f["custo_total"] += ve
+        if any(kw in desc for kw in _RH_VA_KEYWORDS):
+            f["va"] += ve
+        if grupo in ("SALARIO_BASE", "HORA_EXTRA"):
+            f["_qtd_horas"] += qr
+
+    def _r2(v):
+        return round(_rh_num(v), 2)
+
+    # Hora Extra oficial: líquido (prov-desc) + encargo 20% (base exclui ev.134),
+    # substituindo o SUM bruto acumulado no loop.
+    k["hora_extra"] = _rh_hora_extra_componentes(linhas, classif)["hora_extra_calculada"]
+
+    # Custo Férias oficial: líquido do grupo (+ encargos fgts 8% / RAT-FAP quando
+    # mapeados), substituindo o SUM absoluto antigo.
+    k["custo_ferias"] = _rh_custo_ferias_componentes(linhas, classif)["custo_ferias_calculada"]
+
+    # custo_total (interino aqui; o valor final vem da fórmula oficial de 17
+    # componentes em _rh_aplicar_fontes_e_custo, que sobrescreve este).
+    k["custo_total"] = custo_total_classif if custo_total_classif else k["provento"]
+    kpis = {chave: _r2(valor) for chave, valor in k.items()}
+    kpis["total_liquido"] = round(kpis["provento"] - kpis["desconto"], 2)
+
+    proventos = sorted(prov_grp.values(), key=lambda x: x["valor"], reverse=True)
+    descontos = sorted(desc_grp.values(), key=lambda x: x["valor"], reverse=True)
+    for g in proventos:
+        g["valor"] = _r2(g["valor"])
+    for g in descontos:
+        g["valor"] = _r2(g["valor"])
+
+    filiais = sorted(fil_grp.values(), key=lambda x: (x["cd_filial"] is None, x["cd_filial"]))
+    for f in filiais:
+        # Interinos por filial (sem classificação SALARIO_BASE/CUSTO_TOTAL)
+        if not f["salario_base"]:
+            f["salario_base"] = f["proventos"]
+        if not f["custo_total"]:
+            f["custo_total"] = f["proventos"]
+        f["liquido"] = f["proventos"] - f["descontos"]
+        f["qtd_horas"] = _rh_fmt_horas(f.pop("_qtd_horas"))
+        f["qtd_hora_extra"] = _rh_fmt_horas(f.pop("_qtd_hora_extra"))
+        for campo in ("salario_base", "custo_total", "custo_hora_extra", "liquido",
+                      "fgts", "va", "inss", "custo_ferias", "prov_ferias", "prov_13",
+                      "proventos", "descontos"):
+            f[campo] = _r2(f[campo])
+
+    tipos = sorted(tp_grp.values(), key=lambda x: (x["cd_tp_evento"] is None, x["cd_tp_evento"]))
+    for t in tipos:
+        t["valor"] = _r2(t["valor"])
+
+    return {
+        "kpis": kpis,
+        "filiais": filiais,
+        "proventos_vantagens": proventos,
+        "descontos": descontos,
+        "tipos_evento": tipos,
+    }
+
+
+def _rh_resumo_folha_mensal(linhas: list, classif=None) -> list:
+    """Agrupa por anomes_competencia: provento (sinal +1) / desconto (sinal -1)
+    / total_liquido = provento - desconto, usando a MESMA classificação do
+    acumulado (rh_evento_classificacao + fallback). Ordenado por competência."""
+    classif = classif or {}
+    meses: dict = {}
+    for r in linhas or []:
+        am = r.get("anomes_competencia")
+        ve = _rh_num(r.get("vl_evento"))
+        _, entra, sinal = _rh_classificar_linha(r, classif)
+        m = meses.setdefault(am, {
+            "anomes_competencia": am,
+            "provento": 0.0,
+            "desconto": 0.0,
+            "total_liquido": 0.0,
+        })
+        if entra and sinal == 1:
+            m["provento"] += ve
+        elif entra and sinal == -1:
+            m["desconto"] += ve
+
+    saida = sorted(
+        meses.values(),
+        key=lambda x: (x["anomes_competencia"] is None, str(x["anomes_competencia"] or "")),
+    )
+    for m in saida:
+        p = round(m["provento"], 2)
+        d = round(m["desconto"], 2)
+        m["provento"] = p
+        m["desconto"] = d
+        m["total_liquido"] = round(p - d, 2)
+    return saida
+
+
+# Totais oficiais de referência (Jan-Mai/2026) para o comparativo do debug.
+_RH_OFICIAL_REF = {
+    "periodo": "202601-202605",
+    "provento": 12537132.60,
+    "desconto": 6795671.53,
+    "total_liquido": 5741461.07,
+    "beneficios": 1060678.68,
+    "inss_total": 3147442.33,
+    "fgts": 840274.75,
+    "hora_extra": 1533612.20,
+    "provisoes": 2734855.50,
+    "custo_ferias": 581462.67,
+    "rescisoes": 1408899.46,
+    "custo_total": 18260200.42,
+}
+
+
+def _rh_fkey(valor):
+    """Chave estável de filial (str) para casar cd_filial entre fontes."""
+    return str(valor).strip() if valor is not None else ""
+
+
+def _rh_carregar_aux(table: str, select: str, codemp, anomes_ini, anomes_fim, cd_filial) -> list:
+    """Carrega uma tabela auxiliar do RH no período (paginado). Best-effort: se
+    a tabela não existe / dá erro, devolve [] e o dashboard usa o event-based."""
+    filtros = [f"select={select}"]
+    if anomes_ini:
+        filtros.append(f"anomes_competencia=gte.{anomes_ini}")
+    if anomes_fim:
+        filtros.append(f"anomes_competencia=lte.{anomes_fim}")
+    if cd_filial:
+        filtros.append(f"cd_filial=eq.{cd_filial}")
+    if codemp:
+        filtros.append(f"cd_empresa=eq.{codemp}")
+    try:
+        return _rh_supabase_paginar(table, filtros)
+    except Exception:
+        return []
+
+
+def _rh_aplicar_fontes_e_custo(resultado: dict, aux_prov: list, aux_fgts: list,
+                               aux_inss: list = None) -> dict:
+    """Sobrepõe provisões/FGTS/INSS pelas fontes auxiliares (quando há dados) e
+    recalcula custo_total pela fórmula oficial. Devolve os componentes do
+    custo_total (para o debug). NÃO toca em provento/desconto/total_liquido."""
+    kpis = resultado["kpis"]
+    filiais = resultado.get("filiais") or []
+
+    if aux_prov:
+        tot_f = tot_13 = 0.0
+        por_filial: dict = {}
+        for r in aux_prov:
+            vf = _rh_num(r.get("vl_provisao_ferias"))
+            v13 = _rh_num(r.get("vl_provisao_13"))
+            tot_f += vf
+            tot_13 += v13
+            d = por_filial.setdefault(_rh_fkey(r.get("cd_filial")), {"f": 0.0, "t": 0.0})
+            d["f"] += vf
+            d["t"] += v13
+        kpis["provisoes"] = round(tot_f + tot_13, 2)
+        for f in filiais:
+            d = por_filial.get(_rh_fkey(f.get("cd_filial")))
+            if d is not None:
+                f["prov_ferias"] = round(d["f"], 2)
+                f["prov_13"] = round(d["t"], 2)
+
+    if aux_fgts:
+        tot = 0.0
+        por_fil_fgts: dict = {}
+        for r in aux_fgts:
+            v = _rh_num(r.get("vl_fgts")) + _rh_num(r.get("vl_fgts_13"))
+            tot += v
+            kf = _rh_fkey(r.get("cd_filial"))
+            por_fil_fgts[kf] = por_fil_fgts.get(kf, 0.0) + v
+        kpis["fgts"] = round(tot, 2)
+        for f in filiais:
+            kf = _rh_fkey(f.get("cd_filial"))
+            if kf in por_fil_fgts:
+                f["fgts"] = round(por_fil_fgts[kf], 2)
+
+    if aux_inss:
+        tot_inss = 0.0
+        por_fil_inss: dict = {}
+        for r in aux_inss:
+            v = _rh_num(r.get("inss_total"))
+            tot_inss += v
+            kf = _rh_fkey(r.get("cd_filial"))
+            por_fil_inss[kf] = por_fil_inss.get(kf, 0.0) + v
+        kpis["inss_total"] = round(tot_inss, 2)
+        for f in filiais:
+            kf = _rh_fkey(f.get("cd_filial"))
+            if kf in por_fil_inss:
+                f["inss"] = round(por_fil_inss[kf], 2)
+
+    # custo_total = fórmula OFICIAL (soma dos 17 componentes). Componentes com
+    # fonte já validada entram de verdade (FGTS, provisões, INSS empresa=20%);
+    # os demais entram como 0 até serem mapeados no Vetorh (ver debug).
+    # NÃO usa mais a aproximação provento+beneficios+inss+fgts+rescisoes.
+    vl_prov_ferias = round(sum(_rh_num(r.get("vl_provisao_ferias")) for r in (aux_prov or [])), 2)
+    vl_prov_13 = round(sum(_rh_num(r.get("vl_provisao_13")) for r in (aux_prov or [])), 2)
+    vl_fgts_of = round(sum(_rh_num(r.get("vl_fgts")) + _rh_num(r.get("vl_fgts_13")) for r in (aux_fgts or [])), 2)
+    vl_inssempresa = round(sum(_rh_num(r.get("inss_patronal_20")) for r in (aux_inss or [])), 2)
+
+    comp = {
+        "calc_vl_sal_bruto": 0.0,          # a mapear (salário bruto calculado)
+        "vl_fgts": vl_fgts_of,             # OK: r056sfp
+        "vl_fap_rat": 0.0,                 # a mapear
+        "vl_inssterceiros": 0.0,           # a mapear
+        "vl_inssempresa": vl_inssempresa,  # OK: r056sfp (patronal 20%)
+        "vl_provisaoferias": vl_prov_ferias,  # OK: r146prv tipprv=1
+        "vl_provisao13": vl_prov_13,          # OK: r146prv tipprv=2
+        "vl_vale_alimentacao": 0.0,        # a mapear
+        "calc_vl_seg_vida": 0.0,           # a mapear
+        "calc_vl_premio": 0.0,             # a mapear
+        "calc_vl_plano_saude": 0.0,        # a mapear
+        "calc_vl_ajuda_custo": 0.0,        # a mapear
+        "calc_vl_grati": 0.0,              # a mapear
+        "calc_vl_aux_edu": 0.0,            # a mapear
+        "calc_vl_bolsa_estud": 0.0,        # a mapear
+        "calc_vl_vale_trans": 0.0,         # a mapear
+        "calc_vl_aux_moradia": 0.0,        # a mapear
+    }
+    comp["custo_total"] = round(sum(comp.values()), 2)
+    kpis["custo_total"] = comp["custo_total"]
+    return comp
+
+
+def _rh_comparativo_oficial(kpis: dict) -> dict:
+    """Compara os KPIs calculados com os totais oficiais de referência."""
+    out = {}
+    for metr, oficial in _RH_OFICIAL_REF.items():
+        if metr == "periodo":
+            continue
+        api = kpis.get(metr)
+        if api is None:
+            continue
+        api = round(_rh_num(api), 2)
+        out[metr] = {"api": api, "oficial": oficial, "dif": round(api - oficial, 2)}
+    return out
+
+
+def _rh_inss_componentes_from_aux(aux_inss):
+    """Componentes de INSS (debug) agregados da fonte oficial rh_aux_inss.
+    Devolve None se a auxiliar ainda não tem dados (o debug cai no fallback)."""
+    if not aux_inss:
+        return None
+    campos = ("base_inss_original", "base_13_aviso_excluida", "base_inss_patronal",
+              "inss_empregado", "inss_patronal_20", "salario_maternidade",
+              "salario_familia", "inss_total")
+    agg = {c: 0.0 for c in campos}
+    for r in aux_inss:
+        for c in campos:
+            agg[c] += _rh_num(r.get(c))
+    out = {c: round(v, 2) for c, v in agg.items()}
+    # Separação p/ o Custo Total: o que entra é o ENCARGO do empregador, não o
+    # INSS descontado do funcionário. inss_patronal_20 = VL_INSSEMPRESA (20%).
+    out["vl_inssempresa"] = out.get("inss_patronal_20")
+    out["vl_inssterceiros"] = None   # a mapear no Vetorh
+    out["vl_fap_rat"] = None          # a mapear no Vetorh
+    oficial = _RH_OFICIAL_REF.get("inss_total")
+    out["diferenca_oficial"] = round(out["inss_total"] - oficial, 2) if oficial else None
+    return out
+
+
+def _rh_vale_diagnostico(codemp, anomes_ini, anomes_fim):
+    """Diagnóstico de vale/benefícios (R162GER) por codval/staval/orival — para
+    validar o filtro ANTES de eventualmente trocar o card de benefícios."""
+    try:
+        return _rh_executar_sql_senior(SQL_RH_VALE_DIAG, [codemp, anomes_ini, anomes_fim])
+    except Exception as exc:
+        return {"erro": str(exc)}
+
+
+def _rh_montar_diagnostico(linhas, classif, resultado, comp_custo, aux_prov, aux_fgts,
+                           inss_comp=None, vale_r162=None) -> dict:
+    """Diagnóstico (debug=true): comparativo oficial, eventos classificados e
+    SEM classificação (para popular rh_evento_classificacao) e estado das
+    fontes auxiliares."""
+    kpis = resultado["kpis"]
+
+    he_comp = _rh_hora_extra_componentes(linhas, classif)
+    he_oficial = _RH_OFICIAL_REF.get("hora_extra")
+    he_comp["oficial"] = he_oficial
+    he_comp["diferenca"] = (round(he_comp["hora_extra_calculada"] - he_oficial, 2)
+                            if he_oficial else None)
+
+    fe_comp = _rh_custo_ferias_componentes(linhas, classif)
+    fe_oficial = _RH_OFICIAL_REF.get("custo_ferias")
+    fe_comp["oficial"] = fe_oficial
+    fe_comp["diferenca"] = (round(fe_comp["custo_ferias_calculada"] - fe_oficial, 2)
+                            if fe_oficial else None)
+
+    ev: dict = {}
+    for r in linhas or []:
+        cev = r.get("cd_evento")
+        try:
+            chave = int(cev) if cev is not None else None
+        except (TypeError, ValueError):
+            chave = None
+        e = ev.setdefault(chave, {
+            "cd_evento": cev,
+            "ds_evento": r.get("ds_evento"),
+            "total_vl_evento": 0.0,
+            "qtd_linhas": 0,
+        })
+        e["total_vl_evento"] += _rh_num(r.get("vl_evento"))
+        e["qtd_linhas"] += 1
+
+    classificados = []
+    sem = []
+    for chave, e in ev.items():
+        e["total_vl_evento"] = round(e["total_vl_evento"], 2)
+        c = classif.get(chave) if chave is not None else None
+        if c:
+            classificados.append({
+                **e, "grupo_dashboard": c.get("grupo"),
+                "entra_liquido": c.get("entra"), "sinal_liquido": c.get("sinal"),
+            })
+        else:
+            sem.append({**e, "grupo_fallback": _rh_grupo_por_descricao(_rh_desc_norm(e["ds_evento"])) or "OUTROS"})
+    classificados.sort(key=lambda x: abs(x["total_vl_evento"]), reverse=True)
+    sem.sort(key=lambda x: abs(x["total_vl_evento"]), reverse=True)
+
+    fgts_oficial = _RH_OFICIAL_REF.get("fgts")
+    return {
+        "classificacao_eventos_carregados": len(classif or {}),
+        "comparativo_oficial": _rh_comparativo_oficial(kpis),
+        "liquido_componentes": {
+            "provento": kpis.get("provento"),
+            "desconto": kpis.get("desconto"),
+            "total_liquido": kpis.get("total_liquido"),
+            "oficial": {
+                "provento": 12537132.60,
+                "desconto": 6795671.53,
+                "total_liquido": 5741461.07,
+            },
+        },
+        "fgts_componentes": {
+            "fgts": kpis.get("fgts"),
+            "fonte": "rh_aux_fgts (r056sfp)" if aux_fgts else "eventos (fallback — sincronize rh_aux_fgts)",
+            "oficial": fgts_oficial,
+            "diferenca": (round(_rh_num(kpis.get("fgts")) - fgts_oficial, 2)
+                          if fgts_oficial else None),
+        },
+        "provisoes_componentes": {
+            "vl_provisaoferias": round(sum(_rh_num(r.get("vl_provisao_ferias")) for r in (aux_prov or [])), 2),
+            "vl_provisao13": round(sum(_rh_num(r.get("vl_provisao_13")) for r in (aux_prov or [])), 2),
+            "provisoes": kpis.get("provisoes"),
+            "fonte": "rh_aux_provisoes (r146prv)" if aux_prov else "eventos (fallback — sincronize rh_aux_provisoes)",
+            "oficial": _RH_OFICIAL_REF.get("provisoes"),
+        },
+        "inss_componentes": inss_comp or {
+            "inss_empregado_eventos": kpis.get("inss_total"),
+            "obs": "passe codemp e sincronize rh_aux_inss (R056SFP)",
+        },
+        "hora_extra_componentes": he_comp,
+        "ferias_componentes": fe_comp,
+        "custo_total_componentes": comp_custo,
+        "eventos_classificados": classificados,
+        "eventos_sem_classificacao": sem,
+        "vale_r162ger": vale_r162,
+    }
+
+
+# KPIs e grid vêm das views oficiais da VM_FOLHA quando há dado sincronizado.
+_RH_VM_KPI_CAMPOS = ("provento", "desconto", "total_liquido", "custo_total",
+                     "beneficios", "inss_total", "hora_extra", "provisoes",
+                     "custo_ferias", "rescisoes", "fgts")
+_RH_VM_FILIAL_NUM = ("salario_base", "custo_total", "custo_hora_extra", "liquido",
+                     "fgts", "va", "inss", "custo_ferias", "prov_ferias", "prov_13",
+                     "proventos", "descontos")
+_RH_VM_DEBUG_CAMPOS = ("calc_vl_provento_liq", "calc_vl_desconto_liq", "vl_liquido",
+                       "calc_vl_custo_total", "calc_vl_beneficios", "calc_vl_inss_total",
+                       "calc_vl_horas_extra", "calc_vl_total_provisao", "calc_vl_custo_ferias",
+                       "calc_custo_total_rescisao", "vl_fgts", "vl_vale_alimentacao",
+                       "vl_provisaoferias", "vl_provisao13", "vl_proventos", "vl_descontos")
+
+
+def _rh_vm_filtros(select, codemp, anomes_ini, anomes_fim, cd_filial):
+    filtros = [f"select={select}"]
+    if anomes_ini:
+        filtros.append(f"anomes_competencia=gte.{anomes_ini}")
+    if anomes_fim:
+        filtros.append(f"anomes_competencia=lte.{anomes_fim}")
+    if cd_filial:
+        filtros.append(f"cd_filial=eq.{cd_filial}")
+    if codemp:
+        filtros.append(f"cd_empresa=eq.{codemp}")
+    return "&".join(filtros)
+
+
+def _rh_ler_vm_dashboard(codemp, anomes_ini, anomes_fim, cd_filial):
+    """KPIs oficiais da view rh_vm_folha_dashboard_v, somando o período. Devolve
+    o dict de kpis, ou None se a view não existir / não tiver dado no período."""
+    try:
+        rows = _rh_get_supabase("rh_vm_folha_dashboard_v",
+                                _rh_vm_filtros("*", codemp, anomes_ini, anomes_fim, cd_filial))
+    except Exception:
+        return None
+    if not rows:
+        return None
+    agg = {c: 0.0 for c in _RH_VM_KPI_CAMPOS}
+    for r in rows:
+        for c in _RH_VM_KPI_CAMPOS:
+            if r.get(c) is not None:
+                agg[c] += _rh_num(r.get(c))
+    return {c: round(v, 2) for c, v in agg.items()}
+
+
+def _rh_ler_vm_filial(codemp, anomes_ini, anomes_fim, cd_filial):
+    """Grid por filial da view rh_vm_folha_filial_v, agregada por filial no
+    período. qtd_horas/qtd_hora_extra saem em HH:MM. None se sem dado."""
+    try:
+        rows = _rh_get_supabase("rh_vm_folha_filial_v",
+                                _rh_vm_filtros("*", codemp, anomes_ini, anomes_fim, cd_filial))
+    except Exception:
+        return None
+    if not rows:
+        return None
+    por_fil: dict = {}
+    for r in rows:
+        cf = r.get("cd_filial")
+        kf = _rh_fkey(cf)
+        f = por_fil.get(kf)
+        if f is None:
+            f = {"cd_filial": cf, "filial": "", "_qtd_horas": 0.0, "_qtd_hora_extra": 0.0}
+            for c in _RH_VM_FILIAL_NUM:
+                f[c] = 0.0
+            por_fil[kf] = f
+        if not f["filial"]:
+            dsf = r.get("ds_filial") or r.get("filial")
+            f["filial"] = (str(dsf).strip() if dsf else "") or (str(cf) if cf is not None else "")
+        for c in _RH_VM_FILIAL_NUM:
+            if r.get(c) is not None:
+                f[c] += _rh_num(r.get(c))
+        f["_qtd_horas"] += _rh_num(r.get("qtd_horas"))
+        f["_qtd_hora_extra"] += _rh_num(r.get("qtd_hora_extra"))
+    saida = sorted(por_fil.values(), key=lambda x: (x["cd_filial"] is None, x["cd_filial"]))
+    for f in saida:
+        for c in _RH_VM_FILIAL_NUM:
+            f[c] = round(f[c], 2)
+        f["qtd_horas"] = _rh_fmt_horas(f.pop("_qtd_horas"))
+        f["qtd_hora_extra"] = _rh_fmt_horas(f.pop("_qtd_hora_extra"))
+    return saida
+
+
+def _rh_ler_vm_componentes(codemp, anomes_ini, anomes_fim, cd_filial):
+    """Componentes brutos da VM_FOLHA (rh_vm_folha) somados no período — p/ debug."""
+    try:
+        rows = _rh_get_supabase(
+            "rh_vm_folha",
+            _rh_vm_filtros(",".join(_RH_VM_DEBUG_CAMPOS), codemp, anomes_ini, anomes_fim, cd_filial))
+    except Exception:
+        return None
+    if not rows:
+        return None
+    agg = {c: 0.0 for c in _RH_VM_DEBUG_CAMPOS}
+    for r in rows:
+        for c in _RH_VM_DEBUG_CAMPOS:
+            agg[c] += _rh_num(r.get(c))
+    return {c: round(v, 2) for c, v in agg.items()}
+
+
+# ============================================================
+# VM_FOLHA não existe como objeto SQL no Vetorh (é do UpQuery/BI). A camada
+# COMPAT materializa os campos equivalentes em public.rh_vm_folha a partir das
+# fontes reais já validadas, e o dashboard lê dessa tabela.
+# ============================================================
+
+# Mapa coluna_rh_vm_folha -> KPI. Coluna toda-nula => KPI "pendente" (null).
+_RH_VM_KPI_MAP = {
+    "provento": "calc_vl_provento_liq",
+    "desconto": "calc_vl_desconto_liq",
+    "total_liquido": "vl_liquido",
+    "custo_total": "calc_vl_custo_total",
+    "beneficios": "calc_vl_beneficios",
+    "inss_total": "calc_vl_inss_total",
+    "hora_extra": "calc_vl_horas_extra",
+    "provisoes": "calc_vl_total_provisao",
+    "custo_ferias": "calc_vl_custo_ferias",
+    "rescisoes": "calc_custo_total_rescisao",
+    "fgts": "vl_fgts",
+}
+_RH_VM_FILIAL_MAP = {
+    "salario_base": "calc_vl_sal_bruto",
+    "custo_total": "calc_vl_custo_total",
+    "custo_hora_extra": "calc_vl_horas_extra",
+    "liquido": "vl_liquido",
+    "fgts": "vl_fgts",
+    "va": "vl_vale_alimentacao",
+    "inss": "calc_vl_inss_total",
+    "custo_ferias": "calc_vl_custo_ferias",
+    "prov_ferias": "vl_provisaoferias",
+    "prov_13": "vl_provisao13",
+    "proventos": "vl_proventos",
+    "descontos": "vl_descontos",
+}
+
+
+def _rh_ler_vm_folha_kpis(codemp, anomes_ini, anomes_fim, cd_filial):
+    """KPIs somados de public.rh_vm_folha (a camada COMPAT). Devolve None se a
+    tabela estiver vazia no período (=> SEM_CARGA). Coluna toda-nula => KPI None
+    (pendente), nunca 0.00 em silêncio."""
+    sel = "cd_filial," + ",".join(sorted(set(_RH_VM_KPI_MAP.values())))
+    try:
+        rows = _rh_get_supabase("rh_vm_folha", _rh_vm_filtros(sel, codemp, anomes_ini, anomes_fim, cd_filial))
+    except Exception:
+        return None
+    if not rows:
+        return None
+    kpis = {}
+    for kpi, col in _RH_VM_KPI_MAP.items():
+        vals = [r.get(col) for r in rows]
+        kpis[kpi] = None if all(v is None for v in vals) else round(sum(_rh_num(v) for v in vals), 2)
+    return kpis
+
+
+def _rh_ler_vm_folha_filiais(codemp, anomes_ini, anomes_fim, cd_filial):
+    """Grid por filial de public.rh_vm_folha. qtd_* em HH:MM. Coluna toda-nula
+    da filial => campo None (pendente)."""
+    cols = sorted(set(_RH_VM_FILIAL_MAP.values()) | {"calc_qtd_horas", "calc_qtd_hora_extra"})
+    sel = "cd_filial,ds_filial," + ",".join(cols)
+    try:
+        rows = _rh_get_supabase("rh_vm_folha", _rh_vm_filtros(sel, codemp, anomes_ini, anomes_fim, cd_filial))
+    except Exception:
+        return None
+    if not rows:
+        return None
+    por_fil: dict = {}
+    for r in rows:
+        cf = r.get("cd_filial")
+        kf = _rh_fkey(cf)
+        g = por_fil.setdefault(kf, {"cd_filial": cf, "ds_filial": r.get("ds_filial"), "_linhas": []})
+        if not g.get("ds_filial") and r.get("ds_filial"):
+            g["ds_filial"] = r.get("ds_filial")
+        g["_linhas"].append(r)
+    saida = []
+    for g in sorted(por_fil.values(), key=lambda x: (x["cd_filial"] is None, x["cd_filial"])):
+        linhas_f = g.pop("_linhas")
+        item = {"cd_filial": g["cd_filial"],
+                "filial": (str(g.get("ds_filial")).strip() if g.get("ds_filial") else "") or str(g["cd_filial"] or "")}
+        for campo, col in _RH_VM_FILIAL_MAP.items():
+            vals = [r.get(col) for r in linhas_f]
+            item[campo] = None if all(v is None for v in vals) else round(sum(_rh_num(v) for v in vals), 2)
+        item["qtd_horas"] = _rh_fmt_horas(sum(_rh_num(r.get("calc_qtd_horas")) for r in linhas_f))
+        item["qtd_hora_extra"] = _rh_fmt_horas(sum(_rh_num(r.get("calc_qtd_hora_extra")) for r in linhas_f))
+        saida.append(item)
+    return saida
+
+
+def _rh_ler_vm_folha_mensal(codemp, anomes_ini, anomes_fim, cd_filial):
+    """Mensal (provento/desconto/total_liquido por competência) de rh_vm_folha."""
+    sel = "anomes_competencia,calc_vl_provento_liq,calc_vl_desconto_liq,vl_liquido"
+    try:
+        rows = _rh_get_supabase("rh_vm_folha", _rh_vm_filtros(sel, codemp, anomes_ini, anomes_fim, cd_filial))
+    except Exception:
+        rows = []
+    meses: dict = {}
+    for r in rows or []:
+        am = r.get("anomes_competencia")
+        m = meses.setdefault(am, {"anomes_competencia": am, "provento": 0.0, "desconto": 0.0, "total_liquido": 0.0})
+        m["provento"] += _rh_num(r.get("calc_vl_provento_liq"))
+        m["desconto"] += _rh_num(r.get("calc_vl_desconto_liq"))
+        m["total_liquido"] += _rh_num(r.get("vl_liquido"))
+    saida = sorted(meses.values(), key=lambda x: str(x["anomes_competencia"] or ""))
+    for m in saida:
+        for k in ("provento", "desconto", "total_liquido"):
+            m[k] = round(m[k], 2)
+    return saida
+
+
+# NOTA: VETORH.dbo.VM_FOLHA NÃO existe (é objeto lógico do UpQuery/BI JET).
+# As funções que consultavam esse objeto foram REMOVIDAS. Os cards oficiais
+# vêm de public.rh_vm_folha (camada COMPAT montada a partir das tabelas reais).
+
+
+# Cache em memória dos drills (o cálculo é caro no caminho SEM a view: 63k+
+# linhas x páginas de 1.000 no Supabase ≈ 32s). Invalidado pelo /api/rh/sync.
+_RH_DRILLS_CACHE: dict = {}
+_RH_DRILLS_CACHE_TTL = 600.0   # segundos
+
+
+def _rh_drills_cache_invalidar():
+    _RH_DRILLS_CACHE.clear()
+
+
+def _rh_drills_eventos(codemp, anomes_ini, anomes_fim, cd_filial):
+    """Drills (proventos_vantagens/descontos/tipos_evento) + líquido validado por
+    evento (provento/desconto/total_liquido). NÃO alimenta custo_total/INSS/FGTS/
+    provisões/férias/rescisões.
+
+    Fonte preferida: view agregada rh_drill_eventos_v (migration
+    rh_drill_eventos_view.sql — poucas centenas de linhas, <1s). Fallback: tabela
+    crua rh_resumo_folha (63k+ linhas ≈ 32s). Como a agregação é toda aditiva
+    (soma de vl_evento por evento), os dois caminhos produzem o MESMO resultado."""
+    cache_key = (codemp, anomes_ini, anomes_fim, cd_filial)
+    em_cache = _RH_DRILLS_CACHE.get(cache_key)
+    if em_cache and (_time_mod.time() - em_cache[0]) < _RH_DRILLS_CACHE_TTL:
+        return em_cache[1]
+
+    filtros_periodo = []
+    if anomes_ini:
+        filtros_periodo.append(f"anomes_competencia=gte.{anomes_ini}")
+    if anomes_fim:
+        filtros_periodo.append(f"anomes_competencia=lte.{anomes_fim}")
+    if cd_filial:
+        filtros_periodo.append(f"cd_filial=eq.{cd_filial}")
+    if codemp:
+        filtros_periodo.append(f"cd_empresa=eq.{codemp}")
+
+    linhas = None
+    try:
+        linhas = _rh_supabase_paginar(
+            "rh_drill_eventos_v",
+            ["select=cd_evento,ds_evento,cd_tp_evento,cd_filial,"
+             "vl_provento,vl_desconto,vl_evento,qtd_referencia"] + filtros_periodo,
+            order="anomes_competencia.asc,cd_filial.asc,cd_tp_calculo.asc,cd_evento.asc",
+        )
+    except Exception:
+        linhas = None   # view ainda não criada no Supabase => caminho lento
+    if linhas is None:
+        try:
+            linhas = _rh_supabase_paginar(
+                "rh_resumo_folha",
+                ["select=cd_evento,ds_evento,cd_tp_evento,cd_filial,"
+                 "vl_provento,vl_desconto,vl_evento"] + filtros_periodo,
+            )
+        except Exception:
+            linhas = []
+    classif = _rh_carregar_classificacao_eventos(codemp)
+    agg = _rh_resumo_folha_agregar(linhas, classif)
+    k = agg.get("kpis") or {}
+    resultado = {
+        "liquido": {
+            "provento": k.get("provento"),
+            "desconto": k.get("desconto"),
+            "total_liquido": k.get("total_liquido"),
+        },
+        "custo_ferias_componentes": _rh_custo_ferias_componentes(linhas, classif),
+        "proventos_vantagens": agg.get("proventos_vantagens") or [],
+        "descontos": agg.get("descontos") or [],
+        "tipos_evento": agg.get("tipos_evento") or [],
+    }
+    _RH_DRILLS_CACHE[cache_key] = (_time_mod.time(), resultado)
+    return resultado
+
+
+@app.get("/api/rh/resumo-folha/dashboard")
+def rh_resumo_folha_dashboard(
+    anomes_ini: Optional[str] = None,
+    anomes_fim: Optional[str] = None,
+    cd_filial: Optional[int] = None,
+    codemp: Optional[int] = None,
+    modo: str = "completo",
+    debug: bool = False,
+    usuario=Depends(validar_token),
+):
+    """Tela 01 - Resumo Folha. Os cards e a grid OFICIAIS vêm SEMPRE da VM_FOLHA
+    do ERP (VETORH.dbo.VM_FOLHA, ao vivo). rh_resumo_folha/eventos servem SÓ para
+    os drills de Proventos/Descontos — NUNCA para os cards oficiais.
+
+    Se a VM_FOLHA não existir ou não tiver dado, retorna erro técnico (409) — não
+    devolve 0,00 em silêncio nem cai em fallback por evento.
+    - modo=completo (padrão): kpis (11) + filiais + proventos_vantagens +
+      descontos + tipos_evento.
+    - modo=mensal: {"mensal": [{anomes_competencia, provento, desconto,
+      total_liquido}, ...]}."""
+    codemp = codemp or EMPRESA_PADRAO
+    if not anomes_ini or not anomes_fim:
+        raise HTTPException(status_code=422, detail="Informe anomes_ini e anomes_fim (YYYYMM).")
+
+    # modo=mensal não usa drills — sai ANTES do cálculo caro (antes ele era
+    # computado e descartado).
+    if str(modo or "").strip().lower() == "mensal":
+        return {"mensal": _rh_ler_vm_folha_mensal(codemp, anomes_ini, anomes_fim, cd_filial)}
+
+    # Drills analíticos (proventos/descontos/tipos) por evento (view agregada
+    # rh_drill_eventos_v quando existir; senão tabela crua + cache).
+    drills = _rh_drills_eventos(codemp, anomes_ini, anomes_fim, cd_filial)
+
+    # Cards/grid OFICIAIS: public.rh_vm_folha (camada COMPAT da VM_FOLHA).
+    kpis = _rh_ler_vm_folha_kpis(codemp, anomes_ini, anomes_fim, cd_filial)
+    if kpis is None:
+        # rh_vm_folha ainda não materializada: líquido validado por evento;
+        # demais cards ficam null (pendentes). NUNCA 0.00 em silêncio.
+        liq = drills.get("liquido") or {}
+        return {
+            "fonte": "ERP_SENIOR_VETORH_COMPAT_PENDENTE",
+            "fonte_kpis": "SEM_CARGA",
+            "kpis": {
+                "provento": liq.get("provento"),
+                "desconto": liq.get("desconto"),
+                "total_liquido": liq.get("total_liquido"),
+                "custo_total": None,
+                "beneficios": None,
+                "inss_total": None,
+                "hora_extra": None,
+                "provisoes": None,
+                "custo_ferias": None,
+                "rescisoes": None,
+                "fgts": None,
+            },
+            "filiais": [],
+            "proventos_vantagens": drills["proventos_vantagens"],
+            "descontos": drills["descontos"],
+            "tipos_evento": drills["tipos_evento"],
+            "diagnostico": {
+                "vm_folha_status": "OBJETO_INEXISTENTE_NO_VETORH",
+                "fonte_cards": "PENDENTE_VM_FOLHA_COMPATIVEL",
+                "erro_tecnico": "VETORH.dbo.VM_FOLHA não existe fisicamente. Necessário calcular a camada compatível — rode POST /api/rh/vm-folha-compat/sincronizar.",
+            },
+        }
+
+    filiais = _rh_ler_vm_folha_filiais(codemp, anomes_ini, anomes_fim, cd_filial) or []
+    resultado = {
+        "fonte": "public.rh_vm_folha",
+        "fonte_kpis": "vm_folha_compat",
+        "kpis": kpis,
+        "filiais": filiais,
+        "proventos_vantagens": drills["proventos_vantagens"],
+        "descontos": drills["descontos"],
+        "tipos_evento": drills["tipos_evento"],
+    }
+    if debug:
+        resultado["diagnostico"] = {
+            "vm_folha_status": "OK",
+            "fonte_cards": "public.rh_vm_folha (COMPAT)",
+            "fonte_drills": "rh_resumo_folha/eventos",
+            "kpis_pendentes": [k for k, v in kpis.items() if v is None],
+            # Item A: composição do custo de férias (prova que encargos/provisões
+            # NÃO entram — ferias_*_encargos e ferias_provisao_usada = 0).
+            "custo_ferias_componentes": drills.get("custo_ferias_componentes"),
+        }
+    return resultado
+
+
+@app.get("/api/rh/diagnostico/vetorh-tabela")
+def rh_diagnostico_vetorh_tabela(
+    tabela: str,
+    amostra: bool = False,
+    usuario=Depends(validar_token),
+):
+    """Diagnóstico read-only de uma tabela do Vetorh: lista as COLUNAS
+    (INFORMATION_SCHEMA) e, com amostra=true, 1 linha de exemplo.
+
+    Serve para mapear as fontes auxiliares antes de escrever a extração:
+    provisões (R146PRV), FGTS (R056SFP/R056RCS), INSS patronal (tabela a
+    confirmar). Só aceita nome no padrão Senior (R### + sufixo) — evita
+    injeção no SELECT de amostra. Não grava nada."""
+    tab = (tabela or "").strip().upper()
+    if not re.fullmatch(r"R[0-9]{3}[A-Z0-9]{2,5}", tab):
+        raise HTTPException(
+            status_code=422,
+            detail="Informe o nome Senior da tabela (ex.: R146PRV, R056SFP, R056RCS).",
+        )
+    colunas = _rh_executar_sql_senior(
+        "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, "
+        "NUMERIC_PRECISION, NUMERIC_SCALE "
+        "FROM VETORH.INFORMATION_SCHEMA.COLUMNS "
+        "WHERE TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+        [tab],
+    )
+    if not colunas:
+        return {
+            "tabela": tab,
+            "existe": False,
+            "colunas": [],
+            "obs": "Tabela não encontrada em VETORH — confira o nome.",
+        }
+    saida = {
+        "tabela": tab,
+        "existe": True,
+        "total_colunas": len(colunas),
+        "colunas": colunas,
+    }
+    if amostra:
+        try:
+            rows = _rh_executar_sql_senior(f"SELECT TOP 1 * FROM VETORH.dbo.{tab}", [])
+            saida["amostra"] = rows[0] if rows else None
+        except Exception as exc:
+            saida["amostra"] = {"erro": str(exc)}
+    return saida
+
+
+@app.get("/api/rh/diagnostico/eventos-catalogo")
+def rh_diagnostico_eventos_catalogo(
+    anomes_ini: str = Query(..., description="Exemplo: 202601"),
+    anomes_fim: str = Query(..., description="Exemplo: 202605"),
+    codemp: Optional[int] = None,
+    cd_filial: Optional[int] = None,
+    contem: Optional[str] = None,
+    usuario=Depends(validar_token),
+):
+    """Catálogo dos eventos do período (a partir de rh_resumo_folha) para mapear
+    benefícios / rescisão / etc. SEM chutar. Para cada cd_evento: descrição, tipo,
+    total no período, nº de linhas, o grupo_dashboard atual (se classificado) e em
+    qual 'bucket' de férias já está. Ordena por |total| desc. `contem` filtra pela
+    descrição (ex.: contem=ferias, contem=vale). Read-only."""
+    codemp = codemp or EMPRESA_PADRAO
+    if not anomes_ini or not anomes_fim:
+        raise HTTPException(status_code=422, detail="Informe anomes_ini e anomes_fim (YYYYMM).")
+    filtros = ["select=cd_evento,ds_evento,cd_tp_evento,vl_evento,vl_provento,vl_desconto",
+               f"anomes_competencia=gte.{anomes_ini}", f"anomes_competencia=lte.{anomes_fim}"]
+    if cd_filial:
+        filtros.append(f"cd_filial=eq.{cd_filial}")
+    if codemp:
+        filtros.append(f"cd_empresa=eq.{codemp}")
+    try:
+        linhas = _rh_supabase_paginar("rh_resumo_folha", filtros)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Erro ao ler rh_resumo_folha: {exc}")
+    classif = _rh_carregar_classificacao_eventos(codemp)
+    cat: dict = {}
+    for r in linhas or []:
+        cev = _rh_cd_evento_int(r.get("cd_evento"))
+        d = cat.get(cev)
+        if d is None:
+            d = {"cd_evento": cev, "ds_evento": r.get("ds_evento"),
+                 "cd_tp_evento": r.get("cd_tp_evento"),
+                 "total_evento": 0.0, "total_provento": 0.0, "total_desconto": 0.0, "linhas": 0}
+            cat[cev] = d
+        if not d["ds_evento"] and r.get("ds_evento"):
+            d["ds_evento"] = r.get("ds_evento")
+        d["total_evento"] += _rh_num(r.get("vl_evento"))
+        d["total_provento"] += _rh_num(r.get("vl_provento"))
+        d["total_desconto"] += _rh_num(r.get("vl_desconto"))
+        d["linhas"] += 1
+    alvo = (contem or "").strip().lower()
+    saida = []
+    for cev, d in cat.items():
+        if alvo and alvo not in str(d.get("ds_evento") or "").lower():
+            continue
+        c = classif.get(cev) or {}
+        bucket = ("FERIAS_NORMAL" if cev in _RH_FERIAS_NORMAIS_EVENTOS
+                  else "FERIAS_RESCISAO" if cev in _RH_FERIAS_RESCISAO_EVENTOS
+                  else "FERIAS_DESCONTO" if cev in _RH_FERIAS_DESCONTO_EVENTOS else None)
+        for k in ("total_evento", "total_provento", "total_desconto"):
+            d[k] = round(d[k], 2)
+        d["grupo_classificacao"] = c.get("grupo")
+        d["bucket_ferias"] = bucket
+        saida.append(d)
+    saida.sort(key=lambda x: -abs(x["total_evento"]))
+    return {
+        "periodo": f"{anomes_ini}-{anomes_fim}",
+        "codemp": codemp,
+        "total_eventos": len(saida),
+        "eventos": saida,
+    }
+
+
+@app.post("/api/rh/vm-folha/sincronizar")
+def rh_vm_folha_sincronizar(
+    codemp: int = EMPRESA_PADRAO,
+    anomes_ini: str = Query(..., description="Exemplo: 202601"),
+    anomes_fim: str = Query(..., description="Exemplo: 202605"),
+    usuario=Depends(validar_token),
+):
+    """DESCONTINUADO. VETORH.dbo.VM_FOLHA não existe fisicamente (é objeto do
+    UpQuery/BI JET). Este endpoint NÃO tenta mais localizá-la. Use
+    POST /api/rh/vm-folha-compat/sincronizar, que materializa public.rh_vm_folha
+    a partir das tabelas reais do Vetorh."""
+    return {
+        "status": "DESCONTINUADO",
+        "detalhe": "VETORH.dbo.VM_FOLHA não existe fisicamente — endpoint descontinuado.",
+        "use": "POST /api/rh/vm-folha-compat/sincronizar?codemp=1&anomes_ini=YYYYMM&anomes_fim=YYYYMM",
+    }
+
+
+@app.get("/api/rh/diagnostico/localizar-objeto")
+def rh_diagnostico_localizar_objeto(
+    nome: str,
+    amostra: bool = False,
+    usuario=Depends(validar_token),
+):
+    """Localiza uma tabela/view (ex.: VM_FOLHA) em VETORH e no banco PRINCIPAL:
+    devolve catálogo/schema, as colunas (nome/tipo) e, com amostra=true, 1 linha.
+
+    Serve para mapear a origem oficial (VM_FOLHA) — nome e schema onde vive, e
+    as colunas de dimensão (empresa/filial/competência) — antes de escrever a
+    extração. Read-only. Nome validado (letras/dígitos/_) para evitar injeção."""
+    n = (nome or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9_]{3,60}", n):
+        raise HTTPException(
+            status_code=422,
+            detail="Nome inválido. Use letras, dígitos e _ (ex.: VM_FOLHA, USU_VMFOLHA).",
+        )
+    sql_cols = (
+        "SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE, "
+        "CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE "
+        "FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = ? ORDER BY ORDINAL_POSITION"
+    )
+    achados = []
+    for rotulo, executor in (("VETORH", _rh_executar_sql_senior),
+                             ("PRINCIPAL", _rh_executar_sql_principal)):
+        try:
+            cols = executor(sql_cols, [n])
+        except Exception as exc:
+            achados.append({"banco": rotulo, "erro": str(exc)[:300]})
+            continue
+        if not cols:
+            achados.append({"banco": rotulo, "encontrado": False})
+            continue
+        catalog = cols[0].get("table_catalog")
+        schema = cols[0].get("table_schema")
+        item = {
+            "banco": rotulo,
+            "encontrado": True,
+            "catalog": catalog,
+            "schema": schema,
+            "total_colunas": len(cols),
+            "colunas": cols,
+        }
+        if amostra and catalog and schema:
+            # FQN a partir de metadados do próprio banco (não é input do usuário).
+            fqn = f"[{catalog}].[{schema}].[{n}]"
+            try:
+                rows = executor(f"SELECT TOP 1 * FROM {fqn}", [])
+                item["amostra"] = rows[0] if rows else None
+            except Exception as exc:
+                item["amostra"] = {"erro": str(exc)[:300]}
+        achados.append(item)
+
+    return {
+        "nome": n,
+        "encontrado_em": [a["banco"] for a in achados if a.get("encontrado")],
+        "resultados": achados,
+    }
+
+
+def _rh_vm_filtros_lista(select, codemp, anomes_ini, anomes_fim):
+    """Lista de filtros PostgREST (para _rh_supabase_paginar) por período/empresa."""
+    filtros = [f"select={select}"]
+    if anomes_ini:
+        filtros.append(f"anomes_competencia=gte.{anomes_ini}")
+    if anomes_fim:
+        filtros.append(f"anomes_competencia=lte.{anomes_fim}")
+    if codemp:
+        filtros.append(f"cd_empresa=eq.{codemp}")
+    return filtros
+
+
+def _rh_compat_eventos_filcomp(codemp, anomes_ini, anomes_fim):
+    """Agrega eventos (rh_resumo_folha + classificação) por (cd_filial,
+    anomes_competencia) para os campos de líquido/hora extra/férias/qtd."""
+    filtros = ["select=anomes_competencia,cd_evento,ds_evento,cd_filial,ds_filial,"
+               "cd_matricula,vl_provento,vl_desconto,vl_evento,qtd_referencia,"
+               "cd_tp_calculo,cd_tp_evento"]
+    filtros += _rh_vm_filtros_lista("", codemp, anomes_ini, anomes_fim)[1:]
+    try:
+        linhas = _rh_supabase_paginar("rh_resumo_folha", filtros)
+    except Exception:
+        linhas = []
+    classif = _rh_carregar_classificacao_eventos(codemp)
+    g: dict = {}
+    benef_hits: dict = {}   # cd_evento de benefício realmente encontrado -> {linhas, soma}
+    total_linhas = 0
+    # População da folha: (cd_matricula, anomes) -> cd_filial (da FOLHA). Serve para
+    # casar o V.A. do R162GER só com quem tem folha e alocar na filial da folha.
+    pop_folha: dict = {}
+    for r in linhas or []:
+        total_linhas += 1
+        comp = str(r.get("anomes_competencia") or "").strip()
+        matric = str(r.get("cd_matricula") or "").strip()
+        if matric:
+            pop_folha[(matric, comp)] = r.get("cd_filial")
+        # Cards do BI = SOMENTE TIPCAL 11 (mensal). Adiantamento (91), 13º/férias
+        # de outros cálculos (12/13/15) ficam fora de TODOS os cards — a população
+        # p/ casar o V.A. (pop_folha, acima) segue considerando qualquer linha.
+        if _rh_cd_evento_int(r.get("cd_tp_calculo")) != _RH_CARD_TIPCAL:
+            continue
+        key = (_rh_fkey(r.get("cd_filial")), comp)
+        d = g.get(key)
+        if d is None:
+            d = {"cd_filial": r.get("cd_filial"), "anomes_competencia": comp,
+                 "ds_filial": None, "prov": 0.0, "desc": 0.0, "he_prov": 0.0,
+                 "he_desc": 0.0, "he_base": 0.0, "fe_base": 0.0, "fe_gozada": 0.0,
+                 "fe_resc": 0.0, "resc_liq": 0.0, "resc_fgts": 0.0,
+                 "benef_comp": {c: 0.0 for c in _RH_BENEFICIO_COLUNAS},
+                 "qh": 0.0, "qhe": 0.0}
+            g[key] = d
+        if not d["ds_filial"] and r.get("ds_filial"):
+            d["ds_filial"] = r.get("ds_filial")
+        grupo, entra, sinal = _rh_classificar_linha(r, classif)
+        ve = _rh_num(r.get("vl_evento"))
+        qr = _rh_num(r.get("qtd_referencia"))
+        # Provento/Desconto do card = semântica TIPEVE do BI (provada no centavo
+        # contra o UpQuery): provento = TIPEVE 1 e 2; desconto = TIPEVE 3.
+        # TIPEVE 4/5/6 (FGTS, part. empresa, bases) ficam FORA do líquido.
+        # A classificação manual (rh_evento_classificacao) segue valendo para os
+        # GRUPOS (hora extra, férias...), não mais para provento/desconto.
+        tipeve = _rh_cd_evento_int(r.get("cd_tp_evento"))
+        if tipeve in (1, 2):
+            d["prov"] += ve
+        elif tipeve == 3:
+            d["desc"] += ve
+        cev = _rh_cd_evento_int(r.get("cd_evento"))
+        if grupo == "HORA_EXTRA":
+            if sinal == 1:
+                d["he_prov"] += ve
+                if cev != _RH_HE_EVENTO_SEM_ENCARGO:
+                    d["he_base"] += ve
+                d["qhe"] += qr
+            elif sinal == -1:
+                d["he_desc"] += ve
+        # Custo Férias por LISTA DE EVENTOS (não por grupo_dashboard): só férias
+        # normais entram na base. Férias de rescisão vão para o custo de rescisão;
+        # descontos/impostos ficam fora naturalmente (não estão na whitelist).
+        if cev in _RH_FERIAS_NORMAIS_EVENTOS:
+            d["fe_base"] += ve
+            if cev not in _RH_FERIAS_ABONO_EVENTOS:
+                d["fe_gozada"] += ve   # base do encargo (abono pecuniário fica fora)
+        elif cev in _RH_FERIAS_RESCISAO_EVENTOS:
+            d["fe_resc"] += ve         # férias de rescisão (já dentro do líquido 264)
+        # Rescisão por EVENTO: líquido (264) + FGTS rescisório. NÃO somar os
+        # eventos que compõem o líquido — evita duplicidade.
+        elif cev in _RH_RESCISAO_LIQUIDO_EVENTOS:
+            d["resc_liq"] += ve
+        elif cev in _RH_RESCISAO_FGTS_EVENTOS:
+            d["resc_fgts"] += ve
+        # Benefícios por componente (evento -> coluna). V.A. não entra (R162GER).
+        # Benefício é custo patronal (provento); usa vl_provento e cai p/ vl_evento
+        # se o provento vier 0 (evento informativo com valor só em VALEVE).
+        # O gate global de TIPCAL 11 (acima) já espelha o grid oficial.
+        elif cev in _RH_BENEF_EVENTO_TO_COMP:
+            vb = _rh_num(r.get("vl_provento")) or ve
+            d["benef_comp"][_RH_BENEF_EVENTO_TO_COMP[cev]] += vb
+            h = benef_hits.setdefault(cev, {"componente": _RH_BENEF_EVENTO_TO_COMP[cev],
+                                            "linhas": 0, "soma": 0.0})
+            h["linhas"] += 1
+            h["soma"] += vb
+        if grupo in ("SALARIO_BASE", "HORA_EXTRA"):
+            d["qh"] += qr
+    out = {}
+    for key, d in g.items():
+        prov, desc = d["prov"], d["desc"]
+        out[key] = {
+            "cd_filial": d["cd_filial"],
+            "anomes_competencia": d["anomes_competencia"],
+            "ds_filial": d["ds_filial"],
+            "calc_vl_provento_liq": round(prov, 2),
+            "calc_vl_desconto_liq": round(desc, 2),
+            "vl_liquido": round(prov - desc, 2),
+            "vl_proventos": round(prov, 2),
+            "vl_descontos": round(desc, 2),
+            "calc_vl_horas_extra": round((d["he_prov"] - d["he_desc"]) + d["he_base"] * 0.20, 2),
+            # Custo Férias = base de FÉRIAS NORMAIS + encargo patronal sobre as
+            # férias GOZADAS (abono pecuniário não sofre encargo). Rescisão e
+            # descontos/impostos NÃO entram (fe_resc segue p/ o custo de rescisão).
+            # Alíquota do encargo em _RH_FERIAS_ENCARGO_TAXA (ajustar se não fechar).
+            "calc_vl_custo_ferias": round(
+                d["fe_base"] + d["fe_gozada"] * _RH_FERIAS_ENCARGO_TAXA, 2),
+            "calc_qtd_horas": round(d["qh"], 2),
+            "calc_qtd_hora_extra": round(d["qhe"], 2),
+            # Rescisão por evento: líquido (264) + FGTS rescisório. O construir
+            # monta o total (encargos ainda pendentes) e decide null.
+            "_resc_liq": round(d["resc_liq"], 2),
+            "_resc_fgts": round(d["resc_fgts"], 2),
+            # Benefícios por componente (cada coluna já com o nome final).
+            **{c: round(v, 2) for c, v in d["benef_comp"].items()},
+        }
+    for h in benef_hits.values():
+        h["soma"] = round(h["soma"], 2)
+    meta = {
+        "total_linhas_resumo": total_linhas,
+        "beneficios_eventos_encontrados": benef_hits,
+        "beneficios_eventos_esperados": sorted(_RH_BENEF_EVENTO_TO_COMP.keys()),
+        "pop_folha": pop_folha,   # (cd_matricula, anomes) -> cd_filial da folha
+    }
+    return out, meta
+
+
+def _rh_compat_aux_filcomp(table, campos, codemp, anomes_ini, anomes_fim):
+    """Soma campos de uma aux (Supabase) por (cd_filial, anomes_competencia).
+
+    A chave usa _rh_fkey (str normalizada) para casar com os eventos mesmo que o
+    cd_filial venha como int de um lado e str de outro. Preserva o cd_filial cru
+    para gravar o valor original na rh_vm_folha."""
+    sel = "cd_filial,anomes_competencia," + ",".join(campos)
+    try:
+        rows = _rh_supabase_paginar(table, _rh_vm_filtros_lista(sel, codemp, anomes_ini, anomes_fim))
+    except Exception:
+        return {}
+    out: dict = {}
+    for r in rows or []:
+        comp = str(r.get("anomes_competencia") or "").strip()
+        key = (_rh_fkey(r.get("cd_filial")), comp)
+        d = out.get(key)
+        if d is None:
+            d = {c: 0.0 for c in campos}
+            d["cd_filial"] = r.get("cd_filial")
+            d["anomes_competencia"] = comp
+            out[key] = d
+        for c in campos:
+            d[c] += _rh_num(r.get(c))
+    return out
+
+
+def _rh_compat_vale_alimentacao(codemp, anomes_ini, anomes_fim):
+    """Lê o V.A. do R162GER POR MATRÍCULA/competência (qtdval=1, regra do dia 15).
+    Retorna {(cd_matricula, anomes): valor}. A alocação por filial e o filtro
+    "só quem tem folha" ficam no construir (via população da folha). Best-effort:
+    erro => {}."""
+    try:
+        rows = _rh_executar_sql_senior(SQL_RH_VALE_ALIMENTACAO, [codemp, anomes_ini, anomes_fim])
+    except Exception:
+        return {}
+    out: dict = {}
+    for r in rows or []:
+        matric = str(r.get("cd_matricula") or "").strip()
+        comp = str(r.get("anomes_competencia") or "").strip()
+        if not matric:
+            continue
+        out[(matric, comp)] = out.get((matric, comp), 0.0) + _rh_num(r.get("vl_vale_alimentacao"))
+    return out
+
+
+def _rh_compat_vale_breakdown(codemp, anomes_ini, anomes_fim):
+    """Breakdown do V.A. (R162GER) por CODVAL/STAVAL/ORIVAL/TIPCOL/competência —
+    para diagnóstico (achar o filtro que fecha o BI). Best-effort: erro => []."""
+    try:
+        return _rh_executar_sql_senior(SQL_RH_VALE_BREAKDOWN, [codemp, anomes_ini, anomes_fim]) or []
+    except Exception:
+        return []
+
+
+def _rh_vm_folha_compat_construir(codemp, anomes_ini, anomes_fim):
+    """Monta as linhas de rh_vm_folha (COMPAT) compondo as fontes validadas.
+    Campos ainda não mapeados ficam None (pendentes). Retorna (linhas, pendentes)."""
+    ev, ev_meta = _rh_compat_eventos_filcomp(codemp, anomes_ini, anomes_fim)
+    fgts = _rh_compat_aux_filcomp("rh_aux_fgts", ["vl_fgts", "vl_fgts_13"], codemp, anomes_ini, anomes_fim)
+    inss = _rh_compat_aux_filcomp("rh_aux_inss", ["inss_total", "inss_patronal_20"], codemp, anomes_ini, anomes_fim)
+    prov = _rh_compat_aux_filcomp("rh_aux_provisoes", ["vl_provisao_ferias", "vl_provisao_13"], codemp, anomes_ini, anomes_fim)
+    vale_matric = _rh_compat_vale_alimentacao(codemp, anomes_ini, anomes_fim)  # R162GER por matrícula
+    pop_folha = ev_meta.get("pop_folha") or {}
+
+    # V.A.: casa por (matrícula, competência) com a POPULAÇÃO DA FOLHA e aloca na
+    # filial da FOLHA. Só entra quem tem folha na competência — não cria linha nova
+    # nem usa a filial do cadastro. va_bruto = tudo do R162GER; va_casado = só folha.
+    vale_por_key: dict = {}          # (fkey(filial_folha), comp) -> valor
+    va_bruto = 0.0
+    va_casado = 0.0
+    va_por_mes: dict = {}
+    va_matriculas_fora = 0
+    for (matric, comp_va), valor in vale_matric.items():
+        va_bruto += valor
+        filial_folha = pop_folha.get((matric, comp_va))
+        if filial_folha is None:
+            va_matriculas_fora += 1
+            continue                 # matrícula sem folha nessa competência: ignora
+        k = (_rh_fkey(filial_folha), comp_va)
+        vale_por_key[k] = vale_por_key.get(k, 0.0) + valor
+        va_casado += valor
+        va_por_mes[comp_va] = round(va_por_mes.get(comp_va, 0.0) + valor, 2)
+
+    # Rescisão (evento 264 líquido + FGTS rescisório) e Benefícios (componentes de
+    # evento + V.A. casado com a folha). Só grava se o total global > 0.
+    global_resc = round(sum(_rh_num(e.get("_resc_liq")) + _rh_num(e.get("_resc_fgts"))
+                            for e in ev.values()), 2)
+    # Card = colunas do card (sem ajuda custo/estágio) + V.A. — composição provada
+    # contra o BI (1.060.678,68 fecha no centavo sem os eventos 82 e 213).
+    global_benef = round(
+        sum(sum(_rh_num(e.get(c)) for c in _RH_BENEF_CARD_COLUNAS) for e in ev.values())
+        + sum(vale_por_key.values()), 2)
+
+    # V.A. NÃO entra no union: só se soma a chaves de folha já existentes (nunca
+    # cria linha nova só por causa do V.A.).
+    linhas = []
+    for key in set(ev) | set(fgts) | set(inss) | set(prov):
+        e = ev.get(key) or {}
+        f = fgts.get(key) or {}
+        i = inss.get(key) or {}
+        p = prov.get(key) or {}
+        va_val = _rh_num(vale_por_key.get(key))
+        # cd_filial/competência REAIS (preserva o valor cru de qualquer fonte que
+        # tenha a chave — não usa a chave normalizada, que é só p/ o JOIN).
+        cd_filial = (e.get("cd_filial") if e.get("cd_filial") is not None
+                     else f.get("cd_filial") if f.get("cd_filial") is not None
+                     else i.get("cd_filial") if i.get("cd_filial") is not None
+                     else p.get("cd_filial"))
+        comp = (e.get("anomes_competencia") or f.get("anomes_competencia")
+                or i.get("anomes_competencia") or p.get("anomes_competencia") or key[1])
+        pf = round(_rh_num(p.get("vl_provisao_ferias")), 2)
+        p13 = round(_rh_num(p.get("vl_provisao_13")), 2)
+        linhas.append({
+            "cd_empresa": codemp, "cd_filial": cd_filial, "ds_filial": e.get("ds_filial"),
+            "anomes_competencia": comp,
+            # Campos de evento: só têm valor se a filial tem folha (key in ev);
+            # senão null (pendente) — nunca 0 em silêncio numa filial só-aux.
+            "calc_vl_provento_liq": round(_rh_num(e.get("calc_vl_provento_liq")), 2) if key in ev else None,
+            "calc_vl_desconto_liq": round(_rh_num(e.get("calc_vl_desconto_liq")), 2) if key in ev else None,
+            "vl_liquido": round(_rh_num(e.get("vl_liquido")), 2) if key in ev else None,
+            "vl_proventos": round(_rh_num(e.get("vl_proventos")), 2) if key in ev else None,
+            "vl_descontos": round(_rh_num(e.get("vl_descontos")), 2) if key in ev else None,
+            "calc_vl_horas_extra": round(_rh_num(e.get("calc_vl_horas_extra")), 2) if key in ev else None,
+            "calc_vl_custo_ferias": round(_rh_num(e.get("calc_vl_custo_ferias")), 2) if key in ev else None,
+            "calc_qtd_horas": round(_rh_num(e.get("calc_qtd_horas")), 2) if key in ev else None,
+            "calc_qtd_hora_extra": round(_rh_num(e.get("calc_qtd_hora_extra")), 2) if key in ev else None,
+            # Aux: valor real quando a chave existe na fonte; senão null (pendente).
+            "vl_fgts": round(_rh_num(f.get("vl_fgts")) + _rh_num(f.get("vl_fgts_13")), 2) if key in fgts else None,
+            "calc_vl_inss_total": round(_rh_num(i.get("inss_total")), 2) if key in inss else None,
+            # INSS patronal 20% (empresa) — componente do custo total. Terceiros e
+            # FAP/RAT ainda faltam (colunas do R056SFP não mapeadas) => custo total
+            # segue pendente. Já grava o que temos.
+            "vl_inssempresa": round(_rh_num(i.get("inss_patronal_20")), 2) if key in inss else None,
+            "vl_provisaoferias": pf if key in prov else None,
+            "vl_provisao13": p13 if key in prov else None,
+            "calc_vl_total_provisao": round(pf + p13, 2) if key in prov else None,
+            # Rescisão por evento: líquido (264) + FGTS rescisório. Encargos
+            # patronais de rescisão ainda pendentes (fonte dos ~87k) => o total é
+            # líquido + fgts por ora (aproxima o BI). null se não houver rescisão.
+            "calc_rescisao_liq": (round(_rh_num(e.get("_resc_liq")), 2)
+                                  if (key in ev and global_resc > 0) else None),
+            "calc_fgts_rescisao": (round(_rh_num(e.get("_resc_fgts")), 2)
+                                   if (key in ev and global_resc > 0) else None),
+            "calc_custo_total_rescisao": (
+                round(_rh_num(e.get("_resc_liq")) + _rh_num(e.get("_resc_fgts")), 2)
+                if (key in ev and global_resc > 0) else None),
+            # Benefícios = componentes de evento + Vale-alimentação (R162GER).
+            # calc_vl_beneficios = soma dos componentes + V.A. null só quando NÃO há
+            # benefício em nenhuma linha do período (global_benef == 0) — nunca 0.
+            "vl_vale_alimentacao": (round(va_val, 2) if global_benef > 0 else None),
+            **{c: (round(_rh_num(e.get(c)), 2) if global_benef > 0 else None)
+               for c in _RH_BENEFICIO_COLUNAS},
+            # Card SEM ajuda custo (82) e SEM bolsa estágio (213) — as colunas
+            # acima continuam gravadas; só não entram na soma do card.
+            "calc_vl_beneficios": (
+                round(sum(_rh_num(e.get(c)) for c in _RH_BENEF_CARD_COLUNAS) + va_val, 2)
+                if global_benef > 0 else None),
+            # Custo Total depende de sal_bruto/FAP-RAT/INSS terceiros + salário,
+            # ainda não extraídos => null (pendente), nunca 0 em silêncio.
+            "calc_vl_custo_total": None,
+            "calc_vl_sal_bruto": None,
+            "vl_salario": None,
+        })
+    # Breakdown por componente (para validar cada peça contra o BI sem chutar).
+    resc_liq_tot = round(sum(_rh_num(e.get("_resc_liq")) for e in ev.values()), 2)
+    resc_fgts_tot = round(sum(_rh_num(e.get("_resc_fgts")) for e in ev.values()), 2)
+    benef_comp_tot = {c: round(sum(_rh_num(e.get(c)) for e in ev.values()), 2)
+                      for c in _RH_BENEFICIO_COLUNAS}
+    vale_casado = round(va_casado, 2)
+    vale_bruto = round(va_bruto, 2)
+    _RH_BENEF_ALVO = 1060678.68
+    _RH_VA_ALVO = 515036.56
+
+    # O card oficial exclui 82 e 213 (provado). As duas somas abaixo mostram o
+    # card e a composição antiga (com os dois), para conferência.
+    ajuda_custo_tot = round(_rh_num(benef_comp_tot.get("calc_vl_ajuda_custo")), 2)
+    estagio_tot = round(_rh_num(benef_comp_tot.get("calc_vl_estagio")), 2)
+    benef_card_ev = round(sum(_rh_num(benef_comp_tot.get(c))
+                              for c in _RH_BENEF_CARD_COLUNAS), 2)
+    benef_sem_ac = round(benef_card_ev + estagio_tot + vale_casado, 2)
+    benef_com_ac = round(benef_card_ev + estagio_tot + ajuda_custo_tot + vale_casado, 2)
+
+    # V.A. por FILIAL (da folha) vs o grid oficial do BI (UpQuery, Jan-Mai/2026) —
+    # é a referência que faltava para achar a regra da R162GER que fecha 515.036,56.
+    _fil_nome = {}
+    for e in ev.values():
+        fk = _rh_fkey(e.get("cd_filial"))
+        if fk not in _fil_nome:
+            _fil_nome[fk] = f"{e.get('cd_filial')} - {e.get('ds_filial') or ''}".strip(" -")
+    va_por_filial: dict = {}
+    for (fk, _c), valor in vale_por_key.items():
+        nome = _fil_nome.get(fk, str(fk))
+        va_por_filial[nome] = round(va_por_filial.get(nome, 0.0) + valor, 2)
+    va_por_filial = dict(sorted(va_por_filial.items(), key=lambda x: -x[1]))
+    _RH_VA_OFICIAL_FILIAL = {
+        "ESTRUTURAL ZORTEA - MATRIZ": 193141.08,
+        "622 - GRANSOL": 650.00,
+        "630 - TESC": 0.00,
+        "634 - TUCUMANN/TGSC": 0.00,
+        "GENIUS MAQUINAS AGRICOLAS": 84624.63,
+        "645 - COFCO": 25285.01,
+        "640 - TMSA/TGSC": 0.00,
+        "653 - AGI/TEAG": 36703.42,
+        "662 - UNITAPAJOS": 0.00,
+        "665 - RUMO LOGISTICA": 0.00,
+        "660 - PORTOAGIL LOGISTICA SPE LTDA": 69983.35,
+        "664 - BUNGE - RIO GRANDE": 16076.59,
+        "663 - VIA MARIS": 23117.35,
+        "667 - TEAG/TEG": 3250.00,
+        "669 - TESC": 11028.34,
+        "655 - ROCHA TERM. PORT. E LOGISTICA": 51176.79,
+        "649 - AGI/MOINHO PAULISTA": 0.00,
+        "595 - TES": 0.00,
+    }
+
+    # Breakdown do V.A. por dimensão do R162GER (achar o filtro que fecha o BI).
+    va_bd_rows = _rh_compat_vale_breakdown(codemp, anomes_ini, anomes_fim)
+
+    def _va_agrupa(campo, so_qtdval_1=True):
+        # so_qtdval_1 espelha o filtro da fórmula atual (QTDVAL = 1): assim os
+        # grupos somam o MESMO universo do vale_alimentacao_bruto_r162ger e dá
+        # para enxergar qual segmento carrega o excesso vs o BI oficial.
+        acc: dict = {}
+        for r in va_bd_rows or []:
+            if so_qtdval_1 and _rh_num(r.get("qtdval")) != 1.0:
+                continue
+            k = str(r.get(campo))
+            acc[k] = round(acc.get(k, 0.0) + _rh_num(r.get("valor")), 2)
+        return dict(sorted(acc.items(), key=lambda x: -x[1]))
+
+    # Colunas reais da R162GER (pedido: listar ANTES de fechar a fórmula do V.A.).
+    try:
+        r162_colunas = {str(c.get("coluna")): str(c.get("tipo"))
+                        for c in (_rh_executar_sql_senior(SQL_RH_R162GER_COLUNAS, []) or [])}
+    except Exception as exc:
+        r162_colunas = {"erro": str(exc)[:300]}
+
+    # --- Custo Total (fórmula oficial do UpQuery) — peça a peça, com pendências.
+    # CALC_VL_CUSTO_TOTAL só será gravado quando TODAS as peças estiverem provadas
+    # (nunca valor parcial em silêncio). O diagnóstico mostra o buraco exato.
+    ct_fgts = round(sum(_rh_num(f.get("vl_fgts")) + _rh_num(f.get("vl_fgts_13"))
+                        for f in fgts.values()), 2)
+    ct_inssemp = round(sum(_rh_num(i.get("inss_patronal_20")) for i in inss.values()), 2)
+    ct_provfer = round(sum(_rh_num(p.get("vl_provisao_ferias")) for p in prov.values()), 2)
+    ct_prov13 = round(sum(_rh_num(p.get("vl_provisao_13")) for p in prov.values()), 2)
+    ct_pecas = {
+        "calc_vl_sal_bruto": None,      # PENDENTE: fórmula no UpQuery
+        "vl_fgts": ct_fgts,
+        "vl_fap_rat": None,             # PENDENTE: alíquota RAT x FAP (base patronal ok)
+        "vl_inssterceiros": None,       # PENDENTE: alíquota terceiros (base patronal ok)
+        "vl_inssempresa": ct_inssemp,
+        "vl_provisaoferias": ct_provfer,
+        "vl_provisao13": ct_prov13,
+        "vl_vale_alimentacao": vale_casado,   # ainda inflado vs 9999 do BI
+        "calc_vl_seg_vida": benef_comp_tot.get("calc_vl_seg_vida"),
+        "calc_vl_premio": benef_comp_tot.get("calc_vl_premio"),
+        "calc_vl_plano_saude": benef_comp_tot.get("calc_vl_plano_saude"),
+        "calc_vl_ajuda_custo": benef_comp_tot.get("calc_vl_ajuda_custo"),
+        "calc_vl_grati": benef_comp_tot.get("calc_vl_grati"),
+        "calc_vl_aux_edu": benef_comp_tot.get("calc_vl_aux_edu"),
+        "calc_vl_bolsa_estud": benef_comp_tot.get("calc_vl_bolsa_estud"),
+        "calc_vl_vale_trans": benef_comp_tot.get("calc_vl_vale_trans"),
+        "calc_vl_aux_moradia": benef_comp_tot.get("calc_vl_aux_moradia"),
+    }
+    _RH_CT_ALVO = 18260200.42   # oficial Jan-Mai/2026 — só compara nesse período
+    ct_soma = round(sum(v for v in ct_pecas.values() if v is not None), 2)
+
+    diag = {
+        "chaves_eventos": len(ev),
+        "chaves_fgts": len(fgts),
+        "chaves_inss": len(inss),
+        "chaves_provisoes": len(prov),
+        "chaves_vale_alimentacao": len(vale_por_key),
+        "linhas_montadas": len(linhas),
+        # Rescisão = líquido (evento 264) + FGTS rescisório. Encargos patronais de
+        # rescisão (fonte dos ~87k) ainda pendentes; o total abaixo é líq+fgts.
+        "rescisao_total": global_resc if global_resc > 0 else None,
+        "rescisao_liquido": resc_liq_tot if resc_liq_tot else None,
+        "rescisao_fgts": resc_fgts_tot if resc_fgts_tot else None,
+        # Benefícios = componentes do CARD (sem 82/213) + Vale-alimentação (R162GER).
+        "beneficios_total": global_benef if global_benef > 0 else None,
+        "beneficios_por_componente": benef_comp_tot,
+        "beneficios_card_exclui": sorted(_RH_BENEF_CARD_EXCLUIR),
+        "beneficios_alvo_oficial": _RH_BENEF_ALVO,
+        "beneficios_diferenca_oficial": (round(global_benef - _RH_BENEF_ALVO, 2)
+                                         if global_benef > 0 else None),
+        # --- Vale-alimentação (diagnóstico obrigatório) ---
+        "vale_alimentacao": vale_casado if vale_casado else None,
+        "vale_alimentacao_alvo_oficial": _RH_VA_ALVO,
+        "vale_alimentacao_diferenca_oficial": (round(vale_casado - _RH_VA_ALVO, 2)
+                                               if vale_casado else None),
+        "vale_alimentacao_bruto_r162ger": vale_bruto if vale_bruto else None,
+        "vale_alimentacao_casado_com_folha": vale_casado if vale_casado else None,
+        "vale_alimentacao_matriculas_fora_folha": va_matriculas_fora,
+        "vale_alimentacao_por_mes": va_por_mes,
+        # Grupos abaixo já no recorte QTDVAL=1 (o da fórmula) — somam o bruto.
+        "vale_alimentacao_por_codval": _va_agrupa("codval"),
+        "vale_alimentacao_por_staval": _va_agrupa("staval"),
+        "vale_alimentacao_por_origem": _va_agrupa("orival"),
+        "vale_alimentacao_por_tipcol": _va_agrupa("tipcol"),
+        "vale_alimentacao_por_tabeve": _va_agrupa("tabeve"),
+        # Universo INTEIRO da R162GER por QTDVAL (sem filtro) — mostra quanto
+        # existe fora do recorte QTDVAL=1.
+        "vale_alimentacao_por_qtdval": _va_agrupa("qtdval", so_qtdval_1=False),
+        # Cross-tab CRU (todas as dimensões x competência, SEM filtro de qtdval):
+        # permite achar offline a combinação que fecha o alvo oficial.
+        "vale_alimentacao_breakdown_completo": va_bd_rows,
+        "r162ger_colunas": r162_colunas,
+        # --- V.A. por filial vs grid oficial do BI ---
+        "vale_alimentacao_por_filial": va_por_filial,
+        "vale_alimentacao_oficial_por_filial": _RH_VA_OFICIAL_FILIAL,
+        # --- Simulação ajuda de custo (82) / bolsa estágio (213) ---
+        "beneficios_ajuda_custo_82": ajuda_custo_tot,
+        "beneficios_bolsa_estagio_213": estagio_tot,
+        "beneficios_total_com_ajuda_custo": benef_com_ac,
+        "beneficios_total_sem_ajuda_custo": benef_sem_ac,
+        # --- Custo Total (fórmula oficial do UpQuery) peça a peça ---
+        "custo_total_formula": ("sal_bruto + fgts + fap_rat + inss_terceiros + "
+                                "inss_empresa + prov_ferias + prov_13 + vale_alim + "
+                                "seg_vida + premio + plano_saude + ajuda_custo + "
+                                "grati + aux_edu + bolsa_estud + vale_trans + moradia"),
+        "custo_total_pecas": ct_pecas,
+        "custo_total_pecas_pendentes": sorted(k for k, v in ct_pecas.items() if v is None),
+        "custo_total_soma_pecas_disponiveis": ct_soma,
+        "custo_total_alvo_oficial_jan_mai": _RH_CT_ALVO,
+        "custo_total_faltante_vs_alvo": round(_RH_CT_ALVO - ct_soma, 2),
+        # DIAGNÓSTICO: quais eventos de benefício ESPERADOS apareceram na folha.
+        "total_linhas_resumo": ev_meta.get("total_linhas_resumo"),
+        "beneficios_eventos_esperados": ev_meta.get("beneficios_eventos_esperados"),
+        "beneficios_eventos_encontrados": ev_meta.get("beneficios_eventos_encontrados"),
+    }
+    return linhas, diag
+
+
+@app.post("/api/rh/vm-folha-compat/sincronizar")
+def rh_vm_folha_compat_sincronizar(
+    codemp: int = EMPRESA_PADRAO,
+    anomes_ini: str = Query(..., description="Exemplo: 202601"),
+    anomes_fim: str = Query(..., description="Exemplo: 202605"),
+    usuario=Depends(validar_token),
+):
+    """Materializa a camada COMPAT da VM_FOLHA em public.rh_vm_folha, a partir das
+    fontes já validadas (eventos p/ líquido/hora extra/férias; R056SFP p/ FGTS/
+    INSS; R146PRV p/ provisões). Requer /api/rh/sync antes (popula rh_resumo_folha
+    e as aux). Campos ainda não mapeados ficam null (pendentes), nunca 0.
+
+    campos_validados/pendentes NÃO são lista fixa: depois do UPSERT a API RELÊ a
+    rh_vm_folha no Supabase e classifica cada campo pela soma REAL persistida —
+    tem valor => validado; tudo null => pendente."""
+    try:
+        linhas, diag = _rh_vm_folha_compat_construir(codemp, anomes_ini, anomes_fim)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _rh_registrar_log("RH_VM_FOLHA_COMPAT", "ERRO", 0, str(exc), anomes_ini, anomes_fim)
+        raise HTTPException(status_code=500, detail=f"Erro ao montar VM_FOLHA compat: {exc}")
+    if not linhas:
+        _rh_registrar_log("RH_VM_FOLHA_COMPAT", "VAZIO", 0, "sem dados nas fontes", anomes_ini, anomes_fim)
+        return {"status": "VAZIO",
+                "detalhe": "Sem dados nas fontes — rode /api/rh/sync antes.",
+                "fontes": diag}
+    _rh_supabase_delete(
+        "rh_vm_folha",
+        f"cd_empresa=eq.{codemp}&anomes_competencia=gte.{anomes_ini}&anomes_competencia=lte.{anomes_fim}",
+    )
+    qtd = _rh_supabase_upsert("rh_vm_folha", linhas, "cd_empresa,cd_filial,anomes_competencia")
+
+    # ---- Validação REAL (ponto 4): relê o que ficou persistido e soma cada campo.
+    # Um campo só entra em campos_validados se veio com pelo menos um valor
+    # não-nulo do BANCO (não porque a coluna existe). Caso contrário, é pendente.
+    campos = ["calc_vl_provento_liq", "calc_vl_desconto_liq", "vl_liquido",
+              "calc_vl_horas_extra", "calc_vl_custo_ferias",
+              "vl_fgts", "calc_vl_inss_total", "vl_provisaoferias",
+              "vl_provisao13", "calc_vl_total_provisao",
+              "calc_vl_custo_total", "calc_vl_beneficios", "calc_custo_total_rescisao",
+              "calc_vl_sal_bruto", "vl_salario", "vl_vale_alimentacao"]
+    erro_releitura = None
+    try:
+        relidas = _rh_supabase_paginar(
+            "rh_vm_folha",
+            _rh_vm_filtros_lista(",".join(campos), codemp, anomes_ini, anomes_fim),
+        )
+    except Exception as exc:
+        relidas = None
+        erro_releitura = str(exc)
+
+    somas: dict = {}
+    if relidas is not None:
+        for c in campos:
+            vals = [r.get(c) for r in relidas if r.get(c) is not None]
+            somas[c] = round(sum(_rh_num(v) for v in vals), 2) if vals else None
+        validados = [c for c in campos if somas.get(c) is not None]
+        pendentes = [c for c in campos if somas.get(c) is None]
+    else:
+        # Sem releitura não afirmo nada como validado (honesto).
+        validados = []
+        pendentes = list(campos)
+
+    # Ponto 9: status OK só quando TODOS os auxiliares (FGTS/INSS/provisões)
+    # gravaram valor. Se algum continuar null, é PARCIAL — nunca "OK pleno".
+    AUX_OBRIGATORIOS = ["vl_fgts", "calc_vl_inss_total", "vl_provisaoferias",
+                        "vl_provisao13", "calc_vl_total_provisao"]
+    aux_faltando = [c for c in AUX_OBRIGATORIOS if c not in validados]
+    status = "OK" if not aux_faltando else "PARCIAL"
+
+    _rh_registrar_log("RH_VM_FOLHA_COMPAT", status, qtd,
+                      f"validados={len(validados)} pendentes={len(pendentes)}",
+                      anomes_ini, anomes_fim)
+    resp = {
+        "status": status,
+        "linhas_gravadas": qtd,
+        "campos_validados": validados,
+        "campos_pendentes": pendentes,
+        "somas_verificadas": somas,
+        "fontes": diag,
+        "obs": "campos_validados/pendentes derivados da RELEITURA do Supabase pós-UPSERT (não é lista fixa).",
+    }
+    # Dica direcionada: fonte aux que não trouxe chaves => tabela vazia no período.
+    faltando_aux = [nome for nome, n in (("rh_aux_fgts", diag.get("chaves_fgts")),
+                                         ("rh_aux_inss", diag.get("chaves_inss")),
+                                         ("rh_aux_provisoes", diag.get("chaves_provisoes")))
+                    if not n]
+    if faltando_aux:
+        resp["dica"] = (
+            "Fontes aux vazias no período: " + ", ".join(faltando_aux)
+            + ". Rode POST /api/rh/sync no MESMO período e confira os steps 05/06/07 "
+            "no log (RH_AUX_PROVISOES/RH_AUX_FGTS/RH_AUX_INSS). Sem elas, FGTS/INSS/"
+            "provisões ficam pendentes (null), nunca 0."
+        )
+    if erro_releitura:
+        resp["aviso_releitura"] = f"Não consegui reler p/ validar: {erro_releitura}"
+    return resp
 
 
 if __name__ == '__main__':
